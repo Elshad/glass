@@ -2,10 +2,23 @@
 //! keyboard layout, like a real keyboard), the pointer in absolute desktop coordinates.
 //! Windows refuses injected input into elevated windows (UIPI) and the secure desktop
 //! (UAC prompts, the lock screen) unless the host itself runs elevated.
+//!
+//! A pen (an iPad's Pencil) is injected as a pen, with pressure and tilt, through a
+//! synthetic pointer device (Windows 10 1809 and later): while it's near the screen, the
+//! pointer moves and left button that follow are its hover and touches. Without one it
+//! works as a mouse.
 
 use std::collections::HashSet;
 
 use glass_proto::InputEvent as Ev;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::Controls::{
+    CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE, POINTER_FEEDBACK_DEFAULT,
+    POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
+};
+use windows::Win32::UI::Input::Pointer::{
+    InjectSyntheticPointerInput, POINTER_BUTTON_CHANGE_TYPE, POINTER_FLAGS, POINTER_INFO, POINTER_PEN_INFO,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
@@ -14,9 +27,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetSystemMetrics, PEN_FLAG_NONE, PEN_MASK_PRESSURE, PEN_MASK_ROTATION, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
+use super::convert::{PenPhase, pen_frame};
 use super::keymap::{self, Key, LEFT_CTRL, LEFT_WIN, RIGHT_WIN, V};
 use super::video::{self, Rect};
 
@@ -37,6 +52,34 @@ pub struct Injector {
     wheel: (f32, f32),
     /// A streamed window's rect, which absolute moves map to instead of a display.
     window: Option<Rect>,
+    /// The pen's latest state, while it's near the screen.
+    pen: Option<Pen>,
+    pen_device: PenDevice,
+    /// Where the pointer was last put (desktop pixels): where pen frames go.
+    at: Option<(i32, i32)>,
+}
+
+/// A synthetic pen device.
+#[derive(Clone, Copy)]
+struct Device(HSYNTHETICPOINTERDEVICE);
+
+// SAFETY: a process-wide handle, not tied to the thread that made it; the injector using
+// it is behind a mutex.
+unsafe impl Send for Device {}
+
+/// From `InputEvent::Pen`.
+#[derive(Clone, Copy)]
+struct Pen {
+    pressure: f32,
+    tilt: (i8, i8),
+    twist: f32,
+}
+
+enum PenDevice {
+    Untried,
+    Ready(Device),
+    /// Too old a Windows, or refused: the pen stays a mouse.
+    Unavailable,
 }
 
 impl Injector {
@@ -47,6 +90,9 @@ impl Injector {
             buttons: [false; 3],
             wheel: (0.0, 0.0),
             window: None,
+            pen: None,
+            pen_device: PenDevice::Untried,
+            at: None,
         };
         this.set_displays(&[display]);
         this
@@ -57,12 +103,72 @@ impl Injector {
         self.bounds = displays.iter().filter_map(|&id| video::rect_of(id)).collect();
     }
 
-    /// Moves the pointer to `x`, `y` (0..1) of the rectangle `r` (desktop pixels).
+    /// Moves the pointer to `x`, `y` (0..1) of the rectangle `r` (desktop pixels), as the
+    /// pen when it's near.
     fn move_in(&mut self, r: Rect, x: f32, y: f32) {
         let gx = r.x + x.clamp(0.0, 1.0) as f64 * (r.w - 1.0).max(0.0);
         let gy = r.y + y.clamp(0.0, 1.0) as f64 * (r.h - 1.0).max(0.0);
+        self.at = Some((gx.round() as i32, gy.round() as i32));
+        if self.pen_ready() {
+            self.pen_frame(if self.buttons[0] { PenPhase::Drag } else { PenPhase::Hover });
+            return;
+        }
         let (ax, ay) = absolute(gx, gy, virtual_screen());
         send(&[mouse(ax, ay, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)]);
+    }
+
+    /// The pen is near and can be injected as a pen.
+    fn pen_ready(&self) -> bool {
+        self.pen.is_some() && matches!(self.pen_device, PenDevice::Ready(_))
+    }
+
+    /// Makes the synthetic pen the first time one comes near.
+    fn ensure_pen_device(&mut self) {
+        if !matches!(self.pen_device, PenDevice::Untried) {
+            return;
+        }
+        // SAFETY: plain call; the device is destroyed on drop.
+        self.pen_device = match unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT) } {
+            Ok(d) => PenDevice::Ready(Device(d)),
+            Err(e) => {
+                tracing::info!("input: no pen injection ({e}); the pen works as a mouse");
+                PenDevice::Unavailable
+            }
+        };
+    }
+
+    /// One pen frame at the pointer, with the pen's pressure and tilt.
+    fn pen_frame(&self, phase: PenPhase) {
+        let (PenDevice::Ready(device), Some(pen), Some((x, y))) = (&self.pen_device, self.pen, self.at) else {
+            return;
+        };
+        let f = pen_frame(phase, pen.pressure, pen.tilt, pen.twist);
+        let info = POINTER_TYPE_INFO {
+            r#type: PT_PEN,
+            Anonymous: POINTER_TYPE_INFO_0 {
+                penInfo: POINTER_PEN_INFO {
+                    pointerInfo: POINTER_INFO {
+                        pointerType: PT_PEN,
+                        pointerFlags: POINTER_FLAGS(f.flags),
+                        ptPixelLocation: POINT { x, y },
+                        ButtonChangeType: POINTER_BUTTON_CHANGE_TYPE(f.button_change),
+                        ..Default::default()
+                    },
+                    penFlags: PEN_FLAG_NONE,
+                    penMask: PEN_MASK_PRESSURE | PEN_MASK_ROTATION | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
+                    pressure: f.pressure,
+                    rotation: f.rotation,
+                    tiltX: f.tilt_x,
+                    tiltY: f.tilt_y,
+                },
+            },
+        };
+        // SAFETY: a live device and one fully initialized pen frame.
+        if let Err(e) = unsafe { InjectSyntheticPointerInput(device.0, &[info]) } {
+            // Blocked like SendInput (an elevated window, the secure desktop), or a frame
+            // out of sequence.
+            tracing::debug!("input: pen {phase:?} not injected: {e}");
+        }
     }
 
     pub fn handle(&mut self, ev: Ev) {
@@ -77,8 +183,30 @@ impl Injector {
             Ev::MouseMoveBy { dx, dy } => send(&[mouse(dx.round() as i32, dy.round() as i32, 0, MOUSEEVENTF_MOVE)]),
             // Routed to crate::gamepad by the server, never here.
             Ev::Gamepad { .. } => {}
-            // Pressure needs pen injection; the pen still works as a mouse.
-            Ev::Pen { .. } => {}
+            Ev::Pen { near, pressure, tilt_x, tilt_y, twist } => {
+                let was_near = self.pen.is_some();
+                if near {
+                    self.ensure_pen_device();
+                    self.pen = Some(Pen { pressure, tilt: (tilt_x, tilt_y), twist });
+                    if !was_near && self.pen_ready() {
+                        // A button held as a mouse ends before the pen takes over.
+                        if self.buttons[0] {
+                            self.buttons[0] = false;
+                            send(&[mouse(0, 0, 0, MOUSEEVENTF_LEFTUP)]);
+                        }
+                        self.pen_frame(PenPhase::Hover);
+                    }
+                } else if was_near {
+                    self.pen_leaves();
+                }
+            }
+            Ev::MouseDown { button: 0 } | Ev::MouseUp { button: 0 } if self.pen_ready() => {
+                let down = matches!(ev, Ev::MouseDown { .. });
+                if down != self.buttons[0] {
+                    self.buttons[0] = down;
+                    self.pen_frame(if down { PenPhase::Down } else { PenPhase::Up });
+                }
+            }
             Ev::MouseDown { button } | Ev::MouseUp { button } => {
                 let down = matches!(ev, Ev::MouseDown { .. });
                 let flags = match (button, down) {
@@ -140,8 +268,23 @@ impl Injector {
         send(&wins.iter().map(|&k| keyboard(k, true)).collect::<Vec<_>>());
     }
 
+    /// The pen lifts (if touching) and goes out of range.
+    fn pen_leaves(&mut self) {
+        if self.pen_ready() {
+            if self.buttons[0] {
+                self.buttons[0] = false;
+                self.pen_frame(PenPhase::Up);
+            }
+            self.pen_frame(PenPhase::Leave);
+        }
+        self.pen = None;
+    }
+
     /// Releases anything still held, e.g. when a client disconnects mid-drag.
     pub fn release_all(&mut self) {
+        if self.pen.is_some() {
+            self.pen_leaves();
+        }
         for button in 0..3u8 {
             if self.buttons[button as usize] {
                 self.handle(Ev::MouseUp { button });
@@ -264,6 +407,15 @@ fn send(inputs: &[INPUT]) {
 /// Wakes the displays: a pointer nudge there and back counts as input.
 pub fn nudge() {
     send(&[mouse(1, 0, 0, MOUSEEVENTF_MOVE), mouse(-1, 0, 0, MOUSEEVENTF_MOVE)]);
+}
+
+impl Drop for Injector {
+    fn drop(&mut self) {
+        if let PenDevice::Ready(device) = self.pen_device {
+            // SAFETY: made by this injector and used by nothing else.
+            unsafe { DestroySyntheticPointerDevice(device.0) };
+        }
+    }
 }
 
 impl crate::media::InputSink for Injector {

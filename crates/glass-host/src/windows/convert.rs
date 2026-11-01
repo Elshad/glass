@@ -1,6 +1,6 @@
 //! The Windows port's arithmetic and naming, with no Win32 calls, so its tests run on any
-//! OS: an app's id from its executable, and UI Automation control types as the short
-//! roles snapshots show.
+//! OS: an app's id from its executable, UI Automation control types as the short roles
+//! snapshots show, and a pen frame's flags, pressure and tilt.
 
 /// An app's id, what grants and protected apps name it by: the executable's file name
 /// without `.exe`, lowercase ("windowsterminal"). Stable, unlike its localized description.
@@ -127,6 +127,74 @@ pub fn scaffolding(control_type: i32) -> bool {
     matches!(control_type, GROUP | PANE | CUSTOM)
 }
 
+/// POINTER_FLAG_* and POINTER_CHANGE_* (WinUser.h).
+pub mod pointer {
+    pub const IN_RANGE: u32 = 0x2;
+    pub const IN_CONTACT: u32 = 0x4;
+    pub const FIRST_BUTTON: u32 = 0x10;
+    pub const DOWN: u32 = 0x1_0000;
+    pub const UPDATE: u32 = 0x2_0000;
+    pub const UP: u32 = 0x4_0000;
+    pub const CHANGE_NONE: i32 = 0;
+    pub const CHANGE_FIRST_DOWN: i32 = 1;
+    pub const CHANGE_FIRST_UP: i32 = 2;
+}
+
+/// Where a pen frame falls in a stroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PenPhase {
+    /// Near the screen, not touching it.
+    Hover,
+    Down,
+    /// Moving while touching.
+    Drag,
+    Up,
+    /// Out of range: the pen leaves.
+    Leave,
+}
+
+/// One injected pen frame: what InjectSyntheticPointerInput's POINTER_PEN_INFO carries
+/// beyond the position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PenFrame {
+    pub flags: u32,
+    pub button_change: i32,
+    /// 0..1024; at least 1 while touching (as on macOS, a touch always has some).
+    pub pressure: u32,
+    /// Degrees, -90..90.
+    pub tilt_x: i32,
+    pub tilt_y: i32,
+    /// Degrees, 0..359.
+    pub rotation: u32,
+}
+
+pub fn pen_frame(phase: PenPhase, pressure: f32, tilt: (i8, i8), twist: f32) -> PenFrame {
+    use pointer::*;
+    let (flags, button_change) = match phase {
+        PenPhase::Hover => (IN_RANGE | UPDATE, CHANGE_NONE),
+        PenPhase::Down => (IN_RANGE | IN_CONTACT | FIRST_BUTTON | DOWN, CHANGE_FIRST_DOWN),
+        PenPhase::Drag => (IN_RANGE | IN_CONTACT | FIRST_BUTTON | UPDATE, CHANGE_NONE),
+        PenPhase::Up => (IN_RANGE | UP, CHANGE_FIRST_UP),
+        PenPhase::Leave => (UPDATE, CHANGE_NONE),
+    };
+    let touching = matches!(phase, PenPhase::Down | PenPhase::Drag);
+    let pressure = if touching {
+        let p = if pressure.is_finite() { pressure.clamp(0.0, 1.0) } else { 0.0 };
+        ((p * 1024.0).round() as u32).max(1)
+    } else {
+        0
+    };
+    let twist = if twist.is_finite() { twist } else { 0.0 };
+    PenFrame {
+        flags,
+        button_change,
+        pressure,
+        tilt_x: (tilt.0 as i32).clamp(-90, 90),
+        tilt_y: (tilt.1 as i32).clamp(-90, 90),
+        rotation: (twist.round() as i32).rem_euclid(360) as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +218,28 @@ mod tests {
         assert_eq!(short_role(1234, false), "custom");
         assert!(interactive(control::BUTTON) && !interactive(control::TEXT));
         assert!(editable(control::EDIT) && !editable(control::BUTTON));
+    }
+
+    #[test]
+    fn a_stroke_has_pressure_only_while_touching() {
+        let hover = pen_frame(PenPhase::Hover, 0.7, (10, -20), 30.0);
+        assert_eq!((hover.pressure, hover.flags), (0, pointer::IN_RANGE | pointer::UPDATE));
+        let down = pen_frame(PenPhase::Down, 0.5, (10, -20), 30.0);
+        assert_eq!((down.pressure, down.button_change), (512, pointer::CHANGE_FIRST_DOWN));
+        assert!(down.flags & pointer::IN_CONTACT != 0 && down.flags & pointer::DOWN != 0);
+        assert_eq!(pen_frame(PenPhase::Drag, 0.0, (0, 0), 0.0).pressure, 1);
+        assert_eq!(pen_frame(PenPhase::Drag, 2.0, (0, 0), 0.0).pressure, 1024);
+        assert_eq!(pen_frame(PenPhase::Drag, f32::NAN, (0, 0), 0.0).pressure, 1);
+        let up = pen_frame(PenPhase::Up, 0.5, (0, 0), 0.0);
+        assert_eq!((up.pressure, up.flags & pointer::IN_CONTACT), (0, 0));
+        assert_eq!(pen_frame(PenPhase::Leave, 0.0, (0, 0), 0.0).flags & pointer::IN_RANGE, 0);
+    }
+
+    #[test]
+    fn tilt_and_twist_stay_in_range() {
+        let f = pen_frame(PenPhase::Drag, 0.5, (-128, 127), -90.0);
+        assert_eq!((f.tilt_x, f.tilt_y, f.rotation), (-90, 90, 270));
+        assert_eq!(pen_frame(PenPhase::Drag, 0.5, (45, -45), 359.6).rotation, 0);
+        assert_eq!(pen_frame(PenPhase::Hover, 0.5, (45, -45), 720.0).rotation, 0);
     }
 }
