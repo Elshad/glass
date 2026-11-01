@@ -85,6 +85,17 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: 'dist-linux-${{ matrix.arch }}', path: dist/ }
 
+  # A zip and an MSI per architecture, signed. Authenticode signing (SHA-256, timestamped)
+  # covers glass.exe, glassw.exe and the MSI, with either
+  #   Azure Trusted Signing (now Artifact Signing): secrets AZURE_TENANT_ID, AZURE_CLIENT_ID
+  #     and AZURE_CLIENT_SECRET (an app registration with the "Trusted Signing Certificate
+  #     Profile Signer" role on the account), AZURE_SIGNING_ENDPOINT (the account's region,
+  #     e.g. https://eus.codesigning.azure.net/), AZURE_SIGNING_ACCOUNT (the account's name)
+  #     and AZURE_SIGNING_PROFILE (its certificate profile); or
+  #   a code-signing certificate: secrets WINDOWS_PFX (the .pfx file, base64) and
+  #     WINDOWS_PFX_PASSWORD.
+  # Azure wins when both are set. With neither, a hand-run build is unsigned (a warning) and
+  # a release fails, as macOS does without GLASS_SIGNING_KEY.
   windows:
     strategy:
       matrix:
@@ -94,6 +105,22 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: How to sign
+        id: sign
+        shell: pwsh
+        env:
+          AZURE: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_SIGNING_ACCOUNT != '' }}
+          PFX: ${{ secrets.WINDOWS_PFX != '' }}
+        run: |
+          $how = if ($env:AZURE -eq 'true') { 'azure' } elseif ($env:PFX -eq 'true') { 'pfx' } else { 'none' }
+          if ($how -eq 'none') {
+            if ($env:GITHUB_REF -like 'refs/tags/*') {
+              Write-Host '::error::release builds must be signed: set the Azure Trusted Signing secrets or WINDOWS_PFX (see release.yml)'
+              exit 1
+            }
+            Write-Host '::warning::unsigned Windows build (SmartScreen and Smart App Control will warn about it)'
+          }
+          "how=$how" >> $env:GITHUB_OUTPUT
       # NASM gives OpenH264 its x64 assembly (much faster encoding).
       - if: matrix.arch == 'x86_64'
         run: |
@@ -103,7 +130,84 @@ jobs:
         with: { targets: '${{ matrix.target }}' }
       - uses: Swatinem/rust-cache@v2
         with: { shared-key: 'release-${{ matrix.target }}', save-if: "${{ github.ref == 'refs/heads/main' }}" }
-      - run: pwsh scripts/package.ps1 ${{ matrix.arch }}
+      # WiX builds the MSI. Pinned to 5: later majors need their maintenance-fee EULA accepted.
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: 8.0.x }
+      - name: Install WiX
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Firewall.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+      - run: pwsh scripts/package.ps1 ${{ matrix.arch }} -Step stage
+
+      # The programs, before they go into the zip and the MSI.
+      - name: Sign the programs (Azure)
+        if: steps.sign.outputs.how == 'azure'
+        uses: azure/artifact-signing-action@v2.0.0 # formerly azure/trusted-signing-action
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: |
+            ${{ github.workspace }}\target\package\${{ matrix.arch }}\glass\bin\glass.exe
+            ${{ github.workspace }}\target\package\${{ matrix.arch }}\glass\bin\glassw.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: Glass
+          description-url: https://glassdesk.dev
+      - name: Sign the programs (certificate)
+        if: steps.sign.outputs.how == 'pfx'
+        shell: pwsh
+        env: { PFX: '${{ secrets.WINDOWS_PFX }}', GLASS_SIGN_PFX_PASSWORD: '${{ secrets.WINDOWS_PFX_PASSWORD }}' }
+        run: |
+          $env:GLASS_SIGN_PFX = Join-Path $env:RUNNER_TEMP 'glass.pfx'
+          [IO.File]::WriteAllBytes($env:GLASS_SIGN_PFX, [Convert]::FromBase64String($env:PFX))
+          try { ./scripts/sign.ps1 target/package/${{ matrix.arch }}/glass/bin/glass.exe target/package/${{ matrix.arch }}/glass/bin/glassw.exe }
+          finally { Remove-Item $env:GLASS_SIGN_PFX }
+
+      - run: pwsh scripts/package.ps1 ${{ matrix.arch }} -Step bundle
+
+      - name: Sign the MSI (Azure)
+        if: steps.sign.outputs.how == 'azure'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: msi
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: Glass
+          description-url: https://glassdesk.dev
+      - name: Sign the MSI (certificate)
+        if: steps.sign.outputs.how == 'pfx'
+        shell: pwsh
+        env: { PFX: '${{ secrets.WINDOWS_PFX }}', GLASS_SIGN_PFX_PASSWORD: '${{ secrets.WINDOWS_PFX_PASSWORD }}' }
+        run: |
+          $env:GLASS_SIGN_PFX = Join-Path $env:RUNNER_TEMP 'glass.pfx'
+          [IO.File]::WriteAllBytes($env:GLASS_SIGN_PFX, [Convert]::FromBase64String($env:PFX))
+          try { ./scripts/sign.ps1 (Get-ChildItem dist/*.msi).FullName }
+          finally { Remove-Item $env:GLASS_SIGN_PFX }
+      # A release must be signed all the way through, whichever way it was.
+      - name: Check the signatures
+        if: steps.sign.outputs.how != 'none'
+        shell: pwsh
+        run: |
+          foreach ($f in @(Get-ChildItem target/package/${{ matrix.arch }}/glass/bin/*.exe) + @(Get-ChildItem dist/*.msi)) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            if (-not $sig.SignerCertificate -or -not $sig.TimeStamperCertificate) { throw "$($f.Name) isn't signed and timestamped" }
+            Write-Host "$($f.Name): $($sig.Status), $($sig.SignerCertificate.Subject)"
+          }
+
+      - run: pwsh scripts/package.ps1 ${{ matrix.arch }} -Step sums
       - uses: actions/upload-artifact@v4
         with: { name: 'dist-windows-${{ matrix.arch }}', path: dist/ }
 
@@ -131,6 +235,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           awk -v v="## $version" '$0 == v { on = 1; next } on && /^## / { exit } on' CHANGELOG.md > notes.md
           test -s notes.md || { echo "CHANGELOG.md has no '## $version' entry"; exit 1; }
+          # Every platform's archive, the Windows MSIs, and their .sha256 files.
           gh release create "$GITHUB_REF_NAME" dist/glass-[0-9]* --notes-file notes.md --generate-notes --title "Glass $GITHUB_REF_NAME"
       - uses: actions/setup-node@v4
         if: env.CLOUDFLARE_API_TOKEN != ''

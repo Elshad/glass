@@ -77,10 +77,12 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Feature | macOS | Linux | Windows | Notes |
 |---|---|---|---|---|
 | One-line install | ✅ install.sh | ✅ install.sh | ✅ install.ps1 | `irm glassdesk.dev \| iex` |
-| Release builds | ✅ universal | ✅ x86_64 | 🧪 x64 + Arm64 zips | |
+| Release builds | ✅ universal | ✅ x86_64 | 🧪 x64 + Arm64 zips and MSIs | |
+| Signed builds | ✅ stable identity | — | 🧪 Authenticode, timestamped | Windows: Azure Trusted Signing or a .pfx (release.yml) |
+| Managed deployment | ❌ | ❌ | 🧪 per-machine MSI | `msiexec /i glass-….msi /qn`; Program Files, starts for every user, firewall rule |
 | Admin policies (locked settings) | ❌ | ❌ | 🧪 Group Policy / Intune (ADMX) | HKLM/HKCU\SOFTWARE\Policies\Glass; packaging/windows/policies |
 | Background service | ✅ LaunchAgent | ✅ systemd user | ✅ glassw at sign-in | |
-| Self-update | ✅ | ✅ | ✅ | Windows: a policy can turn updates off |
+| Self-update | ✅ | ✅ | ✅ | Windows MSI installs update with the MSI or winget; a policy can turn updates off |
 | Guided setup | ✅ | ✅ | ✅ (unattended) | Windows adds a firewall rule (one UAC prompt) |
 | Desktop app | ✅ Glass.app | ❌ | ✅ Start menu | Same window |
 | Status icon (who's viewing, quick controls) | ✅ menu bar | ❌ | ✅ notification area | |

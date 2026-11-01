@@ -474,9 +474,10 @@ cpSync('../web', 'public/app', { recursive: true });
 mkdirSync('public/releases', { recursive: true });
 const dist = '../dist';
 const PLATFORMS = ['darwin-universal', 'linux-x86_64', 'linux-aarch64'];
-// Windows ships zips; optional until releases include them.
+// Windows ships zips (the installer's), and MSIs for managed installs; optional until
+// releases include them.
 const WINDOWS = ['windows-x86_64', 'windows-arm64'];
-const archive = (p) => (p.startsWith('windows-') ? 'zip' : 'tar.gz');
+const archives = (p) => (p.startsWith('windows-') ? ['zip', 'msi'] : ['tar.gz']);
 const missing = () => PLATFORMS.some((p) => !existsSync(`${dist}/glass-${version}-${p}.tar.gz`));
 if (missing()) {
   try {
@@ -499,14 +500,16 @@ if (existsSync(dist)) {
 }
 // The installer verifies each platform's "latest" tarball against this checksum.
 for (const p of [...PLATFORMS, ...WINDOWS]) {
-  const release = `${dist}/glass-${version}-${p}.${archive(p)}`;
-  const f = `glass-latest-${p}.${archive(p)}`;
-  if (!existsSync(release)) continue;
-  if (small(release)) copyFileSync(release, `public/releases/${f}`);
-  else rmSync(`public/releases/${f}`, { force: true });
-  // Hash the file itself: with several versions around, any lookup by name can pick a stale one.
-  const sum = createHash('sha256').update(readFileSync(release)).digest('hex');
-  writeFileSync(`public/releases/${f}.sha256`, `${sum}  ${f}\n`);
+  for (const ext of archives(p)) {
+    const release = `${dist}/glass-${version}-${p}.${ext}`;
+    const f = `glass-latest-${p}.${ext}`;
+    if (!existsSync(release)) continue;
+    if (small(release)) copyFileSync(release, `public/releases/${f}`);
+    else rmSync(`public/releases/${f}`, { force: true });
+    // Hash the file itself: with several versions around, any lookup by name can pick a stale one.
+    const sum = createHash('sha256').update(readFileSync(release)).digest('hex');
+    writeFileSync(`public/releases/${f}.sha256`, `${sum}  ${f}\n`);
+  }
 }
 
 console.log('built: index.html, features/, help/, computers/, guides/, vs/, changelog/, changelog.md, skill.md, llms.txt, llms-full.txt, docs.md, docs/index.html, index.md, sitemap.xml, app/, releases/');

@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Glass for everyone on a computer, for managed deployment (Intune, Group Policy, SCCM):
+    msiexec /i glass-<version>-windows-<arch>.msi /qn
+  Built by scripts/package.ps1 with WiX Toolset 5 (wix build -arch x64|arm64 -d Version=…
+  -d Stage=… -d Icon=…). Installs to Program Files\Glass with the zip's layout, starts glassw
+  for each user who signs in (the HKLM Run key), adds the Start menu shortcut, puts glass on
+  the PATH and lets Glass through Windows Defender Firewall on private networks, as
+  `glass setup` would. The host finds this copy through HKLM\SOFTWARE\Glass InstallDir
+  (src/windows/agent.rs). Settings stay in each user's profile and survive uninstalling.
+
+  The UpgradeCode never changes: each new MSI replaces the one before (MajorUpgrade).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="Glass" Manufacturer="Glass" Version="$(var.Version)"
+           UpgradeCode="83EBD5C2-954D-4113-A3C1-4797653E5386" Scope="perMachine" Compressed="yes">
+    <SummaryInformation Description="Glass: your computer, in any browser" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Glass is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="Glass.ico" SourceFile="$(var.Icon)" />
+    <Property Id="ARPPRODUCTICON" Value="Glass.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://glassdesk.dev" />
+    <Property Id="ARPHELPLINK" Value="https://glassdesk.dev/docs" />
+
+    <!-- Running copies hold their files open: stop them first (each user's glassw starts
+         again at their next sign-in; whoever ran the installer gets the app back below). -->
+    <util:CloseApplication Id="CloseGlassw" Target="glassw.exe" CloseMessage="no" RebootPrompt="no" TerminateProcess="0" />
+    <util:CloseApplication Id="CloseGlass" Target="glass.exe" CloseMessage="no" RebootPrompt="no" TerminateProcess="0" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Glass">
+        <Directory Id="BinFolder" Name="bin">
+          <Component Id="GlassExe">
+            <File Id="GlassExe" Source="$(var.Stage)\bin\glass.exe" KeyPath="yes">
+              <!-- The rule `glass setup` adds: private networks (home, work, Tailscale) only. -->
+              <fw:FirewallException Id="GlassFirewall" Name="Glass" Profile="private" Scope="any" IgnoreFailure="yes" />
+            </File>
+            <Environment Id="GlassPath" Name="PATH" Value="[BinFolder]" Part="last" Action="set" System="yes" />
+          </Component>
+          <Component Id="GlasswExe">
+            <File Id="GlasswExe" Source="$(var.Stage)\bin\glassw.exe" KeyPath="yes" />
+            <!-- Starts the background launcher for every user at sign-in. -->
+            <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run" Name="Glass"
+                           Type="string" Value="&quot;[#GlasswExe]&quot;" />
+          </Component>
+        </Directory>
+        <Directory Id="ShareFolder" Name="share">
+          <Directory Id="ShareGlassFolder" Name="glass">
+            <Directory Id="WebFolder" Name="web" />
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenu">
+        <Shortcut Id="GlassShortcut" Name="Glass" Description="Glass: your computer, in any browser"
+                  Target="[#GlasswExe]" Arguments="app" WorkingDirectory="BinFolder" Icon="Glass.ico" />
+        <!-- How the host knows it's installed for everyone, and where. -->
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Glass" Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <ComponentGroup Id="Web" Directory="WebFolder">
+      <Files Include="$(var.Stage)\share\glass\web\**" />
+    </ComponentGroup>
+
+    <Feature Id="Glass" Title="Glass">
+      <ComponentRef Id="GlassExe" />
+      <ComponentRef Id="GlasswExe" />
+      <ComponentRef Id="StartMenu" />
+      <ComponentGroupRef Id="Web" />
+    </Feature>
+
+    <!-- Installed by hand (with its window): open the app, as the person who ran it, to set
+         Glass up. A silent install (/qn) leaves that to sign-in. -->
+    <CustomAction Id="OpenGlass" Directory="BinFolder" ExeCommand="&quot;[#GlasswExe]&quot; app" Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
+    <InstallExecuteSequence>
+      <Custom Action="OpenGlass" After="InstallFinalize" Condition="UILevel &gt;= 5 AND NOT REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

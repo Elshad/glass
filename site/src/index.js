@@ -134,7 +134,7 @@ export default {
 
     if (url.pathname.endsWith('.mp4')) return ranged(await env.ASSETS.fetch(request), request);
 
-    if (url.pathname.startsWith('/releases/') && /\.(tar\.gz|zip)$/.test(url.pathname)) {
+    if (url.pathname.startsWith('/releases/') && /\.(tar\.gz|zip|msi)$/.test(url.pathname)) {
       const name = url.pathname.slice('/releases/'.length);
       ctx.waitUntil(recordDownload(env, request, 'release', name, 'download'));
       const res = await env.ASSETS.fetch(request);
@@ -146,14 +146,14 @@ export default {
   },
 };
 
-/** A tarball or zip kept only on GitHub: `glass-latest-*` means the version in version.json. */
+/** A tarball, zip or MSI kept only on GitHub: `glass-latest-*` means the version in version.json. */
 export async function releaseRedirect(env, url, name) {
   let file = name;
   if (file.startsWith('glass-latest-')) {
     const { version } = await (await env.ASSETS.fetch(new URL('/version.json', url))).json();
     file = file.replace('glass-latest-', `glass-${version}-`);
   }
-  const version = file.match(/^glass-(\d+\.\d+\.\d+)-[\w.-]+\.(tar\.gz|zip)$/)?.[1];
+  const version = file.match(/^glass-(\d+\.\d+\.\d+)-[\w.-]+\.(tar\.gz|zip|msi)$/)?.[1];
   if (!version) return new Response('Not found', { status: 404 });
   return Response.redirect(`https://github.com/Ntarasiuk/glass/releases/download/v${version}/${file}`, 302);
 }

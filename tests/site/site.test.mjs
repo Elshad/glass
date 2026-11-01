@@ -180,6 +180,9 @@ test('a tarball too big for the site redirects to the GitHub release', async () 
   assert.equal((await get('/releases/nope.tar.gz')).status, 404);
   const windows = await get('/releases/glass-9.9.9-windows-arm64.zip');
   assert.equal(windows.headers.get('location'), 'https://github.com/Ntarasiuk/glass/releases/download/v9.9.9/glass-9.9.9-windows-arm64.zip');
+  const msi = await get('/releases/glass-latest-windows-x86_64.msi');
+  assert.equal(msi.status, 302);
+  assert.equal(msi.headers.get('location'), `https://github.com/Ntarasiuk/glass/releases/download/v${version}/glass-${version}-windows-x86_64.msi`);
 });
 
 test('PowerShell gets Windows quick support at /help', async () => {
