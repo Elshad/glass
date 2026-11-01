@@ -64,7 +64,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | "Someone is viewing" notice | ✅ app | ✅ | 🧪 | |
 | Drawings shown on the host | ✅ overlay | ❌ | ❌ | Windows could reuse the privacy overlay trick |
 | Privacy screen | ✅ | ❌ | ✅ capture-excluded overlay | |
-| Quick support (`glass support`) | ✅ | ✅ | 🧪 | Windows has no `help.ps1` one-liner yet |
+| Quick support (`glass support`, one-liner) | ✅ | ✅ | ✅ `irm glassdesk.dev/help \| iex` | Windows asks about the firewall once per session (Cancel is fine) |
 | Terminal in the viewer | ✅ | ✅ | ✅ ConPTY | |
 | Agent screenshots, clicks, keys | ✅ | ✅ | ✅ | |
 | Agent `snapshot` (window as text) | ✅ Accessibility | ❌ | ✅ UI Automation | |
@@ -81,7 +81,8 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Background service | ✅ LaunchAgent | ✅ systemd user | ✅ glassw at sign-in | |
 | Self-update | ✅ | ✅ | ✅ | |
 | Guided setup | ✅ | ✅ | ✅ (unattended) | Windows adds a firewall rule (one UAC prompt) |
-| Desktop app | ✅ Glass.app | ❌ | ✅ Start menu | Same window; no tray icon yet (the Mac has a menu bar item) |
+| Desktop app | ✅ Glass.app | ❌ | ✅ Start menu | Same window |
+| Status icon (who's viewing, quick controls) | ✅ menu bar | ❌ | ✅ notification area | |
 | CLI ↔ host channel | ✅ Unix socket | ✅ Unix socket | ✅ named pipe | |
 | Fleet reports | ✅ | ✅ | 🧪 | |
 | Fleet scripts | ✅ | ✅ | 🧪 .ps1/.cmd/.bat/.exe | |
