@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device,
     ID3D11DeviceContext, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
@@ -34,6 +34,7 @@ use crate::mailbox::{FrameSender, Mailbox};
 use crate::media::VideoSource;
 pub use crate::media::{AudioPackets, DisplayInfo, EncodedFrame, Layout};
 use crate::soft_encode::{Encoder, Frame, PixelFormat};
+use crate::win_capture::{Crop, Rotation, blit};
 
 /// How long an encoder waits for a new frame before checking for a keyframe request it
 /// can satisfy by re-encoding the last one (static screens produce no new frames).
@@ -220,9 +221,12 @@ struct Duplicator {
     context: ID3D11DeviceContext,
     dup: IDXGIOutputDuplication,
     staging: Option<ID3D11Texture2D>,
+    /// The desktop image's size as scanned out (on its side for a portrait display).
     width: usize,
     height: usize,
-    /// Where the pointer is on this display (its top-left), if it's here and visible.
+    /// How to turn the image upright.
+    rotation: Rotation,
+    /// Where the pointer is on this display (its top-left, upright), if it's here and visible.
     pointer: Option<(i32, i32)>,
     /// The staging copy holds a desktop image (not just a pointer move) yet.
     has_image: bool,
@@ -257,9 +261,6 @@ impl Duplicator {
             let (device, context) = (device.context("no device")?, context.context("no context")?);
             let dup = output.DuplicateOutput(&device).context("DuplicateOutput")?;
             let desc = dup.GetDesc();
-            if desc.Rotation != DXGI_MODE_ROTATION_IDENTITY && desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED {
-                warn!("{device_name} is rotated; its picture is sent unrotated for now");
-            }
             Ok(Self {
                 _device: device,
                 context,
@@ -267,6 +268,7 @@ impl Duplicator {
                 staging: None,
                 width: desc.ModeDesc.Width as usize,
                 height: desc.ModeDesc.Height as usize,
+                rotation: Rotation::from_dxgi(desc.Rotation.0),
                 pointer: None,
                 has_image: false,
             })
@@ -360,28 +362,32 @@ impl Duplicator {
         Ok(texture.expect("CreateTexture2D returned no texture"))
     }
 
-    /// Copies the staging image, with the pointer drawn in, into the next mailbox frame.
+    /// Copies the staging image, turned upright and with the pointer drawn in, into the
+    /// next mailbox frame.
     unsafe fn copy_out(&mut self, tx: &FrameSender, captured_us: u64) -> windows::core::Result<()> {
         let staging = self.staging.as_ref().expect("has_image without staging");
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         // SAFETY: the staging texture is CPU-readable; it's unmapped below.
         unsafe { self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
-        let (width, height, stride) = (self.width, self.height, mapped.RowPitch as usize);
+        let scanned = (self.width, self.height);
+        let (width, height) = self.rotation.upright(scanned);
         let mut pixels = tx.0.buffer();
-        pixels.clear();
         // SAFETY: a mapped staging texture is RowPitch × height readable bytes.
-        pixels.extend_from_slice(unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, stride * height) });
+        let src = unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, mapped.RowPitch as usize * self.height) };
+        blit(src, scanned, mapped.RowPitch as usize, self.rotation, Crop { x: 0, y: 0, w: width, h: height }, &mut pixels);
         // SAFETY: mapped above.
         unsafe { self.context.Unmap(staging, 0) };
+        // Duplication gives the pointer's position and shape the way the desktop is seen
+        // (upright), so it's drawn after turning the picture.
         let shape = POINTER.lock().unwrap().shape.clone();
         if let (Some((x, y)), Some(shape)) = (self.pointer, shape) {
-            draw_pointer(&mut pixels, width, height, stride, &shape, x, y);
+            draw_pointer(&mut pixels, width, height, width * 4, &shape, x, y);
         }
         tx.0.put(
             Frame {
                 width,
                 height,
-                stride,
+                stride: width * 4,
                 format: PixelFormat::Bgrx,
                 data: pixels,
             },
@@ -398,7 +404,11 @@ fn capture_loop(id: usize, device: String, tx: FrameSender) {
     loop {
         let mut dup = match Duplicator::new(&device) {
             Ok(d) => {
-                info!("screen {id} ({device}): capturing {}x{}", d.width, d.height);
+                let (w, h) = d.rotation.upright((d.width, d.height));
+                match d.rotation {
+                    Rotation::None => info!("screen {id} ({device}): capturing {w}x{h}"),
+                    r => info!("screen {id} ({device}): capturing {w}x{h}, turned upright ({r:?})"),
+                }
                 failing_since = None;
                 d
             }
@@ -901,7 +911,7 @@ mod tests {
         while Instant::now() < deadline {
             dup.next(&tx).unwrap();
             if let Ok((frame, _)) = mailbox.recv_timeout(Duration::ZERO) {
-                assert_eq!((frame.width, frame.height), (dup.width, dup.height));
+                assert_eq!((frame.width, frame.height), dup.rotation.upright((dup.width, dup.height)));
                 return;
             }
         }

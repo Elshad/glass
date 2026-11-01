@@ -1,9 +1,122 @@
-//! The parts of Windows capture and hardware encoding that don't call Windows: NV12 and
-//! fixing up encoder output to Annex B with parameter sets. Kept apart so their tests run
-//! on every OS.
+//! The parts of Windows capture and hardware encoding that don't call Windows: turning
+//! duplicated pictures upright, NV12, and fixing up encoder output to Annex B with
+//! parameter sets. Kept apart so their tests run on every OS.
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use crate::soft_encode::{Frame, to_i420};
+
+/// How a display's scan-out is turned relative to the desktop (DXGI_MODE_ROTATION).
+/// Desktop Duplication hands over the picture as scanned out, so a portrait display's
+/// picture arrives on its side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rotation {
+    None,
+    Cw90,
+    Cw180,
+    Cw270,
+}
+
+impl Rotation {
+    /// From DXGI_MODE_ROTATION (0 unspecified, 1 identity, 2/3/4 a quarter turn each).
+    pub fn from_dxgi(value: i32) -> Self {
+        match value {
+            2 => Self::Cw90,
+            3 => Self::Cw180,
+            4 => Self::Cw270,
+            _ => Self::None,
+        }
+    }
+
+    /// The upright size of a picture that's `size` as scanned out.
+    pub fn upright(self, (w, h): (usize, usize)) -> (usize, usize) {
+        match self {
+            Self::Cw90 | Self::Cw270 => (h, w),
+            Self::None | Self::Cw180 => (w, h),
+        }
+    }
+
+    /// Where upright pixel (`x`, `y`) of a `w`×`h` upright picture is in the scanned-out
+    /// one. Matches the Desktop Duplication sample's rotation handling.
+    fn source(self, (w, h): (usize, usize), x: usize, y: usize) -> (usize, usize) {
+        match self {
+            Self::None => (x, y),
+            Self::Cw90 => (y, w - 1 - x),
+            Self::Cw180 => (w - 1 - x, h - 1 - y),
+            Self::Cw270 => (h - 1 - y, x),
+        }
+    }
+}
+
+/// A rectangle of a picture, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Crop {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// Square blocks rotated at a time, so reads down a column stay in cache.
+const TILE: usize = 32;
+
+/// Copies `crop` of the upright picture into `dst` (rows `crop.w * 4` bytes, no padding),
+/// from `src`: 4-byte pixels as scanned out, `size` pixels, rows `stride` bytes apart.
+pub fn blit(src: &[u8], size: (usize, usize), stride: usize, rotation: Rotation, crop: Crop, dst: &mut Vec<u8>) {
+    let up = rotation.upright(size);
+    assert!(crop.x + crop.w <= up.0 && crop.y + crop.h <= up.1, "crop outside the picture");
+    let row = crop.w * 4;
+    dst.clear();
+    dst.resize(row * crop.h, 0);
+    if crop.w == 0 || crop.h == 0 {
+        return;
+    }
+    if rotation == Rotation::None {
+        for (y, out) in dst.chunks_exact_mut(row).enumerate() {
+            let at = (crop.y + y) * stride + crop.x * 4;
+            out.copy_from_slice(&src[at..at + row]);
+        }
+        return;
+    }
+    // Bands of rows rotate in parallel: at 4K a single thread took about a frame's time.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4);
+    let band = crop.h.div_ceil(threads).div_ceil(TILE) * TILE;
+    std::thread::scope(|s| {
+        for (i, out) in dst.chunks_mut(band * row).enumerate() {
+            s.spawn(move || {
+                let rows = out.len() / row;
+                rotate_band(src, up, stride, rotation, crop, i * band, rows, out);
+            });
+        }
+    });
+}
+
+/// Rotates upright rows `y0..y0 + rows` of `crop` into `out`, a tile at a time.
+#[allow(clippy::too_many_arguments)]
+fn rotate_band(src: &[u8], up: (usize, usize), stride: usize, rotation: Rotation, crop: Crop, y0: usize, rows: usize, out: &mut [u8]) {
+    // Bytes between the source pixels of neighbouring upright pixels in a row.
+    let step: isize = match rotation {
+        Rotation::None => 4,
+        Rotation::Cw90 => -(stride as isize),
+        Rotation::Cw180 => -4,
+        Rotation::Cw270 => stride as isize,
+    };
+    let row = crop.w * 4;
+    for ty in (0..rows).step_by(TILE) {
+        for tx in (0..crop.w).step_by(TILE) {
+            let tw = TILE.min(crop.w - tx);
+            for y in ty..(ty + TILE).min(rows) {
+                let (sx, sy) = rotation.source(up, crop.x + tx, crop.y + y0 + y);
+                let mut at = (sy * stride + sx * 4) as isize;
+                let dst = &mut out[y * row + tx * 4..][..tw * 4];
+                for px in dst.chunks_exact_mut(4) {
+                    let a = at as usize;
+                    px.copy_from_slice(&src[a..a + 4]);
+                    at += step;
+                }
+            }
+        }
+    }
+}
 
 /// Largest picture side H.264 hardware encoders take (level 5.1); bigger screens are halved.
 const MAX_SIDE: usize = 4096;
@@ -140,6 +253,75 @@ impl ParamSets {
 mod tests {
     use super::*;
     use crate::soft_encode::PixelFormat;
+
+    /// A `w`×`h` picture whose pixels hold their own coordinates, rows padded.
+    fn coords(w: usize, h: usize, stride: usize) -> Vec<u8> {
+        let mut data = vec![0xEE; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                data[y * stride + x * 4..][..4].copy_from_slice(&[x as u8, y as u8, (x >> 8) as u8, (y >> 8) as u8]);
+            }
+        }
+        data
+    }
+
+    fn at(pixels: &[u8], w: usize, x: usize, y: usize) -> (usize, usize) {
+        let p = &pixels[(y * w + x) * 4..][..4];
+        (p[0] as usize | (p[2] as usize) << 8, p[1] as usize | (p[3] as usize) << 8)
+    }
+
+    #[test]
+    fn rotations_turn_the_picture_upright() {
+        // Scanned out 3×2 (a portrait display's picture lies on its side).
+        let src = coords(3, 2, 16);
+        let all = |rotation: Rotation| {
+            let (w, h) = rotation.upright((3, 2));
+            let mut dst = Vec::new();
+            blit(&src, (3, 2), 16, rotation, Crop { x: 0, y: 0, w, h }, &mut dst);
+            (w, dst)
+        };
+        let (w, none) = all(Rotation::None);
+        assert_eq!((at(&none, w, 0, 0), at(&none, w, 2, 1)), ((0, 0), (2, 1)));
+        // A quarter turn clockwise: the source's left column becomes the top row, read
+        // bottom to top.
+        let (w, cw90) = all(Rotation::Cw90);
+        assert_eq!(w, 2);
+        assert_eq!([at(&cw90, w, 0, 0), at(&cw90, w, 1, 0), at(&cw90, w, 0, 2)], [(0, 1), (0, 0), (2, 1)]);
+        let (w, cw180) = all(Rotation::Cw180);
+        assert_eq!([at(&cw180, w, 0, 0), at(&cw180, w, 2, 1)], [(2, 1), (0, 0)]);
+        let (w, cw270) = all(Rotation::Cw270);
+        assert_eq!([at(&cw270, w, 0, 0), at(&cw270, w, 1, 0), at(&cw270, w, 0, 2)], [(2, 0), (2, 1), (0, 0)]);
+    }
+
+    #[test]
+    fn rotating_four_quarter_turns_is_the_identity() {
+        // Bigger than a tile, odd sizes, padded rows: exercises the tiled, banded path.
+        let (w, h) = (75, 41);
+        let src = coords(w, h, w * 4 + 8);
+        let mut pic = src.clone();
+        let (mut size, mut stride) = ((w, h), w * 4 + 8);
+        for _ in 0..4 {
+            let up = Rotation::Cw90.upright(size);
+            let mut out = Vec::new();
+            blit(&pic, size, stride, Rotation::Cw90, Crop { x: 0, y: 0, w: up.0, h: up.1 }, &mut out);
+            (pic, size, stride) = (out, up, up.0 * 4);
+        }
+        let mut expect = Vec::new();
+        blit(&src, (w, h), w * 4 + 8, Rotation::None, Crop { x: 0, y: 0, w, h }, &mut expect);
+        assert_eq!(pic, expect);
+    }
+
+    #[test]
+    fn crops_come_from_the_upright_picture() {
+        let src = coords(50, 40, 200);
+        let crop = Crop { x: 3, y: 5, w: 10, h: 7 };
+        let mut dst = Vec::new();
+        blit(&src, (50, 40), 200, Rotation::None, crop, &mut dst);
+        assert_eq!((at(&dst, 10, 0, 0), at(&dst, 10, 9, 6)), ((3, 5), (12, 11)));
+        // Upright 40×50 from a quarter turn: upright (x, y) is source (y, 39 - x).
+        blit(&src, (50, 40), 200, Rotation::Cw90, crop, &mut dst);
+        assert_eq!((at(&dst, 10, 0, 0), at(&dst, 10, 9, 6)), ((5, 36), (11, 27)));
+    }
 
     #[test]
     fn hardware_encodes_4k_whole_and_halves_bigger() {
