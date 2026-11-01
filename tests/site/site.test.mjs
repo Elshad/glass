@@ -182,6 +182,13 @@ test('a tarball too big for the site redirects to the GitHub release', async () 
   assert.equal(windows.headers.get('location'), 'https://github.com/Ntarasiuk/glass/releases/download/v9.9.9/glass-9.9.9-windows-arm64.zip');
 });
 
+test('PowerShell gets Windows quick support at /help', async () => {
+  for (const res of [await get('/help.ps1'), await get('/help', 'Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.26100; en-US) PowerShell/7.5.0')]) {
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /Glass quick support for Windows/);
+  }
+});
+
 test('PowerShell gets the Windows installer', async () => {
   for (const res of [await get('/install.ps1'), await get('/', 'Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.26100; en-US) PowerShell/7.5.0'), await get('/', 'Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.1')]) {
     assert.equal(res.status, 200);

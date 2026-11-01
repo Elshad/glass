@@ -82,6 +82,14 @@ export default {
 
     // An agent asking for markdown gets the page's markdown twin, even from curl; `curl … | sh` never asks.
     const wantsMarkdown = /\btext\/markdown\b/i.test(request.headers.get('accept') ?? '');
+    // Quick support on Windows: `irm glassdesk.dev/help | iex`.
+    if (url.pathname === '/help.ps1' || (url.pathname === '/help' && POWERSHELL.test(ua) && !wantsMarkdown)) {
+      ctx.waitUntil(recordDownload(env, request, 'script', 'help.ps1', 'quick_support'));
+      const res = await env.ASSETS.fetch(new URL('/help.ps1', url));
+      return new Response(res.body, {
+        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'strict-transport-security': HSTS },
+      });
+    }
     // Quick support: `curl glassdesk.dev/help | sh` runs Glass for one session, installing nothing.
     if (url.pathname === '/help.sh' || (url.pathname === '/help' && CLI_AGENT.test(ua) && !wantsMarkdown)) {
       ctx.waitUntil(recordDownload(env, request, 'script', 'help.sh', 'quick_support'));

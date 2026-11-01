@@ -282,8 +282,14 @@ impl Render for SupportView {
                     .child(
                         v_flex()
                             .gap_2()
-                            .child(Button::new("stop").danger().w_full().icon(I::Power).label("Stop sharing").on_click(|_, _, cx| {
-                                cx.dispatch_action(&super::Quit);
+                            .child(Button::new("stop").danger().w_full().icon(I::Power).label("Stop sharing").on_click({
+                                // Stops the session itself: a dispatched Quit reached no handler on
+                                // Windows (closing the window worked; this button did nothing).
+                                let session = self.session.clone();
+                                move |_, _, cx| {
+                                    session.lock().unwrap().stop();
+                                    cx.quit();
+                                }
                             }))
                             .child(
                                 div()
