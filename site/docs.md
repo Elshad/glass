@@ -42,7 +42,7 @@ Features:
 - **One window.** Stream a single app's window instead of the whole display (macOS).
 - **Terminal and ports.** A shell on the computer inside the viewer, and its local web servers (`/fwd/3000/`) opened from your tailnet.
 - **Recording.** Record sessions to MP4 on the computer, per session or always.
-- **Microphone and controllers.** Your microphone reaches the computer, so its apps hear you (on a Mac through Glass Microphone, a small audio driver Glass installs with one password prompt). Game controllers reach Linux hosts.
+- **Microphone and controllers.** Your microphone reaches the computer, so its apps hear you (on a Mac through Glass Microphone, a small audio driver Glass installs with one password prompt). Game controllers reach Linux hosts, and Windows hosts with the free ViGEmBus driver.
 - **Keyboards per machine.** ⌘↔Ctrl, PC-keyboard and ⌘/⌥ swaps are remembered for each computer; an optional shortcut bar puts Mac shortcuts one tap away.
 - **Power.** Wake a sleeping machine (Wake-on-LAN), restart Glass or the whole computer and reconnect.
 - **AI agents, supervised.** `glass mcp` lets Claude Code, Claude Desktop, Cursor or any MCP client use the computer (and your other computers running Glass) while you watch each step, pause or stop it, and approve anything risky, from the viewer, the Mac app or a notification. On a Mac it can also read an app's window as text (`snapshot`) and press buttons or fill in fields by reference (`press`, `set_value`), without moving your pointer.
@@ -365,7 +365,7 @@ More in the toolbar:
 
 **As an installed app** (Home Screen, or **Install Glass**): long-press the icon for Chat, Machines, Send files and each of your other machines; share photos, files or text to Glass from other apps (Android, ChromeOS, desktop) to send them to the computer; open files with Glass on the desktop; `web+glass://<machine>` links open that machine. It opens even when the computer can't be reached, and says so. Only one tab of a browser shows a computer at a time; another tab asks before taking over.
 
-Game controllers connected to the viewing device work on Linux hosts as a virtual Xbox 360 controller.
+Game controllers connected to the viewing device work on Linux hosts, and on Windows hosts with the free [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver installed, as a virtual Xbox 360 controller.
 
 Local shortcuts (not sent to the Mac): Ctrl+Shift+F toggles fullscreen, Ctrl+Shift+H toggles the stats overlay.
 
