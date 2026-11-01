@@ -166,6 +166,42 @@ fn focus_window() -> Option<HWND> {
     }
 }
 
+/// Whether the foreground window belongs to an elevated (higher-integrity) process, which
+/// this unelevated host's SendInput can't reach (UIPI). Such input must go through the
+/// SYSTEM secure-desktop helper instead (see `windows::secure`).
+pub fn foreground_is_elevated() -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows::Win32::System::Threading::OpenProcessToken;
+    // SAFETY: plain queries; the process and token handles are closed before returning.
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() {
+            return false;
+        }
+        let pid = window_pid(fg);
+        let Ok(proc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return false };
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(proc, TOKEN_QUERY, &mut token).is_ok();
+        let _ = CloseHandle(proc);
+        if !opened {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&raw mut elevation).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && elevation.TokenIsElevated != 0
+    }
+}
+
 /// The app that has the keyboard.
 pub fn key_app() -> Option<String> {
     focus_window().and_then(|h| bundle_of(window_pid(h) as i32))

@@ -474,6 +474,9 @@ impl Duplicator {
 fn capture_loop(id: usize, device: String, monitor: Arc<Monitor>, tx: FrameSender) {
     let mut failing_since: Option<Instant> = None;
     loop {
+        // In the secure-desktop helper, follow the input desktop so duplication can see the
+        // lock screen / UAC desktop. A no-op in the ordinary per-user host.
+        super::secure::follow_input_desktop();
         let mut dup = match Duplicator::new(&device) {
             Ok(d) => {
                 let (w, h) = d.rotation.upright((d.width, d.height));
@@ -519,8 +522,18 @@ impl Video {
         frames: broadcast::Sender<Arc<EncodedFrame>>,
         audio: AudioPackets,
     ) -> Self {
-        super::dpi_aware();
         super::audio::start(audio);
+        Self::build(config, frames)
+    }
+
+    /// Capture and encode only, no audio: the secure-desktop helper (system audio stays in
+    /// the user's session, not this SYSTEM process). See `windows::secure`.
+    pub fn for_helper(config: VideoConfig, frames: broadcast::Sender<Arc<EncodedFrame>>) -> Self {
+        Self::build(config, frames)
+    }
+
+    fn build(config: VideoConfig, frames: broadcast::Sender<Arc<EncodedFrame>>) -> Self {
+        super::dpi_aware();
         Self {
             config,
             frames,
@@ -1039,6 +1052,8 @@ impl VideoSource for Video {
         Video::streams(self)
     }
     fn request_keyframe(&self, stream: Option<u8>) {
+        // While the secure desktop is the source, the live encoder is the helper's.
+        super::secure::request_keyframe(stream);
         Video::request_keyframe(self, stream)
     }
     fn set_layout(&self, layout: Layout) -> Result<Vec<DisplayInfo>> {
@@ -1093,6 +1108,7 @@ impl VideoSource for Video {
         VIEWER_FPS.store(fps, Ordering::Relaxed);
     }
     fn set_bitrate(&self, bps: u32) {
+        super::secure::set_bitrate(bps);
         if let Some(monitors) = self.monitors.lock().unwrap().as_ref() {
             for m in monitors {
                 m.bitrate.store(bps, Ordering::Relaxed);

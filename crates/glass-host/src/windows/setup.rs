@@ -7,7 +7,47 @@ use super::firewall::{self, Inbound};
 use crate::status::Status;
 
 pub async fn prepare() -> Result<()> {
-    firewall_step()
+    firewall_step()?;
+    service_step()
+}
+
+/// Offers to install the secure-desktop service, so viewers can use the lock screen, answer
+/// UAC prompts, control elevated windows and send Ctrl+Alt+Del. Optional and separate from
+/// the per-user host, which keeps working either way.
+fn service_step() -> Result<()> {
+    log::step("Secure desktop (lock screen, UAC, Ctrl+Alt+Del)")?;
+    match super::service::status() {
+        Ok(Some(_)) => {
+            log::success("The Glass secure-desktop service is installed")?;
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(_) => {
+            log::warning("Couldn't check the secure-desktop service.")?;
+            return Ok(());
+        }
+    }
+    note(
+        "Use the computer even when it's locked",
+        "Without this, a viewer can't see or use the lock screen or sign-in screen, answer a\n\
+         Windows security (UAC) prompt, control a program running as administrator, or send\n\
+         Ctrl+Alt+Del. A small background service (running as the system) handles those.\n\
+         It never accepts connections itself — your Glass host stays the only way in.\n\
+         Windows asks for administrator approval once.",
+    )?;
+    if !confirm("Install the secure-desktop service?").initial_value(true).interact()? {
+        log::warning("Skipped. Install it later with: glass service install")?;
+        return Ok(());
+    }
+    match super::service::cli("install") {
+        Ok(()) if matches!(super::service::status(), Ok(Some(_))) => {
+            log::success("The secure-desktop service is installed")?;
+        }
+        _ => {
+            log::warning("The service wasn't installed. Try again as administrator: glass service install")?;
+        }
+    }
+    Ok(())
 }
 
 /// Without a rule, Windows asks the first time the host listens, on this screen, and
@@ -72,6 +112,13 @@ pub fn prepare_unattended() -> Vec<crate::setup::Need> {
     };
     if let Some(action) = action {
         needs.push(crate::setup::Need { step: "firewall", action, on_screen: false });
+    }
+    if matches!(super::service::status(), Ok(None)) {
+        needs.push(crate::setup::Need {
+            step: "secure-desktop",
+            action: "Optional: to use the lock screen, answer UAC, control elevated apps and send Ctrl+Alt+Del, install the secure-desktop service (asks for administrator once): glass service install".into(),
+            on_screen: false,
+        });
     }
     needs
 }

@@ -58,6 +58,9 @@ pub struct Injector {
     pen_device: PenDevice,
     /// Where the pointer was last put (desktop pixels): where pen frames go.
     at: Option<(i32, i32)>,
+    /// Input is going through the SYSTEM secure-desktop helper (the lock screen is up or an
+    /// elevated window has focus), not this process's own SendInput. See `windows::secure`.
+    routing: bool,
 }
 
 /// A synthetic pen device.
@@ -94,6 +97,7 @@ impl Injector {
             pen: None,
             pen_device: PenDevice::Untried,
             at: None,
+            routing: false,
         };
         this.set_displays(&[display]);
         this
@@ -115,6 +119,19 @@ impl Injector {
             return;
         }
         let (ax, ay) = absolute(gx, gy, virtual_screen());
+        send(&[mouse(ax, ay, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)]);
+    }
+
+    /// Moves the pointer to a point in desktop pixels, mapped across the virtual screen.
+    /// Used by the secure-desktop helper, which gets already-mapped coordinates from the
+    /// host (it has no streamed-display rects of its own). See `windows::secure`.
+    pub fn move_abs(&mut self, x: i32, y: i32) {
+        self.at = Some((x, y));
+        if self.pen_ready() {
+            self.pen_frame(if self.buttons[0] { PenPhase::Drag } else { PenPhase::Hover });
+            return;
+        }
+        let (ax, ay) = absolute(x as f64, y as f64, virtual_screen());
         send(&[mouse(ax, ay, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)]);
     }
 
@@ -173,6 +190,35 @@ impl Injector {
     }
 
     pub fn handle(&mut self, ev: Ev) {
+        // While the secure desktop is up (or an elevated window has focus), this process's
+        // SendInput is refused; the SYSTEM helper injects for us. Release what the side we're
+        // leaving still holds, so nothing stays stuck down across the switch.
+        let want_route = super::secure::route_input();
+        if want_route != self.routing {
+            if self.routing {
+                super::secure::release();
+            } else {
+                self.release_local();
+            }
+            self.routing = want_route;
+        }
+        if self.routing {
+            match ev {
+                Ev::MouseMove { x, y, stream } => {
+                    let display = self.displays.get(stream as usize).or(self.displays.first());
+                    if let Some(r) = self.window.or_else(|| display.and_then(|&id| video::rect_of(id))) {
+                        let gx = (r.x + x.clamp(0.0, 1.0) as f64 * (r.w - 1.0).max(0.0)).round() as i32;
+                        let gy = (r.y + y.clamp(0.0, 1.0) as f64 * (r.h - 1.0).max(0.0)).round() as i32;
+                        super::secure::move_abs(gx, gy);
+                    }
+                }
+                Ev::Gamepad { .. } => {}
+                other => {
+                    super::secure::send_input(&other);
+                }
+            }
+            return;
+        }
         match ev {
             Ev::MouseMove { x, y, stream } => {
                 let display = self.displays.get(stream as usize).or(self.displays.first());
@@ -282,8 +328,18 @@ impl Injector {
         self.pen = None;
     }
 
-    /// Releases anything still held, e.g. when a client disconnects mid-drag.
+    /// Releases anything still held, e.g. when a client disconnects mid-drag — on whichever
+    /// side is injecting (the helper, or this process).
     pub fn release_all(&mut self) {
+        if self.routing {
+            super::secure::release();
+        } else {
+            self.release_local();
+        }
+    }
+
+    /// Releases held buttons, keys and the pen through this process's own SendInput.
+    fn release_local(&mut self) {
         if self.pen.is_some() {
             self.pen_leaves();
         }
@@ -443,6 +499,11 @@ impl crate::media::InputSink for Injector {
     }
     /// Any text, as Unicode key events (UTF-16 units), independent of the layout.
     fn type_text(&mut self, text: &str) -> bool {
+        // On the secure desktop (e.g. typing a password at the lock screen) injection goes
+        // through the helper, which has no Unicode path; let the caller press keys instead.
+        if super::secure::route_input() {
+            return false;
+        }
         let mut inputs = Vec::new();
         for unit in text.encode_utf16() {
             // Newlines as Enter: apps read Return from the key, not the character.

@@ -357,6 +357,14 @@ enum Command {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
+    /// The secure-desktop service (LocalSystem): lets viewers use the lock screen, answer
+    /// UAC prompts, control elevated windows and send Ctrl+Alt+Del. Install or remove it
+    /// (needs administrator; `glass setup` asks for you).
+    #[cfg(windows)]
+    Service {
+        #[arg(value_parser = ["install", "uninstall", "status"], default_value = "status")]
+        action: String,
+    },
     /// Wake a machine with Wake-on-LAN, by a MAC address or a tailnet name seen before.
     Wake { target: String },
     /// Show the access token for devices outside your tailnet.
@@ -782,6 +790,17 @@ fn main() -> Result<()> {
     {
         return platform::front::run_hook_helper(pid);
     }
+    // Windows: the secure-desktop service (started by the SCM) and the SYSTEM helper it
+    // keeps running in the active console session (see platform::service / platform::secure).
+    #[cfg(windows)]
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        match argv.get(1).map(String::as_str) {
+            Some(platform::service::SERVICE_ARG) => return platform::service::run_service(),
+            Some(platform::secure::HELPER_ARG) => return platform::secure::run_helper(),
+            _ => {}
+        }
+    }
     let args = Args::parse();
     // Quick support keeps everything in its own temporary config, chosen before anything
     // (or any thread) reads the environment.
@@ -1036,6 +1055,8 @@ async fn async_main(args: Args) -> Result<()> {
             println!("Sent a wake-up to {target} ({macs}).");
             Ok(())
         }
+        #[cfg(windows)]
+        Some(Command::Service { action }) => platform::service::cli(action),
         Some(Command::Remote { action }) => remote_cli(action),
         Some(Command::Account { action, json }) => account_cli(action, *json),
         Some(Command::Fleet { action, arg, json }) => fleet_cli(action, arg.as_deref(), *json),
@@ -1191,6 +1212,14 @@ async fn run_host(args: Args) -> Result<()> {
     // ~80 ms of 5 ms packets; a session that falls further behind just skips ahead.
     let (audio, _) = broadcast::channel(16);
     let (events, _) = broadcast::channel(32);
+
+    // Windows: link to the SYSTEM secure-desktop helper if the service is installed, so
+    // viewers can use the lock screen, answer UAC, control elevated windows and Ctrl+Alt+Del.
+    // A no-op (degrading to today's behaviour) when it isn't.
+    #[cfg(windows)]
+    if !args.test {
+        platform::secure::start(frames.clone());
+    }
 
     let token = control::load_or_create_token(&args.token_file)?;
     let tls = match args.cert.clone().zip(args.key.clone()) {

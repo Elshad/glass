@@ -14,6 +14,8 @@ pub mod permissions;
 pub mod policy;
 pub mod privacy;
 pub mod script;
+pub mod secure;
+pub mod service;
 pub mod session;
 pub mod setup;
 pub mod system;
@@ -122,6 +124,14 @@ pub fn ps_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+
+/// Whether a process we hold a handle to is still running (zero-timeout wait).
+pub fn process_alive_handle(h: windows::Win32::Foundation::HANDLE) -> bool {
+    use windows::Win32::Foundation::WAIT_TIMEOUT;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    // SAFETY: a process handle we own; a zero wait only polls.
+    unsafe { WaitForSingleObject(h, 0) == WAIT_TIMEOUT }
+}
 
 /// Whether process `pid` is still running.
 pub fn process_alive(pid: u32) -> bool {
