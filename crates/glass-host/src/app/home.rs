@@ -262,7 +262,7 @@ impl GlassApp {
                 I::Hand,
                 theme.primary,
                 "Ask before guests connect",
-                "Someone with a link waits until you allow them, here or in the menu bar.",
+                format!("Someone with a link waits until you allow them, here or in the {}.", super::ICON_PLACE),
                 Switch::new("ask-guests").checked(s.ask_guests).on_click(|on: &bool, window, cx| {
                     let v = if *on { "on" } else { "off" };
                     act(window, cx, move || actions::set_setting("ask-guests", v))

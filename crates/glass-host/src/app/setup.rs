@@ -276,7 +276,7 @@ impl GlassApp {
                 "It's free. Install it here and on your iPad, and sign in to both with the same account.".into(),
             ),
             Tailnet::NotRunning => (I::Power, theme.warning, "Open Tailscale".into(), "It's installed but not running.".into()),
-            Tailnet::LoggedOut => (I::KeyRound, theme.warning, "Sign in to Tailscale".into(), "Click its icon in the menu bar and log in.".into()),
+            Tailnet::LoggedOut => (I::KeyRound, theme.warning, "Sign in to Tailscale".into(), format!("Click its icon in the {} and log in.", super::ICON_PLACE)),
             Tailnet::NoHttps(_) => (
                 I::Lock,
                 theme.warning,
@@ -358,7 +358,7 @@ impl GlassApp {
         let running = snap.running();
         v_flex()
             .gap_5()
-            .child(Self::step_header(2, "Turn on Glass", "Glass runs quietly in the background, with an icon in the menu bar when someone's connected.", cx))
+            .child(Self::step_header(2, "Turn on Glass", &format!("Glass runs quietly in the background, with an icon in the {} when someone's connected.", super::ICON_PLACE), cx))
             .child(ui::group(
                 vec![
                     ui::icon_row(

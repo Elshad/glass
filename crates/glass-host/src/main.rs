@@ -825,6 +825,12 @@ fn main() -> Result<()> {
         });
         platform::menubar::run(handle);
     }
+    // The host on Windows shows a notification-area icon (who's viewing) on its own thread.
+    #[cfg(windows)]
+    // (Quick support's host sets GLASS_NO_MENUBAR, as on a Mac: its window is the UI.)
+    if args.command.is_none() && !args.test && std::env::var_os("GLASS_NO_MENUBAR").is_none() {
+        platform::tray::start(rt.handle().clone());
+    }
     rt.block_on(async_main(args))
 }
 

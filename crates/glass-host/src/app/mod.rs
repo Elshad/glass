@@ -31,7 +31,6 @@ use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable, Theme, ThemeM
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-#[cfg_attr(windows, allow(unused_imports))]
 pub use bundle::{install as install_bundle, open as open_app};
 use data::{Machine, Snapshot, Tailnet};
 use ui::I;
@@ -146,6 +145,9 @@ pub fn run(rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
 }
 
 actions!(glass, [Quit, Close]);
+
+/// Where Glass's icon lives: the menu bar on a Mac, the notification area on Windows.
+pub const ICON_PLACE: &str = if cfg!(windows) { "notification area" } else { "menu bar" };
 
 /// The quick-support window (`glass support`).
 pub fn run_support(rt: tokio::runtime::Runtime, session: crate::support::Session) -> anyhow::Result<()> {
