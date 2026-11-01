@@ -400,6 +400,7 @@ const ui = createUI({
   onFullscreen: toggleFullscreen,
   onToggleStats: toggleStats,
   onPrivacy: (on) => control({ t: 'privacy', on }),
+  onSas: () => control({ t: 'sas' }),
   onRestart: (glass) => {
     restarting = glass ? 'Glass' : 'computer';
     control({ t: 'restart', glass });

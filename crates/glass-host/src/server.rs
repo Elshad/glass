@@ -1216,6 +1216,15 @@ async fn control(
                 }
                 Err(e) => refuse(&format!("Couldn't wake {dns}: {e:#}")),
             },
+            ClientMsg::Sas if !perms.input => refuse("This link is view only."),
+            ClientMsg::Sas => {
+                #[cfg(windows)]
+                if !crate::platform::secure::send_sas() {
+                    refuse("Ctrl+Alt+Del needs the Glass secure-desktop service. Install it with `glass service install`.");
+                }
+                #[cfg(not(windows))]
+                refuse("Ctrl+Alt+Del is only available on Windows.");
+            }
             ClientMsg::Agent { .. } | ClientMsg::AgentAnswer { .. } if guest => refuse(OWNER_ONLY),
             ClientMsg::Agent { op } => crate::computer::control(&op),
             ClientMsg::AgentAnswer { id, ok, note } => {

@@ -60,6 +60,9 @@ pub enum ClientMsg {
     ListWindows,
     /// Previews of every display (answered with `thumbs`, only the ones that changed).
     Thumbs,
+    /// Send Ctrl+Alt+Del (Windows secure attention sequence). Needs the Glass secure-desktop
+    /// service; a no-op elsewhere. Input permission required.
+    Sas,
     /// The owner steering an agent: `pause`, `resume`, `stop`, `allow`.
     Agent { op: String },
     /// The owner's answer to an agent's question (`agentAsk`).
