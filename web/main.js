@@ -393,7 +393,7 @@ const ui = createUI({
   onUploadFiles: uploadFiles,
   onRequestFiles: () => {
     control({ t: 'pickFiles' });
-    ui.toast({ text: 'Choose files in the dialog on your Mac' });
+    ui.toast({ text: 'Choose files in the dialog on the computer' });
   },
   onAudio: toggleAudio,
   onMic: toggleMic,
@@ -780,6 +780,7 @@ function onControl(msg) {
       input.setHostOs(msg.host_os ?? 'macos');
       ui.setHostOs(msg.host_os ?? 'macos');
       applyKeyboard(msg.host_os ?? 'macos');
+      files.setHostOs(msg.host_os ?? 'macos');
       if (remoteKey) {
         setLogSink((lines) => control({ t: 'log', lines }));
         rememberRemote(msg.computer);

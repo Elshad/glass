@@ -68,9 +68,11 @@ gstreamer-video = { version = "0.25", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
+    "Data_Xml_Dom",
     "Foundation",
     "Media_Control",
     "Storage_Streams",
+    "UI_Notifications",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",

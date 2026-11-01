@@ -557,6 +557,9 @@ impl Bits<'_> {
 
 /// "2026-10-22 14-03" in local time (`date` knows the time zone).
 fn local_stamp() -> String {
+    #[cfg(windows)]
+    return crate::platform::clock::local_stamp();
+    #[cfg(not(windows))]
     std::process::Command::new("date")
         .arg("+%Y-%m-%d %H-%M")
         .output()

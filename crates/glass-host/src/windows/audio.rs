@@ -39,6 +39,14 @@ const WANTED: WAVEFORMATEX = WAVEFORMATEX {
 /// The engine's buffer (100 ns units). Drained every 10 ms or so; this is only headroom.
 const BUFFER_HNS: i64 = 200 * 10_000;
 
+/// Why there's no sound to send, while capture is failing (no output device, say).
+static UNAVAILABLE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Why viewers who turn sound on won't hear anything, if that's the case.
+pub fn unavailable() -> Option<String> {
+    UNAVAILABLE.lock().unwrap().clone()
+}
+
 pub fn start(packets: AudioPackets) {
     let spawned = std::thread::Builder::new().name("glass-audio".into()).spawn(move || run(packets));
     if let Err(e) = spawned {
@@ -164,6 +172,7 @@ fn run(packets: AudioPackets) {
                     last_error = msg;
                 }
                 failures += 1;
+                *UNAVAILABLE.lock().unwrap() = Some(last_error.clone());
                 // An output just unplugged usually has a replacement a moment later.
                 std::thread::sleep(if failures == 1 { Duration::from_millis(200) } else { Duration::from_secs(2) });
             }
@@ -202,6 +211,7 @@ fn capture(packets: &AudioPackets, packetizer: &mut Packetizer, failures: &mut u
     };
     tracing::info!("audio: recording {name} ({format})");
     *failures = 0;
+    *UNAVAILABLE.lock().unwrap() = None;
 
     let mut converter = Converter::new(format);
     let frame_bytes = format.frame_bytes();

@@ -102,7 +102,7 @@ pub fn list(root: &Path, rel: &str, hidden: bool) -> Result<Listing> {
     for e in std::fs::read_dir(&dir).with_context(|| format!("can't open {}", dir.display()))? {
         let Ok(e) = e else { continue };
         let name = e.file_name().to_string_lossy().into_owned();
-        if !hidden && name.starts_with('.') {
+        if !hidden && (name.starts_with('.') || hidden_on_windows(&e)) {
             continue;
         }
         if entries.len() >= MAX_ENTRIES {
@@ -123,6 +123,21 @@ pub fn list(root: &Path, rel: &str, hidden: bool) -> Result<Listing> {
     // Folders first, then by name (case-insensitive), like Finder.
     entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     Ok(Listing { path: relative(root, &dir), entries, truncated })
+}
+
+/// Windows marks what Explorer doesn't show as hidden or system (AppData, and the old
+/// "My Documents" / "Cookies" junctions in every home folder), not with a leading dot.
+#[cfg(windows)]
+fn hidden_on_windows(e: &std::fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN: u32 = 0x2;
+    const SYSTEM: u32 = 0x4;
+    e.metadata().is_ok_and(|m| m.file_attributes() & (HIDDEN | SYSTEM) != 0)
+}
+
+#[cfg(not(windows))]
+fn hidden_on_windows(_: &std::fs::DirEntry) -> bool {
+    false
 }
 
 fn kind(name: &str) -> &'static str {

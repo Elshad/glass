@@ -61,7 +61,14 @@ pub struct Injector {
     /// Input is going through the SYSTEM secure-desktop helper (the lock screen is up or an
     /// elevated window has focus), not this process's own SendInput. See `windows::secure`.
     routing: bool,
+    /// A paste lifted and restored the Windows key (⌘ from a Mac viewer): letting it go now,
+    /// with nothing pressed in between, would open Start.
+    mask_win: bool,
 }
+
+/// An unassigned virtual key, tapped so a Windows key let go doesn't open Start (as
+/// AutoHotkey does).
+const MASK: Key = Key::Vk(0xE8);
 
 /// A synthetic pen device.
 #[derive(Clone, Copy)]
@@ -98,6 +105,7 @@ impl Injector {
             pen_device: PenDevice::Untried,
             at: None,
             routing: false,
+            mask_win: false,
         };
         this.set_displays(&[display]);
         this
@@ -290,6 +298,12 @@ impl Injector {
                 let Some(key) = keymap::to_key(keycode) else {
                     return;
                 };
+                let win = key == LEFT_WIN || key == RIGHT_WIN;
+                if !down && win && std::mem::take(&mut self.mask_win) {
+                    send(&[keyboard(MASK, true), keyboard(MASK, false)]);
+                } else if down && !win {
+                    self.mask_win = false;
+                }
                 if down {
                     self.held.insert(key);
                 } else {
@@ -307,6 +321,10 @@ impl Injector {
     /// Windows key, so that's lifted for the paste and restored after.
     pub fn paste(&mut self) {
         let wins: Vec<Key> = [LEFT_WIN, RIGHT_WIN].into_iter().filter(|k| self.held.contains(k)).collect();
+        if !wins.is_empty() {
+            send(&[keyboard(MASK, true), keyboard(MASK, false)]);
+            self.mask_win = true;
+        }
         send(&wins.iter().map(|&k| keyboard(k, false)).collect::<Vec<_>>());
         send(&[keyboard(LEFT_CTRL, true)]);
         settle();

@@ -1096,6 +1096,12 @@ async fn control(
             ClientMsg::Audio { on } => {
                 ctx.audio_on.store(on, Ordering::Relaxed);
                 info!("{peer}: audio {}", if on { "on" } else { "off" });
+                #[cfg(windows)]
+                if on && crate::platform::audio::unavailable().is_some() {
+                    let _ = ctx.ctl_tx.send(ServerMsg::Notice {
+                        msg: "No sound to share: this computer has no sound output right now.".into(),
+                    });
+                }
             }
             ClientMsg::FilesList { .. }
             | ClientMsg::FilesFetch { .. }

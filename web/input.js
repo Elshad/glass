@@ -67,6 +67,10 @@ export function attachInput({
   let macHost = true;
   const codeOf = (e) => (!macHost ? undefined : pc ? PC[e.code] : swap ? SWAPPED[e.code] : undefined) ?? e.code;
   const cmdHeld = (e) => (!macHost ? e.metaKey : pc ? e.ctrlKey : swap ? e.altKey : e.metaKey);
+  // Copy and paste: ⌘ on a Mac host; Ctrl on Windows and Linux (and ⌘V still pastes this
+  // device's clipboard there, as a Mac viewer expects).
+  const copyHeld = (e) => (macHost ? cmdHeld(e) : e.ctrlKey && !e.altKey && !e.metaKey);
+  const pasteHeld = (e) => (macHost ? cmdHeld(e) && !swap : e.metaKey || (e.ctrlKey && !e.altKey));
   // Each canvas shows one host stream (data-stream) and is letterboxed by
   // `object-fit: contain`; pointer positions map into the video's content box. Rects are
   // cached and dropped on resize, so pointer events never force a layout read.
@@ -587,7 +591,7 @@ export function attachInput({
     // On-screen keyboards often report no code; their text arrives via beforeinput.
     if (keycode === undefined) return;
 
-    if (cmdHeld(e) && code === 'KeyV' && !swap) {
+    if (pasteHeld(e) && code === 'KeyV') {
       // Let the browser fire `paste`; the host gets the text and presses Cmd+V itself, so
       // the Mac pastes what's on this device's clipboard. Without a focused text field some
       // browsers never fire it, so fall back to sending ⌘V as a plain keystroke.
@@ -600,7 +604,7 @@ export function attachInput({
       }, PASTE_FALLBACK_MS);
       return;
     }
-    if (cmdHeld(e) && (code === 'KeyC' || code === 'KeyX') && navigator.clipboard?.write) {
+    if (copyHeld(e) && (code === 'KeyC' || code === 'KeyX') && navigator.clipboard?.write) {
       // Must be called during the keydown for Safari; the item resolves once the
       // Mac reports its new clipboard.
       const clip = nextClipboard(CLIPBOARD_WAIT_MS);

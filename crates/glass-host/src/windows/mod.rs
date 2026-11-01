@@ -21,6 +21,7 @@ pub mod service;
 pub mod session;
 pub mod setup;
 pub mod system;
+pub mod toast;
 pub mod tray;
 pub mod uia;
 pub mod video;
