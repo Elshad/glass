@@ -16,6 +16,7 @@ pub mod script;
 pub mod session;
 pub mod setup;
 pub mod system;
+pub mod uia;
 pub mod video;
 
 use std::process::{Command, Stdio};

@@ -82,7 +82,7 @@ fn description(path: &str) -> Option<String> {
     }
 }
 
-fn class_name(hwnd: HWND) -> String {
+pub fn class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 128];
     // SAFETY: a writable buffer.
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
@@ -171,7 +171,7 @@ pub fn key_app() -> Option<String> {
 }
 
 /// A password field has the keyboard, or the session is locked (the lock screen's field
-/// does). Classic edit boxes say so in their style.
+/// does). Classic edit boxes say so in their style; anything else, through UI Automation.
 pub fn secure_input() -> bool {
     if super::session::locked() {
         return true;
@@ -180,7 +180,7 @@ pub fn secure_input() -> bool {
     let class = class_name(focus).to_ascii_lowercase();
     // SAFETY: plain query.
     let style = unsafe { GetWindowLongW(focus, GWL_STYLE) };
-    (class == "edit" || class.starts_with("richedit")) && style & ES_PASSWORD != 0
+    ((class == "edit" || class.starts_with("richedit")) && style & ES_PASSWORD != 0) || super::uia::focus_is_password()
 }
 
 // ---- Local input ----

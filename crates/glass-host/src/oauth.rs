@@ -1569,7 +1569,7 @@ const HTTP_INSTRUCTIONS: &str = "Glass gives you a real computer: its screens, p
 The person who owns it approved you, can watch you live, and can pause, stop or revoke you at any time.\n\
 - Start with `screenshot`. Coordinates for click, move, drag and scroll are in the pixels of the \
 latest screenshot of that display.\n\
-- On a Mac, `snapshot` reads an app's window as text, with a ref on each element you can act on; \
+- On a Mac or a Windows PC, `snapshot` reads an app's window as text, with a ref on each element you can act on; \
 `press` and `set_value` act on a ref without moving the pointer. Prefer them for ordinary app \
 windows, and screenshot and click for what a snapshot doesn't show (canvases, games, video).\n\
 - After acting, check the result: pass `screenshot_after: true`, or call `wait_for_change` then `screenshot`.\n\
