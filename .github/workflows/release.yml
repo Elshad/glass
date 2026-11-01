@@ -283,14 +283,16 @@ jobs:
       # The winget manifests for this release, to submit to microsoft/winget-pkgs by hand
       # (packaging/winget/README.md).
       - name: winget manifests
+        if: ${{ !contains(github.ref_name, '-') }}
         run: node scripts/winget.mjs "${GITHUB_REF_NAME#v}" dist dist/winget
       - uses: actions/upload-artifact@v4
+        if: ${{ !contains(github.ref_name, '-') }}
         with: { name: winget-manifests, path: dist/winget/ }
       # Not for a pre-release: the installers and updates keep serving the last release.
       - uses: actions/setup-node@v4
-        if: env.CLOUDFLARE_API_TOKEN != '' && !contains(github.ref_name, '-')
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && !contains(github.ref_name, '-') }}
         with: { node-version: 24 }
       - name: Deploy glassdesk.dev (installer serves the new release)
-        if: env.CLOUDFLARE_API_TOKEN != '' && !contains(github.ref_name, '-')
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && !contains(github.ref_name, '-') }}
         working-directory: site
         run: npm ci && npm run deploy
