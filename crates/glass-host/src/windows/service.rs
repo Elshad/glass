@@ -43,20 +43,22 @@ pub fn cli(action: &str) -> Result<()> {
 /// Whether the service exists, and if so whether it's running. `None` = not installed.
 pub fn status() -> Result<Option<bool>> {
     use windows::Win32::System::Services::{
-        ControlService, OpenSCManagerW, OpenServiceW, SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_CONTROL_INTERROGATE, SERVICE_RUNNING, SERVICE_STATUS,
+        OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+        SERVICE_STATUS,
     };
+    // Query rights only: an ordinary (unelevated) user can't open the service for more, and
+    // would read an installed service as missing.
     // SAFETY: handles are closed on every path out.
     unsafe {
-        let scm = match OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS) {
+        let scm = match OpenSCManagerW(None, None, SC_MANAGER_CONNECT) {
             Ok(h) => h,
             Err(_) => return Ok(None),
         };
-        let svc = OpenServiceW(scm, &HSTRING::from(SERVICE_NAME), SERVICE_ALL_ACCESS);
+        let svc = OpenServiceW(scm, &HSTRING::from(SERVICE_NAME), SERVICE_QUERY_STATUS);
         let out = match svc {
             Ok(svc) => {
                 let mut st = SERVICE_STATUS::default();
-                let running = ControlService(svc, SERVICE_CONTROL_INTERROGATE, &mut st).is_ok()
-                    && st.dwCurrentState == SERVICE_RUNNING;
+                let running = QueryServiceStatus(svc, &mut st).is_ok() && st.dwCurrentState == SERVICE_RUNNING;
                 let _ = close_service_handle(svc.0);
                 Some(running)
             }
