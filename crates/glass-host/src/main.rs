@@ -70,6 +70,11 @@ mod platform;
 #[cfg(windows)]
 #[path = "windows/mod.rs"]
 mod platform;
+// The Windows port's pure parts, so their tests run on every OS.
+#[cfg(all(test, not(windows)))]
+#[path = "windows/convert.rs"]
+#[allow(dead_code)]
+mod windows_convert;
 
 // Platform modules keep the same names everywhere, so shared code says `crate::input` etc.
 use platform::{agent, audio, clipboard, clock, input, permissions, video};
