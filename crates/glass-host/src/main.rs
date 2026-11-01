@@ -88,7 +88,7 @@ use crate::media::VideoSource;
 #[derive(Parser)]
 #[command(
     name = "glass",
-    about = "Low-latency remote desktop for your Mac",
+    about = "Low-latency remote desktop for your computer",
     version
 )]
 struct Args {
@@ -1038,9 +1038,13 @@ async fn async_main(args: Args) -> Result<()> {
                 eprintln!("Couldn't stop publishing to agents with Tailscale Funnel ({e:#}); run: tailscale funnel --https=8443 off");
             }
             agent::uninstall()?;
-            println!(
-                "Glass service removed. Delete ~/.glass and ~/.config/glass to remove everything."
-            );
+            if cfg!(windows) {
+                println!(
+                    "Glass service removed. Delete %LOCALAPPDATA%\\Programs\\Glass and %APPDATA%\\Glass to remove everything."
+                );
+            } else {
+                println!("Glass service removed. Delete ~/.glass and ~/.config/glass to remove everything.");
+            }
             Ok(())
         }
     }
