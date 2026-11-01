@@ -2,7 +2,7 @@ mod access;
 mod account;
 mod actions;
 mod fleet;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod app;
 mod computer;
 mod admin;
@@ -172,9 +172,9 @@ enum Command {
         json: bool,
     },
     /// Open the Glass app: setup, who's connected, links, settings and more, in a window.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     App {
-        /// Just (re)create Glass.app in ~/Applications.
+        /// Just (re)create Glass.app in ~/Applications (on Windows, the Start menu shortcut).
         #[arg(long)]
         install: bool,
     },
@@ -793,16 +793,16 @@ fn main() -> Result<()> {
                 return Err(e);
             }
         };
-        // On the Mac's own screen: a window. Over SSH, with --no-window or --json: here.
-        #[cfg(target_os = "macos")]
+        // On the computer's own screen: a window. Over SSH, with --no-window or --json: here.
+        #[cfg(any(target_os = "macos", windows))]
         if !no_window && !json && std::env::var_os("SSH_CONNECTION").is_none() {
             return app::run_support(rt, session);
         }
         let _ = no_window;
         return rt.block_on(support::run_terminal(session, *json));
     }
-    // The app: `glass app`, or Glass.app (whose executable is this binary).
-    #[cfg(target_os = "macos")]
+    // The app: `glass app`, Glass.app (whose executable is this binary), or the Start menu.
+    #[cfg(any(target_os = "macos", windows))]
     match &args.command {
         Some(Command::App { install: true }) => {
             println!("{}", app::install_bundle()?.display());
@@ -1046,7 +1046,7 @@ async fn async_main(args: Args) -> Result<()> {
             Ok(())
         }
         Some(Command::Restart) => restart_service(),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         Some(Command::App { .. }) => unreachable!("handled before the runtime starts"),
         Some(Command::Support { .. }) => unreachable!("handled before the runtime starts"),
         Some(Command::Uninstall) => {

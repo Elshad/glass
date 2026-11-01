@@ -2,7 +2,8 @@
 //! and Linux. Started at logon (the HKCU Run key) with no console window; starts the host
 //! (`glass.exe` beside it) with none either, and starts it again when it exits with an
 //! error. One per user session. `glass` asks it to restart or stop the host through the
-//! named events below (keep them in sync with src/windows/agent.rs).
+//! named events below (keep them in sync with src/windows/agent.rs). `glassw app` instead
+//! opens the app, for the Start menu shortcut.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -14,6 +15,11 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
+    // The Start menu shortcut: open the app (`glass app`) without a console window.
+    if std::env::args().nth(1).as_deref() == Some("app") {
+        agent::open_app();
+        return;
+    }
     if let Err(e) = agent::run() {
         agent::log(&format!("glassw: {e}"));
         std::process::exit(1);
@@ -64,6 +70,17 @@ mod agent {
             .stderr(out)
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
+    }
+
+    pub fn open_app() {
+        match host() {
+            Ok(host) => {
+                if let Err(e) = Command::new(&host).arg("app").creation_flags(CREATE_NO_WINDOW).spawn() {
+                    log(&format!("glassw: can't open the app: {e}"));
+                }
+            }
+            Err(e) => log(&format!("glassw: {e}")),
+        }
     }
 
     pub fn run() -> windows::core::Result<()> {

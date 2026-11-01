@@ -187,9 +187,7 @@ impl GlassApp {
                 theme.warning,
                 if tailnet == Tailnet::NotRunning { "Tailscale isn't running" } else { "Tailscale is signed out" },
                 "Open Tailscale and sign in to reach this computer from your devices.",
-                Button::new("open-ts").small().label("Open Tailscale").on_click(|_, _, _| {
-                    let _ = std::process::Command::new("open").args(["-a", "Tailscale"]).spawn();
-                }),
+                Button::new("open-ts").small().label("Open Tailscale").on_click(|_, _, _| actions::open_tailscale()),
                 cx,
             )),
             Tailnet::NoHttps(_) => fixes.push(ui::icon_row(
@@ -294,14 +292,18 @@ impl GlassApp {
                 cx,
             ),
         ];
-        // Until it's installed: your devices' microphones on this Mac need a driver.
+        // Until it's installed: your devices' microphones on this computer need a driver.
         let mut quick = quick;
         if snap.mic.is_none() {
             quick.push(ui::icon_row(
                 I::Mic,
                 theme.primary,
                 "Microphone from your devices",
-                "Talk into this Mac's apps from your iPad or phone. Needs a small audio driver.",
+                if cfg!(windows) {
+                    "Talk into this computer's apps from your iPad or phone. Needs VB-CABLE, a free virtual audio cable."
+                } else {
+                    "Talk into this Mac's apps from your iPad or phone. Needs a small audio driver."
+                },
                 Button::new("home-install-mic")
                     .small()
                     .icon(I::Download)

@@ -121,11 +121,10 @@ impl GlassApp {
         let theme = cx.theme().clone();
         let s = &snap.settings;
 
-        let connections = vec![
+        let mut connections = vec![
             self.toggle("ask-guests", "Ask before guests connect", "Someone with a link waits until you allow them.", s.ask_guests, cx),
             self.toggle("ask-everyone", "Ask before anyone connects", "Your own devices too.", s.ask_everyone, cx),
             self.toggle("privacy", "Privacy screen while viewed", "Blank this screen and block its keyboard and mouse.", s.privacy, cx),
-            self.toggle("lid-awake", "Stay awake with the lid closed", "While on power, so you can still unlock it from a viewer. Asks for your password once.", s.lid_awake, cx),
             ui::row(
                 "Reach from anywhere",
                 "Links can work outside your tailnet, over WebRTC through glassdesk.dev.",
@@ -138,7 +137,9 @@ impl GlassApp {
             ui::row(
                 "Microphone from your devices",
                 match &snap.mic {
+                    Some(name) if cfg!(windows) => format!("Ready: a viewer's mic plays into {name}; pick it as the microphone in your apps."),
                     Some(name) => format!("Ready: a viewer's mic plays into {name}, the Mac's default input while it's on."),
+                    None if cfg!(windows) => "Needs VB-CABLE, a free virtual audio cable. Install… opens its download page.".into(),
                     None => "Needs Glass Microphone, a small audio driver. Installing asks for your Mac's password once.".into(),
                 },
                 match &snap.mic {
@@ -161,6 +162,13 @@ impl GlassApp {
                 cx,
             ),
         ];
+        // Windows has no lid-closed sleep to hold off yet.
+        if !cfg!(windows) {
+            connections.insert(
+                3,
+                self.toggle("lid-awake", "Stay awake with the lid closed", "While on power, so you can still unlock it from a viewer. Asks for your password once.", s.lid_awake, cx),
+            );
+        }
 
         // The same switches as on AI agents, here too so they're easy to find and turn off.
         let agent = &snap.agent;
@@ -306,7 +314,11 @@ impl GlassApp {
             ),
             ui::row(
                 "Turn off Glass",
-                "Stops the service and removes it from login items. Your settings stay.",
+                if cfg!(windows) {
+                    "Stops the service and removes it from startup apps. Your settings stay."
+                } else {
+                    "Stops the service and removes it from login items. Your settings stay."
+                },
                 Button::new("uninstall").small().danger().label("Turn off…").on_click(|_, window, cx| {
                     confirm(window, cx, "Turn off Glass?", "Nobody can connect until you turn it on again.", "Turn off", actions::uninstall)
                 }),

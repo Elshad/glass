@@ -91,12 +91,20 @@ if ($installed) {
     if ($LASTEXITCODE -eq 0) { Info 'Restarted Glass in the background' }
 }
 
+# The app, in the Start menu (Glass.app on a Mac).
+$app = $false
+try { & $Glass app --install | Out-Null; $app = ($LASTEXITCODE -eq 0) } catch {}
+if ($app -and -not $previous) { Info 'Added Glass to the Start menu' }
+
 Write-Host ''
 if ($previous -and $installed) {
-    Write-Host 'Glass is up to date and running. Settings: glass setup' -ForegroundColor White
+    Write-Host 'Glass is up to date and running. Open Glass from the Start menu for settings.' -ForegroundColor White
     return
 }
-if ([Environment]::UserInteractive -and -not $env:SSH_CONNECTION) {
+if ($app -and [Environment]::UserInteractive -and -not $env:SSH_CONNECTION) {
+    Start-Process (Join-Path $Bin 'glassw.exe') 'app'
+    Write-Host 'Glass is open: follow the steps in its window. (Or in a terminal: glass setup)' -ForegroundColor White
+} elseif ([Environment]::UserInteractive -and -not $env:SSH_CONNECTION) {
     & $Glass setup
 } else {
     Write-Host 'Next: run  glass setup' -ForegroundColor White

@@ -7,6 +7,7 @@
 
 mod actions;
 mod agents;
+#[cfg_attr(windows, path = "shortcut.rs")]
 mod bundle;
 mod data;
 mod history;
@@ -30,6 +31,7 @@ use gpui_kit::component::{ActiveTheme, Disableable, Icon, Sizable, Theme, ThemeM
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+#[cfg_attr(windows, allow(unused_imports))]
 pub use bundle::{install as install_bundle, open as open_app};
 use data::{Machine, Snapshot, Tailnet};
 use ui::I;
@@ -39,13 +41,15 @@ const TICK: Duration = Duration::from_millis(1000);
 /// And Tailscale's (it runs the tailscale CLI).
 const SLOW_TICK: Duration = Duration::from_secs(10);
 
-pub fn run(rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
-    // Already open: bring that window forward instead.
+/// Makes this the only app window: if one is already open, asks it to come forward and
+/// returns `None`; otherwise listens for later asks.
+#[cfg(unix)]
+fn single_instance() -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
     let sock = crate::config_dir().join("app.sock");
     if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
         use std::io::Write;
         let _ = s.write_all(b"show\n");
-        return Ok(());
+        return None;
     }
     let _ = std::fs::create_dir_all(crate::config_dir());
     let _ = std::fs::remove_file(&sock);
@@ -57,6 +61,42 @@ pub fn run(rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
             }
         });
     }
+    Some(show_rx)
+}
+
+/// The same with a named pipe per user (and config dir), which every session can reach.
+#[cfg(windows)]
+fn single_instance() -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
+    use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT};
+    let mut name = crate::ipc::path();
+    name.set_file_name(format!("{}-app", name.file_name()?.to_string_lossy()));
+    if std::fs::OpenOptions::new().write(true).open(&name).is_ok() {
+        return None;
+    }
+    let (show_tx, show_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let wide = windows::core::HSTRING::from(name.as_os_str());
+    std::thread::spawn(move || loop {
+        // SAFETY: one pipe instance at a time, closed after each connection.
+        unsafe {
+            let pipe = CreateNamedPipeW(&wide, PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 0, 64, 0, None);
+            if pipe.is_invalid() {
+                return;
+            }
+            if ConnectNamedPipe(pipe, None).is_ok() || windows::Win32::Foundation::GetLastError() == windows::Win32::Foundation::ERROR_PIPE_CONNECTED {
+                let _ = show_tx.send(());
+            }
+            let _ = DisconnectNamedPipe(pipe);
+            let _ = CloseHandle(pipe);
+        }
+    });
+    Some(show_rx)
+}
+
+pub fn run(rt: tokio::runtime::Runtime) -> anyhow::Result<()> {
+    // Already open: bring that window forward instead.
+    let Some(show_rx) = single_instance() else { return Ok(()) };
     let handle = rt.handle().clone();
     // The runtime lives as long as the app; Tailscale's helpers need it.
     std::mem::forget(rt);

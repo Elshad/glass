@@ -81,7 +81,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Background service | ✅ LaunchAgent | ✅ systemd user | ✅ glassw at sign-in | |
 | Self-update | ✅ | ✅ | ✅ | |
 | Guided setup | ✅ | ✅ | ✅ (unattended) | Windows adds a firewall rule (one UAC prompt) |
-| Desktop app | ✅ Glass.app | ❌ | ❌ | |
+| Desktop app | ✅ Glass.app | ❌ | ✅ Start menu | Same window; no tray icon yet (the Mac has a menu bar item) |
 | CLI ↔ host channel | ✅ Unix socket | ✅ Unix socket | ✅ named pipe | |
 | Fleet reports | ✅ | ✅ | 🧪 | |
 | Fleet scripts | ✅ | ✅ | 🧪 .ps1/.cmd/.bat/.exe | |

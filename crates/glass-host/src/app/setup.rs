@@ -287,11 +287,9 @@ impl GlassApp {
         };
         let action = match &tailnet {
             Tailnet::Missing => Some(Button::new("ts-get").label("Get Tailscale").icon(I::ExternalLink).on_click(|_, _, _| {
-                actions::open("https://tailscale.com/download/mac")
+                actions::open(actions::TAILSCALE_DOWNLOAD)
             })),
-            Tailnet::NotRunning | Tailnet::LoggedOut => Some(Button::new("ts-open").label("Open Tailscale").on_click(|_, _, _| {
-                let _ = std::process::Command::new("open").args(["-a", "Tailscale"]).spawn();
-            })),
+            Tailnet::NotRunning | Tailnet::LoggedOut => Some(Button::new("ts-open").label("Open Tailscale").on_click(|_, _, _| actions::open_tailscale())),
             Tailnet::NoHttps(_) => Some(Button::new("ts-https").label("Open DNS settings").icon(I::ExternalLink).on_click(|_, _, _| {
                 actions::open("https://login.tailscale.com/admin/dns")
             })),

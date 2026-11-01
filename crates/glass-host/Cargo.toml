@@ -39,8 +39,10 @@ rtc = { version = "0.21.1", default-features = false }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 png = "0.17"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
 gpui-kit = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
 objc2 = "0.6.5"
