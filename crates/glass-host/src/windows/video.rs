@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use glass_proto::MAX_STREAMS;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{HMODULE, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
@@ -22,12 +22,13 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
     DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource,
 };
-use windows::core::Interface;
+use windows::core::{BOOL, Interface};
 
 use super::clock::now_us;
 use crate::mailbox::{FrameSender, Mailbox};
@@ -64,6 +65,9 @@ struct Monitor {
     info: Mutex<DisplayInfo>,
     /// The output's GDI name (\\.\DISPLAY1), which survives re-enumeration.
     device: String,
+    /// Attached to the desktop. A display that's unplugged keeps its id (and its capture,
+    /// which picks up again if it comes back) but isn't offered.
+    present: AtomicBool,
     /// Stream number this monitor is sent as, or -1 when not shown.
     slot: AtomicI32,
     keyframe: AtomicBool,
@@ -104,6 +108,31 @@ fn outputs() -> Result<Vec<(String, Rect)>> {
         false
     })?;
     Ok(out)
+}
+
+/// What GDI says the monitors are (name and rect). Cheap enough to ask every second, and it
+/// changes whenever a display is plugged in, removed, moved, turned or resized.
+fn monitor_signature() -> Vec<(String, [i32; 4])> {
+    unsafe extern "system" fn add(monitor: HMONITOR, _: HDC, _: *mut RECT, list: LPARAM) -> BOOL {
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: list is the Vec passed to EnumDisplayMonitors below, alive for its
+        // duration; info is a MONITORINFOEXW with its size set, as GetMonitorInfoW wants.
+        unsafe {
+            if GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()).as_bool() {
+                let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+                let r = info.monitorInfo.rcMonitor;
+                let list = &mut *(list.0 as *mut Vec<(String, [i32; 4])>);
+                list.push((String::from_utf16_lossy(&info.szDevice[..len]), [r.left, r.top, r.right, r.bottom]));
+            }
+        }
+        BOOL(1)
+    }
+    let mut list: Vec<(String, [i32; 4])> = Vec::new();
+    // SAFETY: the callback only runs during the call, while list is borrowed.
+    let _ = unsafe { EnumDisplayMonitors(None, None, Some(add), LPARAM(&raw mut list as isize)) };
+    list.sort();
+    list
 }
 
 /// Calls `f` for each output attached to the desktop until it returns true.
@@ -437,6 +466,8 @@ pub struct Video {
     frames: broadcast::Sender<Arc<EncodedFrame>>,
     monitors: Mutex<Option<Vec<Arc<Monitor>>>>,
     shown: Mutex<Vec<u32>>,
+    /// The monitors as of the last look (`monitor_signature`), to notice changes.
+    seen: Mutex<Vec<(String, [i32; 4])>>,
 }
 
 impl Video {
@@ -452,6 +483,7 @@ impl Video {
             frames,
             monitors: Mutex::new(None),
             shown: Mutex::new(Vec::new()),
+            seen: Mutex::new(Vec::new()),
         }
     }
 
@@ -482,18 +514,23 @@ impl Video {
 
     pub fn set_layout(&self, layout: Layout) -> Result<Vec<DisplayInfo>> {
         let monitors = self.ensure_started()?;
+        let present = |m: &Arc<Monitor>| m.present.load(Ordering::Relaxed);
         let ids: Vec<u32> = match layout {
             Layout::Single(Some(id)) => {
-                anyhow::ensure!((id as usize) < monitors.len(), "unknown display");
+                anyhow::ensure!(monitors.get(id as usize).is_some_and(present), "unknown display");
                 vec![id]
             }
-            Layout::Single(None) => vec![monitors.iter().position(|m| m.info.lock().unwrap().main).unwrap_or(0) as u32],
+            Layout::Single(None) => {
+                let main = monitors.iter().position(|m| present(m) && m.info.lock().unwrap().main);
+                vec![main.or_else(|| monitors.iter().position(present)).context("no displays")? as u32]
+            }
             Layout::Window(_) => anyhow::bail!("streaming one window isn't available on Windows yet"),
             Layout::All => {
                 // Left to right, then top to bottom, like the desktop arrangement.
                 let mut all: Vec<(u32, f64, f64)> = monitors
                     .iter()
                     .enumerate()
+                    .filter(|(_, m)| present(m))
                     .take(MAX_STREAMS)
                     .map(|(i, m)| {
                         let info = m.info.lock().unwrap();
@@ -516,60 +553,134 @@ impl Video {
     }
 
     pub fn displays(&self) -> Result<Vec<DisplayInfo>> {
-        Ok(self.ensure_started()?.iter().map(|m| m.info.lock().unwrap().clone()).collect())
+        Ok(self
+            .ensure_started()?
+            .iter()
+            .filter(|m| m.present.load(Ordering::Relaxed))
+            .map(|m| m.info.lock().unwrap().clone())
+            .collect())
     }
 
-    /// Starts capturing every display the first time it's called. Displays added later
-    /// need a restart of the host for now.
+    /// Starts capturing every display the first time it's called.
     fn ensure_started(&self) -> Result<Vec<Arc<Monitor>>> {
         let mut guard = self.monitors.lock().unwrap();
         if let Some(m) = guard.as_ref() {
             return Ok(m.clone());
         }
+        *self.seen.lock().unwrap() = monitor_signature();
         let outputs = outputs()?;
         anyhow::ensure!(!outputs.is_empty(), "no displays to capture (is anyone signed in at the computer?)");
         info!("{} display(s)", outputs.len());
-        let mut rects = Vec::new();
         let mut monitors = Vec::new();
-        for (i, (device, r)) in outputs.into_iter().enumerate() {
-            rects.push(r);
-            let monitor = Arc::new(Monitor {
-                info: Mutex::new(DisplayInfo {
-                    id: i as u32,
-                    width: r.w as usize,
-                    height: r.h as usize,
-                    x: r.x,
-                    y: r.y,
-                    points_width: r.w,
-                    points_height: r.h,
-                    // The primary display has the desktop's origin.
-                    main: r.x == 0.0 && r.y == 0.0,
-                    builtin: false,
-                }),
-                device: device.clone(),
-                slot: AtomicI32::new(-1),
-                keyframe: AtomicBool::new(true),
-                bitrate: AtomicU32::new(self.config.bitrate as u32),
-                latest: Mutex::new(None),
-                generation: AtomicU64::new(0),
-                thumb: Mutex::new(None),
-            });
-            let rx = Arc::new(Mailbox::default());
-            let tx = FrameSender(rx.clone());
-            let (fps, scale) = (self.config.fps as u32, self.config.scale);
-            let (frames, m) = (self.frames.clone(), monitor.clone());
-            std::thread::Builder::new()
-                .name(format!("glass-encode-{i}"))
-                .spawn(move || encode_loop(m, rx, frames, fps, scale))?;
-            std::thread::Builder::new()
-                .name(format!("glass-capture-{i}"))
-                .spawn(move || capture_loop(i, device, tx))
-                .context("starting capture thread")?;
-            monitors.push(monitor);
-        }
-        *RECTS.lock().unwrap() = rects;
+        self.sync_outputs(&mut monitors, outputs)?;
         *guard = Some(monitors.clone());
         Ok(monitors)
+    }
+
+    /// Brings `monitors` in line with the attached outputs: a new display gets the next id
+    /// (ids already given out never change), one that's gone is marked absent, and the
+    /// others follow their desktop rects.
+    fn sync_outputs(&self, monitors: &mut Vec<Arc<Monitor>>, outputs: Vec<(String, Rect)>) -> Result<()> {
+        let starting = monitors.is_empty();
+        for m in monitors.iter() {
+            let now = outputs.iter().any(|(d, _)| *d == m.device);
+            if m.present.swap(now, Ordering::Relaxed) && !now {
+                info!("display {} ({}) removed", m.info.lock().unwrap().id, m.device);
+            }
+        }
+        for (device, r) in outputs {
+            if let Some(m) = monitors.iter().find(|m| m.device == device) {
+                let mut info = m.info.lock().unwrap();
+                let rect = Rect { x: info.x, y: info.y, w: info.points_width, h: info.points_height };
+                if rect != r {
+                    info!("display {} ({device}): now {}x{} at {}, {}", info.id, r.w, r.h, r.x, r.y);
+                }
+                info.x = r.x;
+                info.y = r.y;
+                (info.points_width, info.points_height) = (r.w, r.h);
+                (info.width, info.height) = (r.w as usize, r.h as usize);
+                info.main = r.x == 0.0 && r.y == 0.0;
+                drop(info);
+                if !m.present.swap(true, Ordering::Relaxed) {
+                    info!("display {} ({device}) is back", m.info.lock().unwrap().id);
+                }
+                continue;
+            }
+            let id = monitors.len();
+            if !starting {
+                info!("display {id} ({device}) added: {}x{} at {}, {}", r.w, r.h, r.x, r.y);
+            }
+            monitors.push(self.start_monitor(id, device, r)?);
+        }
+        *RECTS.lock().unwrap() = monitors
+            .iter()
+            .map(|m| {
+                let info = m.info.lock().unwrap();
+                Rect { x: info.x, y: info.y, w: info.points_width, h: info.points_height }
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// A monitor and its capture and encode threads.
+    fn start_monitor(&self, i: usize, device: String, r: Rect) -> Result<Arc<Monitor>> {
+        let monitor = Arc::new(Monitor {
+            info: Mutex::new(DisplayInfo {
+                id: i as u32,
+                width: r.w as usize,
+                height: r.h as usize,
+                x: r.x,
+                y: r.y,
+                points_width: r.w,
+                points_height: r.h,
+                // The primary display has the desktop's origin.
+                main: r.x == 0.0 && r.y == 0.0,
+                builtin: false,
+            }),
+            device: device.clone(),
+            present: AtomicBool::new(true),
+            slot: AtomicI32::new(-1),
+            keyframe: AtomicBool::new(true),
+            bitrate: AtomicU32::new(self.config.bitrate as u32),
+            latest: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            thumb: Mutex::new(None),
+        });
+        let rx = Arc::new(Mailbox::default());
+        let tx = FrameSender(rx.clone());
+        let (fps, scale) = (self.config.fps as u32, self.config.scale);
+        let (frames, m) = (self.frames.clone(), monitor.clone());
+        std::thread::Builder::new()
+            .name(format!("glass-encode-{i}"))
+            .spawn(move || encode_loop(m, rx, frames, fps, scale))?;
+        std::thread::Builder::new()
+            .name(format!("glass-capture-{i}"))
+            .spawn(move || capture_loop(i, device, tx))
+            .context("starting capture thread")?;
+        Ok(monitor)
+    }
+
+    /// Notices displays plugged in, removed, moved or turned since the last look.
+    fn follow_displays(&self) {
+        let now = monitor_signature();
+        if *self.seen.lock().unwrap() == now {
+            return;
+        }
+        let mut guard = self.monitors.lock().unwrap();
+        let Some(monitors) = guard.as_mut() else {
+            return;
+        };
+        let synced = outputs().and_then(|outputs| {
+            let attached = outputs.len();
+            self.sync_outputs(monitors, outputs)?;
+            Ok(attached)
+        });
+        match synced {
+            // DXGI can lag GDI by a moment: look again until they agree.
+            Ok(attached) if attached == now.len() => *self.seen.lock().unwrap() = now,
+            Ok(_) => {}
+            Err(e) => warn!("displays changed, but listing them failed: {e:#}"),
+        }
     }
 }
 
@@ -796,6 +907,9 @@ impl VideoSource for Video {
     fn displays(&self) -> Result<Vec<DisplayInfo>> {
         Video::displays(self)
     }
+    fn heal(&self) {
+        self.follow_displays();
+    }
     fn supports_lossless(&self) -> bool {
         true
     }
@@ -811,7 +925,7 @@ impl VideoSource for Video {
         *THUMBS_UNTIL.lock().unwrap() = Some(Instant::now() + Duration::from_secs(10));
         let frame = {
             let monitors = self.monitors.lock().unwrap();
-            let m = monitors.as_ref()?.get(id as usize)?;
+            let m = monitors.as_ref()?.get(id as usize).filter(|m| m.present.load(Ordering::Relaxed))?;
             let thumb = m.thumb.lock().unwrap();
             thumb.as_ref()?.1.clone()
         };

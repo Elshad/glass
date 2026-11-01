@@ -44,8 +44,9 @@ pub fn has_accessibility() -> bool {
 }
 
 pub struct Injector {
-    /// Desktop rect of each streamed display, by stream number.
-    bounds: Vec<Rect>,
+    /// The streamed displays, by stream number. Their rects are looked up for each move:
+    /// displays can be moved, turned or plugged in while streaming.
+    displays: Vec<u32>,
     held: HashSet<Key>,
     buttons: [bool; 3],
     /// Wheel movement too small to send yet (vertical, horizontal), in wheel units.
@@ -85,7 +86,7 @@ enum PenDevice {
 impl Injector {
     pub fn new(display: u32) -> Self {
         let mut this = Self {
-            bounds: Vec::new(),
+            displays: Vec::new(),
             held: HashSet::new(),
             buttons: [false; 3],
             wheel: (0.0, 0.0),
@@ -100,7 +101,7 @@ impl Injector {
 
     pub fn set_displays(&mut self, displays: &[u32]) {
         self.release_all();
-        self.bounds = displays.iter().filter_map(|&id| video::rect_of(id)).collect();
+        self.displays = displays.to_vec();
     }
 
     /// Moves the pointer to `x`, `y` (0..1) of the rectangle `r` (desktop pixels), as the
@@ -174,7 +175,8 @@ impl Injector {
     pub fn handle(&mut self, ev: Ev) {
         match ev {
             Ev::MouseMove { x, y, stream } => {
-                let Some(r) = self.window.or_else(|| self.bounds.get(stream as usize).or(self.bounds.first()).copied()) else {
+                let display = self.displays.get(stream as usize).or(self.displays.first());
+                let Some(r) = self.window.or_else(|| display.and_then(|&id| video::rect_of(id))) else {
                     return;
                 };
                 self.move_in(r, x, y);
