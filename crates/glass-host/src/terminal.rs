@@ -6,9 +6,8 @@ use std::fs::File;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::process::Child;
 #[cfg(unix)]
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -18,6 +17,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::control::ServerMsg;
+
+#[cfg(windows)]
+mod conpty;
+#[cfg(windows)]
+use conpty::{Child, login_shell};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
@@ -37,8 +41,14 @@ pub enum ServerTerm {
     Exit { code: Option<i32> },
 }
 
-/// Windows needs a ConPTY instead of a pty; not yet.
-pub const SUPPORTED: bool = cfg!(unix);
+/// A pty on Unix, a ConPTY on Windows.
+pub const SUPPORTED: bool = true;
+
+/// A login shell on Unix; PowerShell without its banner on Windows.
+#[cfg(unix)]
+const SHELL_ARGS: &[&str] = &["-l"];
+#[cfg(windows)]
+const SHELL_ARGS: &[&str] = &["-NoLogo"];
 
 /// Output is sent in pieces of at most this many bytes.
 const CHUNK: usize = 16 << 10;
@@ -47,19 +57,9 @@ const CHUNK: usize = 16 << 10;
 struct Shell {
     master: File,
     child: Arc<Mutex<Child>>,
-}
-
-#[cfg(not(unix))]
-impl Shell {
-    fn spawn(program: &str, args: &[&str], cols: u16, rows: u16) -> Result<(Self, File)> {
-        let _ = (program, args, cols, rows);
-        anyhow::bail!("the terminal isn't available on Windows yet")
-    }
-
-    fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let _ = (cols, rows);
-        Ok(())
-    }
+    /// For resizing, while it's open; closed once the shell exits.
+    #[cfg(windows)]
+    console: Arc<Mutex<Option<conpty::Console>>>,
 }
 
 #[cfg(unix)]
@@ -154,6 +154,7 @@ fn openpty(cols: u16, rows: u16) -> Result<(OwnedFd, OwnedFd)> {
 }
 
 /// The user's login shell.
+#[cfg(unix)]
 fn login_shell() -> String {
     std::env::var("SHELL")
         .ok()
@@ -202,7 +203,7 @@ impl Session {
                 // One shell per session: opening again starts a fresh one.
                 self.shell = None;
                 let shell = login_shell();
-                let (s, reader) = Shell::spawn(&shell, &["-l"], cols, rows)?;
+                let (s, reader) = Shell::spawn(&shell, SHELL_ARGS, cols, rows)?;
                 let child = s.child.clone();
                 std::thread::spawn(move || pump(reader, child, out));
                 tracing::info!("terminal: started {shell}");
@@ -228,7 +229,6 @@ impl Session {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     fn collect(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
     ) -> (String, Option<i32>) {
@@ -284,6 +284,73 @@ mod tests {
         let (text, _) = collect(&mut rx);
         assert!(text.contains("40 120"), "{text:?}");
         assert!(text.contains("done-42"), "{text:?}");
+    }
+
+    /// What a ConPTY drew, without its escape sequences or any whitespace: it moves the
+    /// cursor rather than printing runs of spaces.
+    #[cfg(windows)]
+    fn plain(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\x1b' => match chars.next() {
+                    Some('[') => {
+                        chars.find(|c| ('@'..='~').contains(c));
+                    }
+                    Some(']') => {
+                        chars.find(|&c| c == '\x07' || c == '\x1b');
+                    }
+                    _ => {}
+                },
+                c if c.is_whitespace() => {}
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn runs_a_program_in_a_conpty() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (shell, reader) = Shell::spawn(
+            "cmd.exe",
+            &["/c", "mode con & echo glass-ok & exit 3"],
+            100,
+            30,
+        )
+        .unwrap();
+        let child = shell.child.clone();
+        std::thread::spawn(move || pump(reader, child, tx));
+        let (text, code) = collect(&mut rx);
+        let text = plain(&text);
+        assert!(text.contains("Lines:30"), "{text:?}");
+        assert!(text.contains("Columns:100"), "{text:?}");
+        assert!(text.contains("glass-ok"), "{text:?}");
+        assert_eq!(code, Some(3));
+        drop(shell);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn input_reaches_the_shell() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut shell, reader) = Shell::spawn("cmd.exe", &[], 80, 24).unwrap();
+        let child = shell.child.clone();
+        std::thread::spawn(move || pump(reader, child, tx));
+        shell.resize(120, 40).unwrap();
+        // Enter is a carriage return, as a terminal sends it.
+        shell
+            .master
+            .write_all(b"set /a x=40+2\rmode con\recho done-%x%\rexit\r")
+            .unwrap();
+        let (text, code) = collect(&mut rx);
+        let text = plain(&text);
+        assert!(text.contains("Lines:40"), "{text:?}");
+        assert!(text.contains("Columns:120"), "{text:?}");
+        assert!(text.contains("done-42"), "{text:?}");
+        assert_eq!(code, Some(0));
     }
 
     #[test]
