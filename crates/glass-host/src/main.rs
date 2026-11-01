@@ -23,6 +23,8 @@ mod ldap;
 mod lid;
 mod listen;
 mod lossless;
+#[cfg(not(target_os = "macos"))]
+mod mailbox;
 mod mcp;
 mod oauth;
 mod media;
@@ -1220,8 +1222,8 @@ async fn run_host(args: Args) -> Result<()> {
         lid::watch();
         let video = Arc::new(video::Video::new(
             video::VideoConfig {
-                // Linux encodes in software: 60 at most.
-                fps: if cfg!(target_os = "linux") { args.fps.min(60) } else { args.fps },
+                // Linux and Windows encode in software: 60 at most.
+                fps: if cfg!(target_os = "macos") { args.fps } else { args.fps.min(60) },
                 bitrate: args.mbps * 1_000_000,
                 scale: args.scale,
             },

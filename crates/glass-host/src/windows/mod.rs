@@ -126,3 +126,11 @@ pub fn process_alive(pid: u32) -> bool {
         running
     }
 }
+
+/// Desktop coordinates in physical pixels, matching what duplication captures and what
+/// SendInput expects, on every display whatever its scaling.
+pub fn dpi_aware() {
+    use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+    // SAFETY: no preconditions; fails harmlessly if already set.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
