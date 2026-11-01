@@ -34,7 +34,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Relative mouse (games) | ✅ | ✅ | 🧪 | |
 | Type any text (agents) | ✅ | ❌ | 🧪 Unicode key events | |
 | Pen pressure and tilt | ✅ | ❌ | 🧪 synthetic pen | |
-| Game controllers | ❌ | ✅ uinput | ❌ | Windows needs ViGEmBus |
+| Game controllers | ❌ | ✅ uinput | 🧪 ViGEmBus | Windows: a virtual Xbox 360 controller when ViGEmBus is installed |
 | Unlock from the lock screen | ✅ | ? | ❌ | Windows needs a SYSTEM service |
 | Control elevated windows, UAC prompts | — | — | ❌ | Same: SYSTEM service |
 | Wake on LAN, restart Glass/computer | ✅ | ✅ | 🧪 | |

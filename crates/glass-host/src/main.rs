@@ -1089,6 +1089,10 @@ fn print_status() -> Result<()> {
                 _ => "off (glass remote on)",
             };
             println!("  remote:           {remote}");
+            if cfg!(windows) {
+                let pads = if gamepad::supported() { "yes (ViGEmBus)".to_string() } else { format!("no: install ViGEmBus ({})", gamepad::VIGEM_DOWNLOAD) };
+                println!("  controllers:      {pads}");
+            }
             if let Some(url) = &s.url {
                 println!("  open:             {url}");
             }
@@ -1249,6 +1253,9 @@ async fn run_host(args: Args) -> Result<()> {
         // Keep displays (and the system) awake for as long as the host runs.
         let awake = platform::keep_awake();
         lid::watch();
+        if cfg!(windows) && !gamepad::supported() {
+            info!("game controllers: off until ViGEmBus is installed ({})", gamepad::VIGEM_DOWNLOAD);
+        }
         let video = Arc::new(video::Video::new(
             video::VideoConfig {
                 // Linux encodes in software: 60 at most. Windows caps OpenH264 at 60 itself
