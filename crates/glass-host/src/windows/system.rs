@@ -7,7 +7,9 @@ use anyhow::{Result, bail};
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::NetworkManagement::WindowsFirewall::{INetFwPolicy2, NET_FW_PROFILE_TYPE2, NetFwPolicy2};
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::SystemInformation::{
     ComputerNamePhysicalDnsHostname, GetComputerNameExW, GetPhysicallyInstalledSystemMemory, GetTickCount64, GlobalMemoryStatusEx,
@@ -164,6 +166,67 @@ pub fn recycle(path: &Path) -> Result<()> {
         bail!("couldn't move it to the Recycle Bin (error {code:#x})");
     }
     Ok(())
+}
+
+/// The shell's own thumbnail of a file (what Explorer shows for pictures, PDFs and videos),
+/// fitting in `size`×`size`: width, height and BGRA rows top to bottom, alpha premultiplied
+/// as GDI keeps it. `None` for a file without one: no icon instead, the viewer has its own.
+pub fn thumbnail(path: &Path, size: u32) -> Option<(usize, usize, Vec<u8>)> {
+    // SAFETY: paired with CoUninitialize below when it succeeds. Thumbnail handlers are
+    // mostly apartment-threaded, so a single-threaded apartment saves marshalling to one; a
+    // thread that already has COM (RPC_E_CHANGED_MODE) works as well.
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let out = shell_thumbnail(path, size);
+    if hr.is_ok() {
+        // SAFETY: balances the successful CoInitializeEx above, on the same thread.
+        unsafe { CoUninitialize() };
+    }
+    out
+}
+
+fn shell_thumbnail(path: &Path, size: u32) -> Option<(usize, usize, Vec<u8>)> {
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits, GetObjectW,
+    };
+    use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_THUMBNAILONLY};
+
+    let shell = HSTRING::from(crate::browse::shell_path(&path.to_string_lossy()));
+    let side = size as i32;
+    // SAFETY: COM is initialised on this thread (thumbnail() above). The bitmap the factory
+    // returns is ours: read into a buffer sized from its own header, then deleted. The
+    // memory DC is only a context for GetDIBits (the bitmap is never selected into it).
+    unsafe {
+        let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&shell, None).ok()?;
+        let bmp = factory.GetImage(SIZE { cx: side, cy: side }, SIIGBF_THUMBNAILONLY).ok()?;
+        let mut head = BITMAP::default();
+        let got = GetObjectW(bmp.into(), std::mem::size_of::<BITMAP>() as i32, Some((&mut head as *mut BITMAP).cast()));
+        let (w, h) = (head.bmWidth, head.bmHeight.abs());
+        let mut pixels = vec![0u8; w.max(0) as usize * h as usize * 4];
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                // Negative: rows top to bottom.
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lines = if got > 0 && w > 0 && h > 0 {
+            let dc = CreateCompatibleDC(None);
+            let n = GetDIBits(dc, bmp, 0, h as u32, Some(pixels.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
+            let _ = DeleteDC(dc);
+            n
+        } else {
+            0
+        };
+        let _ = DeleteObject(bmp.into());
+        (lines == h && h > 0).then_some((w as usize, h as usize, pixels))
+    }
 }
 
 /// A UNC path, or one on a mapped network drive.

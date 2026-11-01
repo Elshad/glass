@@ -53,7 +53,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | File transfer, folders | ✅ | ✅ | 🧪 | |
 | File browser | ✅ | ✅ | 🧪 | |
 | Move to Trash | ✅ | ✅ gio | 🧪 Recycle Bin | |
-| File previews | ✅ Quick Look | ❌ | ❌ | |
+| File previews | ✅ Quick Look | ❌ | 🧪 shell thumbnails | |
 | Pick files on the host | ✅ | ✅ portal | 🧪 Open dialog | |
 
 ## People and agents
