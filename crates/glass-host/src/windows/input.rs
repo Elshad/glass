@@ -120,6 +120,9 @@ impl Injector {
                     self.held.remove(&key);
                 }
                 send(&[keyboard(key, down)]);
+                if is_modifier(key) {
+                    settle();
+                }
             }
         }
     }
@@ -128,10 +131,13 @@ impl Injector {
     /// Windows key, so that's lifted for the paste and restored after.
     pub fn paste(&mut self) {
         let wins: Vec<Key> = [LEFT_WIN, RIGHT_WIN].into_iter().filter(|k| self.held.contains(k)).collect();
-        let mut inputs: Vec<INPUT> = wins.iter().map(|&k| keyboard(k, false)).collect();
-        inputs.extend([keyboard(LEFT_CTRL, true), keyboard(V, true), keyboard(V, false), keyboard(LEFT_CTRL, false)]);
-        inputs.extend(wins.iter().map(|&k| keyboard(k, true)));
-        send(&inputs);
+        send(&wins.iter().map(|&k| keyboard(k, false)).collect::<Vec<_>>());
+        send(&[keyboard(LEFT_CTRL, true)]);
+        settle();
+        send(&[keyboard(V, true), keyboard(V, false)]);
+        settle();
+        send(&[keyboard(LEFT_CTRL, false)]);
+        send(&wins.iter().map(|&k| keyboard(k, true)).collect::<Vec<_>>());
     }
 
     /// Releases anything still held, e.g. when a client disconnects mid-drag.
@@ -198,6 +204,19 @@ fn keyboard(key: Key, down: bool) -> INPUT {
         Key::Vk(vk) => (vk, 0, up),
     };
     keyboard_input(vk, scan, flags)
+}
+
+fn is_modifier(key: Key) -> bool {
+    matches!(key, Key::Scan(code, extended) if modifier_vk(code, extended).is_some())
+}
+
+/// Gives a modifier's press or release time to take hold before the next key: keys
+/// injected a fraction of a millisecond after Shift or Ctrl can reach the app before the
+/// modifier change does (in the Windows VM, Shift+H typed "h", Shift released early typed
+/// "I", and paste typed "v"). Keystrokes that arrive bunched together, as they can over a
+/// network, would do the same.
+fn settle() {
+    std::thread::sleep(std::time::Duration::from_millis(5));
 }
 
 /// The left/right virtual key of a modifier's scan code (same on every layout).
