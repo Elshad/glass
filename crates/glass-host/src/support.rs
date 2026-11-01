@@ -60,6 +60,10 @@ pub fn computer_name() -> String {
             return name;
         }
     }
+    #[cfg(windows)]
+    if let Some(name) = crate::platform::system::computer_name() {
+        return name;
+    }
     std::fs::read_to_string("/etc/hostname")
         .ok()
         .map(|s| s.trim().to_string())
@@ -218,15 +222,20 @@ impl Session {
         self.revoke_code();
         match self.runner.take() {
             Some(Runner::Child(mut c)) => {
+                // A moment to stop on its own. Windows has no SIGTERM to ask with, and the
+                // session's files go below either way.
                 #[cfg(unix)]
-                unsafe {
-                    libc::kill(c.id() as i32, libc::SIGTERM);
-                }
-                for _ in 0..30 {
-                    if matches!(c.try_wait(), Ok(Some(_))) {
-                        break;
+                {
+                    // SAFETY: signals our own child, which hasn't been waited for yet.
+                    unsafe {
+                        libc::kill(c.id() as i32, libc::SIGTERM);
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    for _ in 0..30 {
+                        if matches!(c.try_wait(), Ok(Some(_))) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
                 let _ = c.kill();
                 let _ = c.wait();
@@ -332,13 +341,17 @@ fn spawn_host(dir: &Path, http_port: u16, wt_port: u16, test: bool) -> Result<Ru
         anyhow::ensure!(status.success(), "launchctl couldn't start Glass for this session");
         return Ok(Runner::Launchd(label));
     }
-    let child = std::process::Command::new(exe)
-        .args(&args)
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&args)
         .envs(env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    // Not in this terminal's console, so Ctrl+C and closing it reach only `glass support`,
+    // which then stops the host itself (or the host notices it's gone).
+    #[cfg(windows)]
+    crate::platform::no_window(&mut cmd);
+    let child = cmd.spawn()?;
     Ok(Runner::Child(child))
 }
 
@@ -473,7 +486,7 @@ fn print_code(session: &Session) {
     println!("Waiting for your helper… (you'll be asked before they can see anything; Ctrl+C stops sharing)");
 }
 
-/// Ctrl+C, or the terminal closing (SIGTERM / SIGHUP).
+/// Ctrl+C, or the terminal closing (SIGTERM / SIGHUP; on Windows, its window closing).
 pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -486,8 +499,18 @@ pub async fn shutdown_signal() {
             _ = hup.recv() => {}
         }
     }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(windows)]
+    match tokio::signal::windows::ctrl_close() {
+        Ok(mut close) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = close.recv() => {}
+            }
+        }
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
 }
 
 #[cfg(test)]

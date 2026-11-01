@@ -12,7 +12,6 @@
 //! with a MAC keyed by that code, which only the link's holder (you) can make, and the
 //! computer pins the key. Only passkeys using ES256 (nearly all) can manage computers.
 
-#[cfg(unix)]
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -285,20 +284,130 @@ fn run_script(name: &str) -> Result<String> {
     run_script_for(name, Duration::from_secs(SCRIPT_SECS))
 }
 
-#[cfg(not(unix))]
+fn check_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty() && name.len() <= 64 && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)),
+        "a script name is letters, digits, dots, dashes and underscores"
+    );
+    Ok(())
+}
+
+/// A fresh file for one run's output, only this user can read.
+fn output_file() -> Result<(PathBuf, std::fs::File)> {
+    crate::fleet::ensure_dir()?;
+    let out_path = dir().join(format!("script-{}-{}.out", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default()));
+    crate::fleet::write_private(&out_path, b"")?;
+    let out = std::fs::OpenOptions::new().append(true).open(&out_path)?;
+    Ok((out_path, out))
+}
+
+/// What goes back: how it ended (`None`: stopped at `limit`) and the end of its output.
+fn outcome(name: &str, out_path: &std::path::Path, status: Option<std::process::ExitStatus>, limit: Duration) -> Result<String> {
+    let mut text = String::new();
+    std::fs::File::open(out_path)?.take(1 << 20).read_to_string(&mut text).ok();
+    let _ = std::fs::remove_file(out_path);
+    let tail: String = text.chars().rev().take(OUTPUT_MAX).collect::<Vec<_>>().into_iter().rev().collect();
+    match status {
+        Some(s) if s.success() => Ok(format!("{name} finished.\n{}", tail.trim())),
+        Some(s) => bail!("{name} exited with {}.\n{}", s.code().map_or("a signal".into(), |c| c.to_string()), tail.trim()),
+        None => bail!("{name} took longer than {} s and was stopped.\n{}", limit.as_secs().max(1), tail.trim()),
+    }
+}
+
+/// How Windows runs a script, by its extension.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum ScriptKind {
+    PowerShell,
+    /// .cmd, .bat and .exe: started directly (the standard library runs batch files
+    /// through cmd.exe).
+    Direct,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn script_kind(name: &str) -> Option<ScriptKind> {
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "ps1" => Some(ScriptKind::PowerShell),
+        "cmd" | "bat" | "exe" => Some(ScriptKind::Direct),
+        _ => None,
+    }
+}
+
+/// Rights that let someone change a file, or swap what's in a folder: write or append
+/// (add a file or folder), delete a child, delete, change the permissions or owner, and the
+/// generic write and all.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WIN_WRITE: u32 = 0x2 | 0x4 | 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000 | 0x4000_0000;
+
+/// Does one ACE (its type, flags, mask, and whether its SID is this user, SYSTEM or
+/// Administrators) let anyone else change the file? Deny entries only take rights away,
+/// and inherit-only ones don't apply to the file itself. Unusual allow kinds count as yes.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn ace_lets_others_write(kind: u8, flags: u8, mask: u32, trusted: bool) -> bool {
+    const INHERIT_ONLY: u8 = 0x08;
+    if flags & INHERIT_ONLY != 0 {
+        return false;
+    }
+    match kind {
+        // Allowed, and allowed with a callback (same layout).
+        0 | 9 => !trusted && mask & WIN_WRITE != 0,
+        // Compound, object and callback-object allows.
+        4 | 5 | 11 => true,
+        _ => false,
+    }
+}
+
+/// On Windows: a .ps1, .cmd, .bat or .exe, in and as a plain folder and file (no links)
+/// that only you, SYSTEM and Administrators can change.
+#[cfg(windows)]
 fn run_script_for(name: &str, limit: Duration) -> Result<String> {
-    let _ = (name, limit);
-    bail!("fleet scripts aren't available on Windows yet")
+    use std::os::windows::fs::MetadataExt;
+    use crate::platform::script::{Access, access};
+    const REPARSE_POINT: u32 = 0x400;
+    check_name(name)?;
+    let kind = script_kind(name).context("a script on Windows ends in .ps1, .cmd, .bat or .exe")?;
+    let scripts = dir().join("scripts");
+    let private = |p: &std::path::Path, what: &str| -> Result<()> {
+        match access(p)? {
+            Access::Private => Ok(()),
+            Access::NotYours => bail!("{what} isn't yours"),
+            Access::OthersCanWrite => bail!("{what} can be written by others (see Properties › Security)"),
+        }
+    };
+    let dir_meta = std::fs::symlink_metadata(&scripts).with_context(|| format!("no folder {}", scripts.display()))?;
+    ensure!(dir_meta.is_dir() && dir_meta.file_attributes() & REPARSE_POINT == 0, "{} isn't a plain folder", scripts.display());
+    private(&scripts, &scripts.display().to_string())?;
+    let path = scripts.join(name);
+    let meta = std::fs::symlink_metadata(&path).with_context(|| format!("no script {name} in {}", scripts.display()))?;
+    ensure!(meta.is_file() && meta.file_attributes() & REPARSE_POINT == 0, "{name} isn't a plain file");
+    private(&path, name)?;
+    let (out_path, out) = output_file()?;
+    let mut cmd = match kind {
+        ScriptKind::PowerShell => {
+            let mut c = std::process::Command::new("powershell.exe");
+            c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]).arg(&path);
+            c
+        }
+        ScriptKind::Direct => std::process::Command::new(&path),
+    };
+    cmd.current_dir(&scripts).stdin(std::process::Stdio::null()).stdout(out.try_clone()?).stderr(out);
+    let status = crate::platform::script::run(cmd, limit).with_context(|| format!("starting {name}"));
+    let status = match status {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            return Err(e);
+        }
+    };
+    outcome(name, &out_path, status, limit)
 }
 
 #[cfg(unix)]
 fn run_script_for(name: &str, limit: Duration) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::process::CommandExt;
-    ensure!(
-        !name.is_empty() && name.len() <= 64 && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)),
-        "a script name is letters, digits, dots, dashes and underscores"
-    );
+    check_name(name)?;
     // SAFETY: geteuid has no preconditions.
     let me = unsafe { libc::geteuid() };
     let scripts = dir().join("scripts");
@@ -314,10 +423,7 @@ fn run_script_for(name: &str, limit: Duration) -> Result<String> {
     ensure!(mode & 0o022 == 0, "{name} can be written by others (chmod go-w)");
     ensure!(meta.uid() == me, "{name} isn't yours");
     // Its output goes to a file only this user can read, one per run.
-    crate::fleet::ensure_dir()?;
-    let out_path = dir().join(format!("script-{}-{}.out", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default()));
-    crate::fleet::write_private(&out_path, b"")?;
-    let out = std::fs::OpenOptions::new().append(true).open(&out_path)?;
+    let (out_path, out) = output_file()?;
     let mut child = std::process::Command::new(&path)
         .current_dir(&scripts)
         .stdin(std::process::Stdio::null())
@@ -340,15 +446,7 @@ fn run_script_for(name: &str, limit: Duration) -> Result<String> {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let mut text = String::new();
-    std::fs::File::open(&out_path)?.take(1 << 20).read_to_string(&mut text).ok();
-    let _ = std::fs::remove_file(&out_path);
-    let tail: String = text.chars().rev().take(OUTPUT_MAX).collect::<Vec<_>>().into_iter().rev().collect();
-    match status {
-        Some(s) if s.success() => Ok(format!("{name} finished.\n{}", tail.trim())),
-        Some(s) => bail!("{name} exited with {}.\n{}", s.code().map_or("a signal".into(), |c| c.to_string()), tail.trim()),
-        None => bail!("{name} took longer than {} s and was stopped.\n{}", limit.as_secs().max(1), tail.trim()),
-    }
+    outcome(name, &out_path, status, limit)
 }
 
 // ---- The log ----
@@ -551,6 +649,90 @@ mod tests {
         assert_eq!(mode(dir.join("fleet").join("actions.log")), 0o600);
         assert!(std::fs::read_dir(dir.join("fleet")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".out")), "no output left behind");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn scripts_run_only_from_a_folder_only_you_can_change_and_are_stopped_on_time() {
+        let dir = scratch();
+        let scripts = dir.join("fleet").join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let write = |name: &str, body: &str| std::fs::write(scripts.join(name), body).unwrap();
+        let icacls = |p: PathBuf, args: &[&str]| {
+            assert!(std::process::Command::new("icacls").arg(p).args(args).stdout(std::process::Stdio::null()).status().unwrap().success())
+        };
+        write("hi.cmd", "@echo hi there\r\n");
+        assert!(run_script("hi.cmd").unwrap().contains("hi there"));
+        write("hi.ps1", "Write-Output 'hi from powershell'\r\n");
+        assert!(run_script("hi.ps1").unwrap().contains("hi from powershell"));
+
+        // The folder, or the script, others can change: either could be swapped.
+        icacls(scripts.clone(), &["/grant", "*S-1-5-11:(W)"]);
+        assert!(run_script("hi.cmd").unwrap_err().to_string().contains("written by others"));
+        icacls(scripts.clone(), &["/remove:g", "*S-1-5-11"]);
+        icacls(scripts.join("hi.cmd"), &["/grant", "*S-1-1-0:(M)"]);
+        assert!(run_script("hi.cmd").unwrap_err().to_string().contains("written by others"));
+        icacls(scripts.join("hi.cmd"), &["/remove:g", "*S-1-1-0"]);
+        assert!(run_script("hi.cmd").is_ok());
+
+        // Something Windows doesn't run, a link (when this account may make one), a failing one.
+        write("plain.txt", "x");
+        assert!(run_script("plain.txt").unwrap_err().to_string().contains(".ps1"));
+        if std::os::windows::fs::symlink_file(scripts.join("hi.cmd"), scripts.join("link.cmd")).is_ok() {
+            assert!(run_script("link.cmd").unwrap_err().to_string().contains("plain file"));
+        }
+        write("bad.cmd", "@echo nope 1>&2\r\n@exit /b 3\r\n");
+        let e = run_script("bad.cmd").unwrap_err().to_string();
+        assert!(e.contains("exited with 3") && e.contains("nope"), "{e}");
+
+        // A script that runs on is stopped, along with what it started.
+        write(
+            "slow.ps1",
+            "$p = Start-Process -FilePath ping.exe -ArgumentList '-n','60','127.0.0.1' -WindowStyle Hidden -PassThru\r\n\
+             $p.Id | Out-File -Encoding ascii child.pid\r\nStart-Sleep 60\r\n",
+        );
+        let started = std::time::Instant::now();
+        assert!(run_script_for("slow.ps1", Duration::from_secs(8)).unwrap_err().to_string().contains("was stopped"));
+        assert!(started.elapsed() < Duration::from_secs(15));
+        std::thread::sleep(Duration::from_millis(300));
+        let pid: u32 = std::fs::read_to_string(scripts.join("child.pid")).unwrap().trim().parse().unwrap();
+        assert!(!crate::platform::process_alive(pid), "what the script started is gone too");
+        assert!(std::fs::read_dir(dir.join("fleet")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".out")), "no output left behind");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn windows_runs_scripts_by_extension() {
+        assert_eq!(script_kind("a.ps1"), Some(ScriptKind::PowerShell));
+        assert_eq!(script_kind("A.PS1"), Some(ScriptKind::PowerShell));
+        for direct in ["a.cmd", "a.bat", "a.EXE"] {
+            assert_eq!(script_kind(direct), Some(ScriptKind::Direct), "{direct}");
+        }
+        for other in ["a", "a.sh", "a.ps1.txt", "a.vbs", "a.com"] {
+            assert_eq!(script_kind(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn only_you_system_and_administrators_may_change_a_script() {
+        const WRITE: u32 = 0x2;
+        const READ_EXECUTE: u32 = 0x1200a9;
+        const FULL: u32 = 0x1f01ff;
+        // Allowed to someone else: reading is fine, writing or full control isn't.
+        assert!(!ace_lets_others_write(0, 0, READ_EXECUTE, false));
+        assert!(ace_lets_others_write(0, 0, WRITE, false));
+        assert!(ace_lets_others_write(0, 0, FULL, false));
+        assert!(ace_lets_others_write(0, 0, 0x4000_0000, false), "generic write");
+        assert!(ace_lets_others_write(0, 0, 0x4_0000, false), "change the permissions");
+        // To a trusted account, anything goes.
+        assert!(!ace_lets_others_write(0, 0, FULL, true));
+        // Denials, and entries only for what's created inside, don't apply.
+        assert!(!ace_lets_others_write(1, 0, FULL, false));
+        assert!(!ace_lets_others_write(0, 0x08 | 0x03, FULL, false));
+        // Inherited entries do.
+        assert!(ace_lets_others_write(0, 0x10, WRITE, false));
+        // Allow kinds this doesn't read are taken as the worst.
+        assert!(ace_lets_others_write(5, 0, 0, false));
     }
 
     #[test]

@@ -5,12 +5,15 @@ pub mod agent;
 pub mod audio;
 pub mod clipboard;
 pub mod clock;
+pub mod firewall;
 pub mod input;
 pub mod keymap;
 pub mod permissions;
 pub mod privacy;
+pub mod script;
 pub mod session;
 pub mod setup;
+pub mod system;
 pub mod video;
 
 use std::process::{Command, Stdio};

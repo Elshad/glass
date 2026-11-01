@@ -1,5 +1,5 @@
-//! Who's connected right now: shown in the macOS menu bar and announced on Linux, so the
-//! person at the computer always knows when it's being viewed, and can end it.
+//! Who's connected right now: shown in the macOS menu bar and announced on Linux and
+//! Windows, so the person at the computer always knows when it's being viewed, and can end it.
 
 use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock};
@@ -83,7 +83,7 @@ pub fn subscribe() -> watch::Receiver<Vec<Viewer>> {
 pub fn joined(viewer: Viewer, conn: wtransport::Connection) -> Leave {
     let id = viewer.id;
     tracing::info!("viewing: {}", viewer.describe());
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     notify(&viewer);
     let mut entries = ENTRIES.lock().unwrap();
     entries.push(Entry { viewer, conn });
@@ -150,6 +150,11 @@ fn notify(viewer: &Viewer) {
             &viewer.describe(),
         ])
         .spawn();
+}
+
+#[cfg(windows)]
+fn notify(viewer: &Viewer) {
+    crate::notify::notify("Glass: someone is viewing this computer", &viewer.describe());
 }
 
 #[cfg(test)]

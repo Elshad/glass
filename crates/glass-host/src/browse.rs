@@ -186,7 +186,22 @@ fn move_to_trash(path: &Path) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{}", e.localizedDescription()))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn move_to_trash(path: &Path) -> Result<()> {
+    crate::platform::system::recycle(path)
+}
+
+/// A path as the Windows shell takes it: without the `\\?\` prefix canonical paths have.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn shell_path(p: &str) -> String {
+    if let Some(unc) = p.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        p.strip_prefix(r"\\?\").unwrap_or(p).to_string()
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn move_to_trash(path: &Path) -> Result<()> {
     let status = std::process::Command::new("gio").arg("trash").arg(path).status().context("gio trash")?;
     anyhow::ensure!(status.success(), "couldn't move it to the Trash");
@@ -348,6 +363,13 @@ mod tests {
 
     fn rand_suffix() -> u64 {
         std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    }
+
+    #[test]
+    fn the_windows_shell_gets_plain_paths() {
+        assert_eq!(shell_path(r"\\?\C:\Users\ana\a.txt"), r"C:\Users\ana\a.txt");
+        assert_eq!(shell_path(r"\\?\UNC\server\share\a.txt"), r"\\server\share\a.txt");
+        assert_eq!(shell_path(r"C:\a"), r"C:\a");
     }
 
     #[test]

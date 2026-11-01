@@ -74,7 +74,7 @@ pub struct Inventory {
     pub ram_gb: u32,
     pub disk_total_gb: u32,
     pub disk_free_gb: u32,
-    /// Disk encryption: FileVault on a Mac. `None` when unknown.
+    /// Disk encryption: FileVault on a Mac, BitLocker on Windows. `None` when unknown.
     pub filevault: Option<bool>,
     /// The system firewall. `None` when unknown.
     pub firewall: Option<bool>,
@@ -87,12 +87,14 @@ pub struct Inventory {
     pub managed: bool,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// "FileVault is On." → Some(true).
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_filevault(s: &str) -> Option<bool> {
     if s.contains("FileVault is On") {
         Some(true)
@@ -104,6 +106,7 @@ fn parse_filevault(s: &str) -> Option<bool> {
 }
 
 /// `defaults read …alf globalstate`: 0 off, 1 or 2 on.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_firewall(s: &str) -> Option<bool> {
     match s.trim() {
         "0" => Some(false),
@@ -113,6 +116,7 @@ fn parse_firewall(s: &str) -> Option<bool> {
 }
 
 /// "…InternalBattery-0 (id=…)	83%; discharging; 5:02 remaining…" → 83.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_battery(s: &str) -> Option<u8> {
     let i = s.find('%')?;
     let digits: String = s[..i].chars().rev().take_while(char::is_ascii_digit).collect::<Vec<_>>().into_iter().rev().collect();
@@ -120,6 +124,7 @@ fn parse_battery(s: &str) -> Option<u8> {
 }
 
 /// `df -k /`: (total GB, free GB).
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_df(s: &str) -> (u32, u32) {
     let Some(line) = s.lines().nth(1) else { return (0, 0) };
     let f: Vec<&str> = line.split_whitespace().collect();
@@ -128,12 +133,14 @@ fn parse_df(s: &str) -> (u32, u32) {
 }
 
 /// `sysctl kern.boottime` → seconds since the epoch of the boot.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_boottime(s: &str) -> Option<u64> {
     let rest = s.split("sec =").nth(1)?;
     rest.trim_start().split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
 }
 
 /// A line like `  Model Name: MacBook Pro`.
+#[cfg_attr(windows, allow(dead_code))]
 fn profile_field(s: &str, name: &str) -> String {
     s.lines()
         .find_map(|l| l.trim().strip_prefix(name).and_then(|r| r.strip_prefix(':')))
@@ -142,11 +149,42 @@ fn profile_field(s: &str, name: &str) -> String {
 }
 
 /// PRETTY_NAME from /etc/os-release.
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_os_release(s: &str) -> String {
     s.lines()
         .find_map(|l| l.strip_prefix("PRETTY_NAME="))
         .map(|v| v.trim_matches('"').to_string())
         .unwrap_or_else(|| "Linux".into())
+}
+
+/// The model from the firmware's maker, name and version. Lenovo puts its machine type
+/// ("20XW0026US") in the name and the familiar one ("ThinkPad X1 Carbon Gen 9") in the
+/// version; boards without a vendor image say "System Product Name" or the like.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_model(maker: &str, name: &str, version: &str) -> String {
+    let real = |s: &str| {
+        let l = s.trim().to_ascii_lowercase();
+        !(l.is_empty() || l.contains("o.e.m") || l.contains("system product name") || l.contains("system version") || l == "default string")
+    };
+    let pick = if maker.trim().eq_ignore_ascii_case("lenovo") && real(version) { version } else { name };
+    if real(pick) { pick.trim().to_string() } else { String::new() }
+}
+
+/// GetSystemPowerStatus's battery flag and percent: 128 is "no battery", 255 "unknown".
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_battery(flag: u8, percent: u8) -> Option<u8> {
+    (flag & 128 == 0 && flag != 255 && percent <= 100).then_some(percent)
+}
+
+/// The shell's BitLockerProtection for a volume: 1 on, 3 encrypting, 6 on (locked); 2 off,
+/// 4 decrypting, 5 suspended, 8 waiting to be turned on. Nothing for a volume without it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn parse_bitlocker(s: &str) -> Option<bool> {
+    match s.trim().parse::<u8>().ok()? {
+        1 | 3 | 6 => Some(true),
+        2 | 4 | 5 | 8 => Some(false),
+        _ => None,
+    }
 }
 
 fn now() -> u64 {
@@ -172,9 +210,12 @@ pub fn collect() -> Inventory {
         };
     }
     let mut inv = Inventory { version: env!("CARGO_PKG_VERSION").into(), managed: crate::actions::managed(), ..Default::default() };
-    let (total, free) = run("df", &["-k", "/"]).map(|s| parse_df(&s)).unwrap_or((0, 0));
-    inv.disk_total_gb = total;
-    inv.disk_free_gb = free;
+    #[cfg(not(windows))]
+    {
+        let (total, free) = run("df", &["-k", "/"]).map(|s| parse_df(&s)).unwrap_or((0, 0));
+        inv.disk_total_gb = total;
+        inv.disk_free_gb = free;
+    }
     #[cfg(target_os = "macos")]
     {
         inv.os = format!("macOS {}", run("sw_vers", &["-productVersion"]).unwrap_or_default());
@@ -187,7 +228,20 @@ pub fn collect() -> Inventory {
         inv.uptime_h = run("sysctl", &["-n", "kern.boottime"]).and_then(|s| parse_boottime(&s)).map_or(0, |boot| (now().saturating_sub(boot) / 3600) as u32);
         inv.battery = run("pmset", &["-g", "batt"]).and_then(|s| parse_battery(&s));
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        use crate::platform::system;
+        inv.os = crate::platform::os_version();
+        inv.model = system::model();
+        inv.chip = system::cpu_name();
+        inv.ram_gb = system::ram_gb();
+        (inv.disk_total_gb, inv.disk_free_gb) = system::system_disk_gb();
+        inv.filevault = system::bitlocker();
+        inv.firewall = system::firewall();
+        inv.uptime_h = system::uptime_h();
+        inv.battery = system::battery();
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         inv.os = parse_os_release(&std::fs::read_to_string("/etc/os-release").unwrap_or_default());
         let dmi = |f: &str| std::fs::read_to_string(format!("/sys/devices/virtual/dmi/id/{f}")).map(|s| s.trim().to_string()).unwrap_or_default();
@@ -279,6 +333,25 @@ mod tests {
         assert_eq!(parse_boottime("{ sec = 1793291000, usec = 123 } Thu Oct 29 09:00:00 2026"), Some(1_793_291_000));
         assert_eq!(profile_field("      Model Name: MacBook Pro\n      Chip: Apple M3 Max\n", "Chip"), "Apple M3 Max");
         assert_eq!(parse_os_release("NAME=\"Arch\"\nPRETTY_NAME=\"Omarchy\"\n"), "Omarchy");
+    }
+
+    #[test]
+    fn reads_what_windows_says() {
+        assert_eq!(windows_model("Microsoft Corporation", "Surface Laptop 5", "124I:00036T:000M:0200000D:3B:5F"), "Surface Laptop 5");
+        assert_eq!(windows_model("LENOVO", "20XW0026US", "ThinkPad X1 Carbon Gen 9"), "ThinkPad X1 Carbon Gen 9");
+        assert_eq!(windows_model("LENOVO", "20XW0026US", ""), "20XW0026US");
+        assert_eq!(windows_model("System manufacturer", "System Product Name", "System Version"), "");
+        assert_eq!(windows_model("To Be Filled By O.E.M.", "To Be Filled By O.E.M.", ""), "");
+        assert_eq!(windows_battery(1, 83), Some(83));
+        assert_eq!(windows_battery(8 | 2, 40), Some(40));
+        assert_eq!(windows_battery(128, 255), None);
+        assert_eq!(windows_battery(255, 255), None);
+        assert_eq!(parse_bitlocker("1\r\n"), Some(true));
+        assert_eq!(parse_bitlocker("6"), Some(true));
+        assert_eq!(parse_bitlocker("2"), Some(false));
+        assert_eq!(parse_bitlocker("5"), Some(false));
+        assert_eq!(parse_bitlocker(""), None);
+        assert_eq!(parse_bitlocker("0"), None);
     }
 
     #[test]
