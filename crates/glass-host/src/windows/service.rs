@@ -57,18 +57,18 @@ pub fn status() -> Result<Option<bool>> {
                 let mut st = SERVICE_STATUS::default();
                 let running = ControlService(svc, SERVICE_CONTROL_INTERROGATE, &mut st).is_ok()
                     && st.dwCurrentState == SERVICE_RUNNING;
-                let _ = CloseServiceHandle(svc.0);
+                let _ = close_service_handle(svc.0);
                 Some(running)
             }
             Err(_) => None,
         };
-        let _ = CloseServiceHandle(scm.0);
+        let _ = close_service_handle(scm.0);
         Ok(out)
     }
 }
 
 /// Closes an SC_HANDLE (windows-rs doesn't wrap CloseServiceHandle on SC_HANDLE directly).
-unsafe fn CloseServiceHandle(h: *mut core::ffi::c_void) -> bool {
+unsafe fn close_service_handle(h: *mut core::ffi::c_void) -> bool {
     // SAFETY: closing a service-control handle we opened.
     unsafe { windows::Win32::System::Services::CloseServiceHandle(windows::Win32::System::Services::SC_HANDLE(h)).is_ok() }
 }
@@ -78,7 +78,7 @@ fn install() -> Result<()> {
         // One UAC prompt, like the firewall step (see windows::firewall).
         return elevate("install");
     }
-    let exe = std::env::current_exe()?;
+    let exe = protected_copy()?;
     let bin = format!("\"{}\" {SERVICE_ARG}", exe.display());
     use windows::Win32::System::Services::{
         CreateServiceW, OpenSCManagerW, SC_MANAGER_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_ALL_ACCESS,
@@ -96,7 +96,7 @@ fn install() -> Result<()> {
             SERVICE_WIN32_OWN_PROCESS,
             SERVICE_AUTO_START,
             SERVICE_ERROR_NORMAL,
-            &HSTRING::from(bin),
+            &HSTRING::from(bin.as_str()),
             None,
             None,
             None,
@@ -106,23 +106,105 @@ fn install() -> Result<()> {
         let svc = match svc {
             Ok(svc) => svc,
             Err(e) if e.code() == windows::Win32::Foundation::ERROR_SERVICE_EXISTS.to_hresult() => {
-                let _ = CloseServiceHandle(scm.0);
-                println!("The Glass secure-desktop service is already installed.");
+                // Installed already: point it at the fresh copy and restart it, so
+                // `glass service install` also brings it up to date after an update.
+                let _ = close_service_handle(scm.0);
+                refresh(&bin)?;
+                println!("Updated and restarted the Glass secure-desktop service.");
                 return Ok(());
             }
             Err(e) => {
-                let _ = CloseServiceHandle(scm.0);
+                let _ = close_service_handle(scm.0);
                 return Err(e).context("create the service");
             }
         };
         let started = StartServiceW(svc, None).is_ok();
-        let _ = CloseServiceHandle(svc.0);
-        let _ = CloseServiceHandle(scm.0);
+        let _ = close_service_handle(svc.0);
+        let _ = close_service_handle(scm.0);
         if started {
             println!("Installed and started the Glass secure-desktop service.");
         } else {
             println!("Installed the Glass secure-desktop service; it starts at the next sign-in or reboot.");
         }
+    }
+    Ok(())
+}
+
+/// The binary the service runs, somewhere only administrators can change: the all-users
+/// (MSI) install in Program Files, or else a copy of this binary in Program Files\Glass\Service.
+/// A SYSTEM service must never run a file from the user's own folders, or anything running
+/// as the user could replace it and get SYSTEM.
+fn protected_copy() -> Result<std::path::PathBuf> {
+    if let Some(dir) = super::agent::machine_dir() {
+        return Ok(dir.join(r"bin\glass.exe"));
+    }
+    let exe = std::env::current_exe()?;
+    let program_files = std::env::var_os("ProgramFiles").context("no ProgramFiles folder")?;
+    let dir = std::path::PathBuf::from(program_files).join(r"Glass\Service");
+    // Program Files' own permissions are inherited: administrators and SYSTEM may write,
+    // users may only read and run.
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let dest = dir.join("glass.exe");
+    // The running service holds the old copy open; move it aside first (it's deleted on the
+    // next install).
+    for old in std::fs::read_dir(&dir)?.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".old")) {
+        let _ = std::fs::remove_file(old.path());
+    }
+    if dest.exists() {
+        let _ = std::fs::rename(&dest, dir.join(format!("glass.exe.{}.old", std::process::id())));
+    }
+    std::fs::copy(&exe, &dest).with_context(|| format!("copy Glass to {}", dest.display()))?;
+    // Development builds need their runtime DLLs beside them; release builds have none.
+    if let Some(src) = exe.parent() {
+        for dll in std::fs::read_dir(src)?.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".dll")) {
+            let _ = std::fs::copy(dll.path(), dir.join(dll.file_name()));
+        }
+    }
+    Ok(dest)
+}
+
+/// Points the installed service at `bin` and restarts it.
+fn refresh(bin: &str) -> Result<()> {
+    use windows::Win32::System::Services::{
+        ChangeServiceConfigW, ControlService, ENUM_SERVICE_TYPE, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
+        SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS, SERVICE_CONTROL_STOP, SERVICE_ERROR, SERVICE_NO_CHANGE,
+        SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STOPPED, StartServiceW,
+    };
+    // SAFETY: handles closed on every path below.
+    unsafe {
+        let scm = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS).context("open the service manager")?;
+        let svc = match OpenServiceW(scm, &HSTRING::from(SERVICE_NAME), SERVICE_ALL_ACCESS) {
+            Ok(svc) => svc,
+            Err(e) => {
+                let _ = close_service_handle(scm.0);
+                return Err(e).context("open the service");
+            }
+        };
+        let changed = ChangeServiceConfigW(
+            svc,
+            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+            SERVICE_START_TYPE(SERVICE_NO_CHANGE),
+            SERVICE_ERROR(SERVICE_NO_CHANGE),
+            &HSTRING::from(bin),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut st = SERVICE_STATUS::default();
+        let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut st);
+        for _ in 0..50 {
+            if QueryServiceStatus(svc, &mut st).is_ok() && st.dwCurrentState == SERVICE_STOPPED {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = StartServiceW(svc, None);
+        let _ = close_service_handle(svc.0);
+        let _ = close_service_handle(scm.0);
+        changed.context("update the service")?;
     }
     Ok(())
 }
@@ -141,7 +223,7 @@ fn uninstall() -> Result<()> {
         let svc = match OpenServiceW(scm, &HSTRING::from(SERVICE_NAME), SERVICE_ALL_ACCESS) {
             Ok(svc) => svc,
             Err(_) => {
-                let _ = CloseServiceHandle(scm.0);
+                let _ = close_service_handle(scm.0);
                 println!("The Glass secure-desktop service isn't installed.");
                 return Ok(());
             }
@@ -149,8 +231,8 @@ fn uninstall() -> Result<()> {
         let mut st = SERVICE_STATUS::default();
         let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut st);
         let deleted = DeleteService(svc).is_ok();
-        let _ = CloseServiceHandle(svc.0);
-        let _ = CloseServiceHandle(scm.0);
+        let _ = close_service_handle(svc.0);
+        let _ = close_service_handle(scm.0);
         anyhow::ensure!(deleted, "couldn't remove the service");
     }
     let _ = set_sas_policy(false);

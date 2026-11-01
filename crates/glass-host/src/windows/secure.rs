@@ -93,10 +93,24 @@ fn driver(frames: broadcast::Sender<Arc<EncodedFrame>>) {
 
 /// Opens the helper's pipe and starts reading its frames. False if it isn't there.
 fn connect(frames: broadcast::Sender<Arc<EncodedFrame>>) -> bool {
-    let file = match std::fs::OpenOptions::new().read(true).write(true).open(PIPE) {
+    let mut file = match std::fs::OpenOptions::new().read(true).write(true).open(PIPE) {
         Ok(f) => f,
         Err(_) => return false,
     };
+    // Only SYSTEM's pipe is the helper: another process that took the name first could
+    // otherwise show viewers a made-up lock screen.
+    if !owned_by_system(&file) {
+        warn_once("the secure-desktop pipe isn't SYSTEM's; ignoring it");
+        return false;
+    }
+    let mut hello = [0u8; HANDSHAKE_LEN];
+    if file.read_exact(&mut hello).is_err() {
+        return false;
+    }
+    if hello != handshake() {
+        warn_once("the secure-desktop service is from another version of Glass; run `glass service install` to update it");
+        return false;
+    }
     let reader = match file.try_clone() {
         Ok(r) => r,
         Err(_) => return false,
@@ -249,7 +263,10 @@ pub fn run_helper() -> anyhow::Result<()> {
                 continue;
             }
         }
-        serve(handle);
+        match client_check(handle) {
+            Ok(()) => serve(handle),
+            Err(why) => log_helper(&format!("secure helper: refused a connection: {why}")),
+        }
         // SAFETY: the handle is ours; disconnect and close before accepting the next host.
         unsafe {
             let _ = DisconnectNamedPipe(handle);
@@ -262,9 +279,13 @@ pub fn run_helper() -> anyhow::Result<()> {
 /// Serves one connected host until the pipe closes. `handle` is the server endpoint, owned
 /// by the caller; reader and writer get their own duplicate handles so they close cleanly.
 fn serve(handle: windows::Win32::Foundation::HANDLE) {
-    let (Some(mut reader), Some(writer)) = (dup_handle(handle), dup_handle(handle)) else {
+    let (Some(mut reader), Some(mut writer)) = (dup_handle(handle), dup_handle(handle)) else {
         return;
     };
+    // Which Glass this is: the host refuses a helper from another version.
+    if writer.write_all(&handshake()).is_err() {
+        return;
+    }
 
     // Injection runs on its own thread, which stays on the input desktop.
     let (tx, rx) = std::sync::mpsc::channel::<InputCmd>();
@@ -570,10 +591,8 @@ fn create_pipe(sd: &SecurityDescriptor) -> anyhow::Result<windows::Win32::Founda
 /// The SID string of the user signed in at the active console session, if any.
 fn console_user_sid() -> Option<String> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
     use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
-    // SAFETY: the token is closed before returning; buffers are sized from the first call.
+    // SAFETY: the token is closed before returning.
     unsafe {
         let session = WTSGetActiveConsoleSessionId();
         if session == 0xFFFF_FFFF {
@@ -581,20 +600,9 @@ fn console_user_sid() -> Option<String> {
         }
         let mut token = HANDLE::default();
         WTSQueryUserToken(session, &mut token).ok()?;
-        let mut len = 0u32;
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
-        let mut buf = vec![0u8; len as usize];
-        let got = GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len).is_ok();
+        let sid = token_user_sid(token);
         let _ = CloseHandle(token);
-        if !got {
-            return None;
-        }
-        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
-        let mut s = windows::core::PWSTR::null();
-        ConvertSidToStringSidW(tu.User.Sid, &mut s).ok()?;
-        let out = s.to_string().ok();
-        let _ = windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(s.0.cast())));
-        out
+        sid
     }
 }
 
@@ -621,5 +629,125 @@ fn log_helper(line: &str) {
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("secure.log")) {
         let _ = writeln!(f, "{line}");
+    }
+}
+
+/// What the helper says first: "GLASS" and the version, padded. Fixed size, so the host
+/// reads exactly this much.
+const HANDSHAKE_LEN: usize = 32;
+
+fn handshake() -> [u8; HANDSHAKE_LEN] {
+    let mut out = [0u8; HANDSHAKE_LEN];
+    let text = format!("GLASS {}", env!("CARGO_PKG_VERSION"));
+    let n = text.len().min(HANDSHAKE_LEN);
+    out[..n].copy_from_slice(&text.as_bytes()[..n]);
+    out
+}
+
+/// Logs a host-side problem with the helper once (the driver retries every few hundred ms).
+fn warn_once(msg: &str) {
+    static SAID: Mutex<Option<String>> = Mutex::new(None);
+    let mut said = SAID.lock().unwrap();
+    if said.as_deref() != Some(msg) {
+        tracing::warn!("{msg}");
+        *said = Some(msg.to_owned());
+    }
+}
+
+/// Whether the pipe's owner is LocalSystem.
+fn owned_by_system(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+    // SAFETY: queries our own open handle; the descriptor is freed after reading the owner.
+    unsafe {
+        let mut owner = PSID::default();
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let got = GetSecurityInfo(
+            HANDLE(file.as_raw_handle() as *mut _),
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut sd),
+        );
+        if got.is_err() {
+            return false;
+        }
+        let mut s = windows::core::PWSTR::null();
+        let system = ConvertSidToStringSidW(owner, &mut s).is_ok() && s.to_string().is_ok_and(|s| s == "S-1-5-18");
+        if !s.is_null() {
+            let _ = LocalFree(Some(HLOCAL(s.0.cast())));
+        }
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+        system
+    }
+}
+
+/// In the helper: a connection is served only from this session's own signed-in user. The
+/// pipe's ACL lets any interactive user open it (an unelevated host has no better group to
+/// match), so another user, say over Remote Desktop, would otherwise be able to see and
+/// drive this session's screen as SYSTEM.
+fn client_check(handle: windows::Win32::Foundation::HANDLE) -> Result<(), String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeClientSessionId};
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::Security::TOKEN_QUERY;
+    // SAFETY: queries about the connected client; every handle is closed before returning.
+    unsafe {
+        let (mut theirs, mut ours) = (0u32, 0u32);
+        GetNamedPipeClientSessionId(handle, &mut theirs).map_err(|e| format!("no client session: {e}"))?;
+        ProcessIdToSessionId(std::process::id(), &mut ours).map_err(|e| format!("no session: {e}"))?;
+        if theirs != ours {
+            return Err(format!("from session {theirs}, not {ours}"));
+        }
+        let mut pid = 0u32;
+        GetNamedPipeClientProcessId(handle, &mut pid).map_err(|e| format!("no client process: {e}"))?;
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).map_err(|e| format!("client process: {e}"))?;
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+        let _ = CloseHandle(process);
+        opened.map_err(|e| format!("client token: {e}"))?;
+        let user = token_user_sid(token);
+        let _ = CloseHandle(token);
+        let console = console_user_sid();
+        match (user, console) {
+            (Some(u), Some(c)) if u == c => Ok(()),
+            (u, c) => Err(format!("user {u:?}, not the console's {c:?}")),
+        }
+    }
+}
+
+/// The SID string of a token's user.
+fn token_user_sid(token: windows::Win32::Foundation::HANDLE) -> Option<String> {
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
+    // SAFETY: the buffer is sized by the first call; the string is freed after copying.
+    unsafe {
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        let mut buf = vec![0u8; len as usize];
+        GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len).ok()?;
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut s = windows::core::PWSTR::null();
+        ConvertSidToStringSidW(tu.User.Sid, &mut s).ok()?;
+        let out = s.to_string().ok();
+        let _ = windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(s.0.cast())));
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_handshake_names_this_version() {
+        let h = super::handshake();
+        let text = String::from_utf8_lossy(&h);
+        assert!(text.starts_with(&format!("GLASS {}", env!("CARGO_PKG_VERSION"))), "{text}");
+        assert_eq!(h.len(), super::HANDSHAKE_LEN);
     }
 }
