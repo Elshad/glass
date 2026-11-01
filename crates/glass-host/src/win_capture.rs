@@ -1,7 +1,9 @@
-//! The parts of Windows capture and hardware encoding that don't call Windows: turning
-//! duplicated pictures upright, NV12, and fixing up encoder output to Annex B with
-//! parameter sets. Kept apart so their tests run on every OS.
+//! The parts of Windows capture and hardware encoding that don't call Windows: turning and
+//! cropping duplicated pictures, NV12, fixing up encoder output to Annex B with parameter
+//! sets, and which windows are worth listing. Kept apart so their tests run on every OS.
 #![cfg_attr(not(windows), allow(dead_code))]
+
+use std::time::{Duration, Instant};
 
 use crate::soft_encode::{Frame, to_i420};
 
@@ -115,6 +117,62 @@ fn rotate_band(src: &[u8], up: (usize, usize), stride: usize, rotation: Rotation
                 }
             }
         }
+    }
+}
+
+/// The part of a window on a display that gets streamed: the window's rect relative to the
+/// display (`window` as left, top, right, bottom and `display` as x, y, width, height, both
+/// desktop pixels), at `size` (kept steady while the window is being resized), moved
+/// inside the display where it overhangs. `None` when the window isn't on this display.
+pub fn window_crop(window: [i32; 4], display: [i32; 4], size: (usize, usize)) -> Option<Crop> {
+    let [l, t, r, b] = window;
+    let [dx, dy, dw, dh] = display;
+    if r <= dx || b <= dy || l >= dx + dw || t >= dy + dh || dw <= 0 || dh <= 0 {
+        return None;
+    }
+    let w = size.0.min(dw as usize) & !1;
+    let h = size.1.min(dh as usize) & !1;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let x = (l - dx).clamp(0, dw - w as i32) as usize;
+    let y = (t - dy).clamp(0, dh - h as i32) as usize;
+    Some(Crop { x, y, w, h })
+}
+
+/// A size that only changes once it has held still for a moment: a window being dragged
+/// bigger changes size every frame, and each new size costs a new encoder and a keyframe.
+#[derive(Debug, Default)]
+pub struct SteadySize {
+    size: Option<(usize, usize)>,
+    pending: Option<((usize, usize), Instant)>,
+}
+
+/// How long a new size must hold before it's used.
+const SIZE_SETTLE: Duration = Duration::from_millis(300);
+
+impl SteadySize {
+    /// The size to use now that the wanted one is `wanted`.
+    pub fn update(&mut self, wanted: (usize, usize), now: Instant) -> (usize, usize) {
+        let Some(size) = self.size else {
+            self.size = Some(wanted);
+            return wanted;
+        };
+        if wanted == size {
+            self.pending = None;
+            return size;
+        }
+        match self.pending {
+            Some((p, since)) if p == wanted => {
+                if now.duration_since(since) >= SIZE_SETTLE {
+                    self.size = Some(wanted);
+                    self.pending = None;
+                    return wanted;
+                }
+            }
+            _ => self.pending = Some((wanted, now)),
+        }
+        size
     }
 }
 
@@ -249,6 +307,52 @@ impl ParamSets {
     }
 }
 
+/// What's known about a top-level window, to decide whether it's listed for streaming.
+#[derive(Debug, Clone, Default)]
+pub struct WindowFacts<'a> {
+    pub visible: bool,
+    /// Hidden by DWM: on another virtual desktop, or a suspended UWP app.
+    pub cloaked: bool,
+    pub minimized: bool,
+    /// WS_EX_TOOLWINDOW: palettes and floating toolbars, left out of Alt+Tab.
+    pub tool: bool,
+    /// WS_EX_APPWINDOW: listed in Alt+Tab even when owned or a tool window.
+    pub app_window: bool,
+    /// Has an owner window: dialogs and popups belonging to another window.
+    pub owned: bool,
+    pub own_process: bool,
+    pub title: &'a str,
+    /// Size in pixels (the visible frame).
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Windows smaller than this (pixels) aren't worth listing: badges, tooltips, menus.
+const MIN_WINDOW: i32 = 100;
+
+/// Whether a window is one people would pick to stream: what Alt+Tab shows, on screen,
+/// titled, not tiny and not the host's own.
+pub fn listable(w: &WindowFacts) -> bool {
+    w.visible
+        && !w.cloaked
+        && !w.minimized
+        && !w.own_process
+        && !w.title.trim().is_empty()
+        && w.width >= MIN_WINDOW
+        && w.height >= MIN_WINDOW
+        && (w.app_window || !(w.tool || w.owned))
+}
+
+/// An app's name from its executable's path: `C:\...\Code.exe` → `Code`.
+pub fn app_name(path: &str) -> String {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let stem = match file.len().checked_sub(4) {
+        Some(at) if file.is_char_boundary(at) && file[at..].eq_ignore_ascii_case(".exe") => &file[..at],
+        _ => file,
+    };
+    stem.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +428,40 @@ mod tests {
     }
 
     #[test]
+    fn window_crops_stay_on_their_display() {
+        let display = [1920, 0, 1920, 1080];
+        // Fully on the display: its own rect, relative to the display.
+        assert_eq!(
+            window_crop([2000, 100, 2801, 701], display, (801, 601)),
+            Some(Crop { x: 80, y: 100, w: 800, h: 600 })
+        );
+        // Hanging off the right edge: moved in, size kept.
+        assert_eq!(
+            window_crop([3500, 100, 4300, 700], display, (800, 600)),
+            Some(Crop { x: 1120, y: 100, w: 800, h: 600 })
+        );
+        // Bigger than the display: the whole display.
+        assert_eq!(
+            window_crop([1900, -10, 4000, 1200], display, (2100, 1210)),
+            Some(Crop { x: 0, y: 0, w: 1920, h: 1080 })
+        );
+        assert_eq!(window_crop([0, 0, 800, 600], display, (800, 600)), None, "another display");
+    }
+
+    #[test]
+    fn sizes_settle_before_changing() {
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        let mut s = SteadySize::default();
+        assert_eq!(s.update((800, 600), t), (800, 600), "the first size is used at once");
+        assert_eq!(s.update((810, 600), ms(10)), (800, 600));
+        assert_eq!(s.update((820, 600), ms(20)), (800, 600), "still moving");
+        assert_eq!(s.update((820, 600), ms(200)), (800, 600));
+        assert_eq!(s.update((820, 600), ms(400)), (820, 600), "held still");
+        assert_eq!(s.update((820, 600), ms(410)), (820, 600));
+    }
+
+    #[test]
     fn hardware_encodes_4k_whole_and_halves_bigger() {
         assert_eq!(hardware_size((3840, 2160), 1.0), (3840, 2160));
         assert_eq!(hardware_size((5120, 2880), 1.0), (2560, 1440));
@@ -385,5 +523,27 @@ mod tests {
         let (out, _) = sets.fix(vec![0, 0, 0, 1, 0x65, 9]);
         let types: Vec<u8> = nal_units(&out).iter().map(|n| n[0] & 0x1f).collect();
         assert_eq!(types, [7, 8, 5]);
+    }
+
+    #[test]
+    fn only_alt_tab_windows_are_listed() {
+        let normal = WindowFacts { visible: true, title: "Report.docx - Word", width: 1200, height: 800, ..Default::default() };
+        assert!(listable(&normal));
+        assert!(!listable(&WindowFacts { cloaked: true, ..normal.clone() }), "another virtual desktop");
+        assert!(!listable(&WindowFacts { minimized: true, ..normal.clone() }));
+        assert!(!listable(&WindowFacts { visible: false, ..normal.clone() }));
+        assert!(!listable(&WindowFacts { tool: true, ..normal.clone() }), "a palette");
+        assert!(!listable(&WindowFacts { owned: true, ..normal.clone() }), "a dialog");
+        assert!(listable(&WindowFacts { owned: true, app_window: true, ..normal.clone() }), "asks to be listed");
+        assert!(!listable(&WindowFacts { title: " ", ..normal.clone() }));
+        assert!(!listable(&WindowFacts { width: 40, ..normal.clone() }));
+        assert!(!listable(&WindowFacts { own_process: true, ..normal }));
+    }
+
+    #[test]
+    fn app_names_come_from_executables() {
+        assert_eq!(app_name(r"C:\Program Files\Microsoft VS Code\Code.exe"), "Code");
+        assert_eq!(app_name(r"C:\Windows\explorer.EXE"), "explorer");
+        assert_eq!(app_name("notepad"), "notepad");
     }
 }

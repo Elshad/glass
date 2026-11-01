@@ -1,9 +1,12 @@
 //! Captures each display with DXGI Desktop Duplication (one thread per display), draws the
 //! pointer in (duplication leaves it out), and encodes each on its own thread: on the GPU
-//! through Media Foundation where there's a hardware encoder, else with OpenH264.
-//! Coordinates are physical pixels: the process is per-monitor DPI aware.
+//! through Media Foundation where there's a hardware encoder, else with OpenH264. A single
+//! window is streamed by cropping its display's picture to it each frame (so it has to be
+//! on screen; what's in front of it shows). Coordinates are physical pixels: the process
+//! is per-monitor DPI aware.
 
 mod mf;
+mod top_windows;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -35,7 +38,7 @@ use crate::mailbox::{FrameSender, Mailbox};
 use crate::media::VideoSource;
 pub use crate::media::{AudioPackets, DisplayInfo, EncodedFrame, Layout};
 use crate::soft_encode::{Encoder, Frame, PixelFormat};
-use crate::win_capture::{Crop, Rotation, blit};
+use crate::win_capture::{Crop, Rotation, SteadySize, blit, window_crop};
 
 /// How long an encoder waits for a new frame before checking for a keyframe request it
 /// can satisfy by re-encoding the last one (static screens produce no new frames).
@@ -70,6 +73,8 @@ struct Monitor {
     present: AtomicBool,
     /// Stream number this monitor is sent as, or -1 when not shown.
     slot: AtomicI32,
+    /// A window streamed instead of the whole display (its id), or 0.
+    window: AtomicU32,
     keyframe: AtomicBool,
     /// Adaptive target bitrate; the encoder thread applies changes.
     bitrate: AtomicU32,
@@ -255,6 +260,12 @@ struct Duplicator {
     height: usize,
     /// How to turn the image upright.
     rotation: Rotation,
+    /// The display's top-left on the desktop, to place windows on it.
+    origin: (i32, i32),
+    /// A streamed window's size, held while it's being resized.
+    window_size: SteadySize,
+    /// The part of the picture last sent.
+    sent: Option<Crop>,
     /// Where the pointer is on this display (its top-left, upright), if it's here and visible.
     pointer: Option<(i32, i32)>,
     /// The staging copy holds a desktop image (not just a pointer move) yet.
@@ -266,12 +277,13 @@ impl Duplicator {
         let mut found = None;
         for_each_output(|adapter, output, desc| {
             if self::device_name(&desc) == device_name {
-                found = Some((adapter.clone(), output.clone()));
+                let r = desc.DesktopCoordinates;
+                found = Some((adapter.clone(), output.clone(), (r.left, r.top)));
                 return true;
             }
             false
         })?;
-        let (adapter, output) = found.with_context(|| format!("{device_name} isn't attached"))?;
+        let (adapter, output, origin) = found.with_context(|| format!("{device_name} isn't attached"))?;
         // SAFETY: plain COM calls on interfaces we hold.
         unsafe {
             let (mut device, mut context) = (None, None);
@@ -298,23 +310,38 @@ impl Duplicator {
                 width: desc.ModeDesc.Width as usize,
                 height: desc.ModeDesc.Height as usize,
                 rotation: Rotation::from_dxgi(desc.Rotation.0),
+                origin,
+                window_size: SteadySize::default(),
+                sent: None,
                 pointer: None,
                 has_image: false,
             })
         }
     }
 
-    /// Waits for the desktop or pointer to change; copies the picture into `tx` if either
-    /// did. Errors (DXGI_ERROR_ACCESS_LOST on a mode change, the lock screen or a UAC
-    /// prompt) mean the duplication must be made again.
-    fn next(&mut self, tx: &FrameSender) -> windows::core::Result<()> {
+    /// Waits for the desktop or pointer to change; copies the picture (all of it, or
+    /// `window`'s part when that isn't 0) into `tx` if either did. Errors
+    /// (DXGI_ERROR_ACCESS_LOST on a mode change, the lock screen or a UAC prompt) mean the
+    /// duplication must be made again.
+    fn next(&mut self, tx: &FrameSender, window: u32) -> windows::core::Result<()> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
         // SAFETY: COM calls; the acquired frame is released before returning.
         unsafe {
             match self.dup.AcquireNextFrame(ACQUIRE_MS, &mut info, &mut resource) {
                 Ok(()) => {}
-                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(()),
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                    // Nothing new on screen, but what's sent may have to change: another
+                    // window (or the whole display again), or a resized window settling.
+                    let crop = self.crop(window);
+                    if self.has_image
+                        && crop != self.sent
+                        && let Some(crop) = crop
+                    {
+                        self.copy_out(tx, now_us(), crop)?;
+                    }
+                    return Ok(());
+                }
                 Err(e) => return Err(e),
             }
             let captured_us = now_us();
@@ -322,11 +349,26 @@ impl Duplicator {
             let released = self.dup.ReleaseFrame();
             let changed = result?;
             released?;
-            if changed && self.has_image {
-                self.copy_out(tx, captured_us)?;
+            if changed
+                && self.has_image
+                && let Some(crop) = self.crop(window)
+            {
+                self.copy_out(tx, captured_us, crop)?;
             }
         }
         Ok(())
+    }
+
+    /// The part of the upright picture to send: all of it, or where `window` is on this
+    /// display. `None` when that window is gone, minimized or elsewhere.
+    fn crop(&mut self, window: u32) -> Option<Crop> {
+        let (w, h) = self.rotation.upright((self.width, self.height));
+        if window == 0 {
+            return Some(Crop { x: 0, y: 0, w, h });
+        }
+        let r = top_windows::frame_rect(window)?;
+        let size = self.window_size.update(((r[2] - r[0]) as usize, (r[3] - r[1]) as usize), Instant::now());
+        window_crop(r, [self.origin.0, self.origin.1, w as i32, h as i32], size)
     }
 
     /// Reads the acquired frame: the pointer's shape and position, and the desktop image
@@ -391,26 +433,27 @@ impl Duplicator {
         Ok(texture.expect("CreateTexture2D returned no texture"))
     }
 
-    /// Copies the staging image, turned upright and with the pointer drawn in, into the
-    /// next mailbox frame.
-    unsafe fn copy_out(&mut self, tx: &FrameSender, captured_us: u64) -> windows::core::Result<()> {
+    /// Copies `crop` of the staging image, turned upright and with the pointer drawn in,
+    /// into the next mailbox frame.
+    unsafe fn copy_out(&mut self, tx: &FrameSender, captured_us: u64, crop: Crop) -> windows::core::Result<()> {
         let staging = self.staging.as_ref().expect("has_image without staging");
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         // SAFETY: the staging texture is CPU-readable; it's unmapped below.
         unsafe { self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
         let scanned = (self.width, self.height);
-        let (width, height) = self.rotation.upright(scanned);
+        let (width, height) = (crop.w, crop.h);
         let mut pixels = tx.0.buffer();
         // SAFETY: a mapped staging texture is RowPitch × height readable bytes.
         let src = unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, mapped.RowPitch as usize * self.height) };
-        blit(src, scanned, mapped.RowPitch as usize, self.rotation, Crop { x: 0, y: 0, w: width, h: height }, &mut pixels);
+        blit(src, scanned, mapped.RowPitch as usize, self.rotation, crop, &mut pixels);
+        self.sent = Some(crop);
         // SAFETY: mapped above.
         unsafe { self.context.Unmap(staging, 0) };
         // Duplication gives the pointer's position and shape the way the desktop is seen
         // (upright), so it's drawn after turning the picture.
         let shape = POINTER.lock().unwrap().shape.clone();
         if let (Some((x, y)), Some(shape)) = (self.pointer, shape) {
-            draw_pointer(&mut pixels, width, height, width * 4, &shape, x, y);
+            draw_pointer(&mut pixels, width, height, width * 4, &shape, x - crop.x as i32, y - crop.y as i32);
         }
         tx.0.put(
             Frame {
@@ -428,7 +471,7 @@ impl Duplicator {
 
 /// Duplicates one display for as long as the host runs, making the duplication again
 /// whenever it's lost (resolution changes, the lock screen, UAC prompts, sleep).
-fn capture_loop(id: usize, device: String, tx: FrameSender) {
+fn capture_loop(id: usize, device: String, monitor: Arc<Monitor>, tx: FrameSender) {
     let mut failing_since: Option<Instant> = None;
     loop {
         let mut dup = match Duplicator::new(&device) {
@@ -453,7 +496,7 @@ fn capture_loop(id: usize, device: String, tx: FrameSender) {
             }
         };
         loop {
-            if let Err(e) = dup.next(&tx) {
+            if let Err(e) = dup.next(&tx, monitor.window.load(Ordering::Relaxed)) {
                 info!("screen {id}: duplication ended ({e}); starting it again");
                 break;
             }
@@ -497,7 +540,10 @@ impl Video {
             .unwrap()
             .iter()
             .filter_map(|&id| monitors.get(id as usize))
-            .map(|m| m.info.lock().unwrap().clone())
+            .filter_map(|m| match m.window.load(Ordering::Relaxed) {
+                0 => Some(m.info.lock().unwrap().clone()),
+                window => top_windows::frame_rect(window).map(|r| window_stream(window, r)),
+            })
             .collect()
     }
 
@@ -524,7 +570,10 @@ impl Video {
                 let main = monitors.iter().position(|m| present(m) && m.info.lock().unwrap().main);
                 vec![main.or_else(|| monitors.iter().position(present)).context("no displays")? as u32]
             }
-            Layout::Window(_) => anyhow::bail!("streaming one window isn't available on Windows yet"),
+            Layout::Window(window) => {
+                let rect = top_windows::frame_rect(window).context("that window is gone (or minimized)")?;
+                vec![display_for(&monitors, rect).context("that window isn't on a display")?]
+            }
             Layout::All => {
                 // Left to right, then top to bottom, like the desktop arrangement.
                 let mut all: Vec<(u32, f64, f64)> = monitors
@@ -543,13 +592,57 @@ impl Video {
         };
         for m in &monitors {
             m.slot.store(-1, Ordering::Relaxed);
+            m.window.store(0, Ordering::Relaxed);
+        }
+        // The window's display crops to it before it's shown, so no frame of the whole
+        // display goes out as the window.
+        if let Layout::Window(window) = layout {
+            monitors[ids[0] as usize].window.store(window, Ordering::Relaxed);
         }
         for (slot, &id) in ids.iter().enumerate() {
             monitors[id as usize].slot.store(slot as i32, Ordering::Relaxed);
             monitors[id as usize].keyframe.store(true, Ordering::Relaxed);
         }
         *self.shown.lock().unwrap() = ids.clone();
-        Ok(ids.iter().map(|&id| monitors[id as usize].info.lock().unwrap().clone()).collect())
+        drop(monitors);
+        Ok(self.streams())
+    }
+
+    /// Windows that can be streamed on their own, front to back.
+    pub fn windows(&self) -> Result<Vec<crate::media::WindowInfo>> {
+        Ok(top_windows::list())
+    }
+
+    /// Keeps a streamed window's stream on the display it's mostly on as it's moved.
+    fn follow_window(&self) {
+        let guard = self.monitors.lock().unwrap();
+        let Some(monitors) = guard.as_ref() else {
+            return;
+        };
+        let Some(from) = monitors.iter().position(|m| m.window.load(Ordering::Relaxed) != 0) else {
+            return;
+        };
+        let window = monitors[from].window.load(Ordering::Relaxed);
+        // Gone: the server's watcher goes back to a display.
+        let Some(rect) = top_windows::frame_rect(window) else {
+            return;
+        };
+        let Some(to) = display_for(monitors, rect) else {
+            return;
+        };
+        if to as usize == from {
+            return;
+        }
+        info!("window {window} moved to display {to}");
+        // The old display stops before the new one starts, so stream 0 never has two
+        // encoders feeding it.
+        monitors[from].slot.store(-1, Ordering::Relaxed);
+        monitors[from].window.store(0, Ordering::Relaxed);
+        let m = &monitors[to as usize];
+        m.window.store(window, Ordering::Relaxed);
+        m.slot.store(0, Ordering::Relaxed);
+        m.keyframe.store(true, Ordering::Relaxed);
+        *self.shown.lock().unwrap() = vec![to];
     }
 
     pub fn displays(&self) -> Result<Vec<DisplayInfo>> {
@@ -640,6 +733,7 @@ impl Video {
             device: device.clone(),
             present: AtomicBool::new(true),
             slot: AtomicI32::new(-1),
+            window: AtomicU32::new(0),
             keyframe: AtomicBool::new(true),
             bitrate: AtomicU32::new(self.config.bitrate as u32),
             latest: Mutex::new(None),
@@ -653,9 +747,10 @@ impl Video {
         std::thread::Builder::new()
             .name(format!("glass-encode-{i}"))
             .spawn(move || encode_loop(m, rx, frames, fps, scale))?;
+        let m = monitor.clone();
         std::thread::Builder::new()
             .name(format!("glass-capture-{i}"))
-            .spawn(move || capture_loop(i, device, tx))
+            .spawn(move || capture_loop(i, device, m, tx))
             .context("starting capture thread")?;
         Ok(monitor)
     }
@@ -684,6 +779,37 @@ impl Video {
     }
 }
 
+/// The present display a window (left, top, right, bottom) overlaps most.
+fn display_for(monitors: &[Arc<Monitor>], [l, t, r, b]: [i32; 4]) -> Option<u32> {
+    monitors
+        .iter()
+        .filter(|m| m.present.load(Ordering::Relaxed))
+        .map(|m| {
+            let i = m.info.lock().unwrap();
+            let w = (r as f64).min(i.x + i.points_width) - (l as f64).max(i.x);
+            let h = (b as f64).min(i.y + i.points_height) - (t as f64).max(i.y);
+            (i.id, w.max(0.0) * h.max(0.0))
+        })
+        .filter(|&(_, area)| area > 0.0)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(id, _)| id)
+}
+
+/// A streamed window as a stream: its picture size and where it is (for input mapping).
+fn window_stream(id: u32, [l, t, r, b]: [i32; 4]) -> DisplayInfo {
+    DisplayInfo {
+        id,
+        width: (r - l) as usize & !1,
+        height: (b - t) as usize & !1,
+        x: l as f64,
+        y: t as f64,
+        points_width: (r - l) as f64,
+        points_height: (b - t) as f64,
+        main: false,
+        builtin: false,
+    }
+}
+
 /// Encodes a monitor's newest picture whenever it's shown and a frame is due: at most the
 /// encoder's frame rate, and again on a keyframe request (static screens send nothing).
 fn encode_loop(
@@ -699,7 +825,18 @@ fn encode_loop(
     // The latest picture hasn't been encoded yet (it came sooner than the frame rate allows).
     let mut unsent = false;
     let mut next_due = Instant::now();
+    // The window being streamed, or 0 for the whole display.
+    let mut target = 0;
     loop {
+        // Another target: the picture held is of the old one; the capture sends a new one.
+        let window = monitor.window.load(Ordering::Relaxed);
+        if window != target {
+            target = window;
+            unsent = false;
+            if let Some((old, _)) = last.take() {
+                rx.recycle(old.data);
+            }
+        }
         let wait = if unsent { next_due.saturating_duration_since(Instant::now()) } else { IDLE_POLL };
         let fresh = match rx.recv_timeout(wait) {
             Ok(f) => Some(f),
@@ -713,9 +850,10 @@ fn encode_loop(
             rx.recycle(old.data);
         }
         unsent |= has_fresh;
-        // Previews cover every monitor, shown or not. The first one comes from the last
-        // frame: a still screen sends no new ones, and screenshots would never work.
+        // Previews cover every monitor, shown or not (as a whole). The first one comes from
+        // the last frame: a still screen sends no new ones, and screenshots would never work.
         if (has_fresh || monitor.thumb.lock().unwrap().is_none())
+            && target == 0
             && THUMBS_UNTIL.lock().unwrap().is_some_and(|t| t > Instant::now())
             && monitor.thumb.lock().unwrap().as_ref().is_none_or(|(at, _)| at.elapsed() >= THUMB_EVERY)
             && let Some((frame, _)) = last.as_ref()
@@ -770,8 +908,10 @@ fn encode_loop(
                 }
             }
             force = true;
-            let mut info = monitor.info.lock().unwrap();
-            (info.width, info.height) = size;
+            if target == 0 {
+                let mut info = monitor.info.lock().unwrap();
+                (info.width, info.height) = size;
+            }
         }
         let enc = encoder.as_mut().unwrap();
         let target = monitor.bitrate.load(Ordering::Relaxed);
@@ -909,6 +1049,13 @@ impl VideoSource for Video {
     }
     fn heal(&self) {
         self.follow_displays();
+        self.follow_window();
+    }
+    fn supports_windows(&self) -> bool {
+        true
+    }
+    fn windows(&self) -> Result<Vec<crate::media::WindowInfo>> {
+        Video::windows(self)
     }
     fn supports_lossless(&self) -> bool {
         true
@@ -1023,7 +1170,7 @@ mod tests {
         let tx = FrameSender(mailbox.clone());
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            dup.next(&tx).unwrap();
+            dup.next(&tx, 0).unwrap();
             if let Ok((frame, _)) = mailbox.recv_timeout(Duration::ZERO) {
                 assert_eq!((frame.width, frame.height), dup.rotation.upright((dup.width, dup.height)));
                 return;
