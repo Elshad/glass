@@ -56,10 +56,57 @@ fn signal(name: &str) -> bool {
     }
 }
 
+/// Starts glassw in the signed-in desktop session. From a session without a desktop
+/// (an SSH shell runs in session 0) it would start where nothing can be captured, so it's
+/// handed to a one-off interactive scheduled task that runs in the user's desktop session.
 fn spawn_launcher() -> Result<()> {
     let path = launcher()?;
-    std::process::Command::new(&path).spawn().with_context(|| format!("start {}", path.display()))?;
-    Ok(())
+    if !in_service_session() {
+        std::process::Command::new(&path).spawn().with_context(|| format!("start {}", path.display()))?;
+        return Ok(());
+    }
+    const TASK: &str = "Glass launcher";
+    let schtasks = |args: &[&str]| -> Result<()> {
+        let mut cmd = std::process::Command::new("schtasks");
+        cmd.args(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        super::no_window(&mut cmd);
+        let status = cmd.status().context("schtasks")?;
+        anyhow::ensure!(status.success(), "schtasks {} failed", args[0]);
+        Ok(())
+    };
+    let run = format!("\"{}\"", path.display());
+    schtasks(&["/Create", "/TN", TASK, "/TR", &run, "/SC", "ONCE", "/ST", "00:00", "/IT", "/F"])
+        .context("start Glass in the desktop session (is anyone signed in at the computer?)")?;
+    let started = schtasks(&["/Run", "/TN", TASK]);
+    let _ = schtasks(&["/Delete", "/TN", TASK, "/F"]);
+    started
+}
+
+/// Whether this process runs in session 0 (services, and OpenSSH's shells), which has no
+/// desktop to show or capture.
+fn in_service_session() -> bool {
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    let mut session = 0u32;
+    // SAFETY: plain query into a local.
+    unsafe { ProcessIdToSessionId(std::process::id(), &mut session) }.is_ok() && session == 0
+}
+
+/// In the host, asked over the pipe from another session: `restart` (the host exits and
+/// glassw starts it again) or `stop` (glassw ends the host and itself).
+pub fn from_host(op: &str) -> Result<()> {
+    match op {
+        "restart" => crate::power::restart_glass(),
+        "stop" => {
+            anyhow::ensure!(signal("Local\\GlassAgentStop"), "Glass isn't running under its background launcher");
+            Ok(())
+        }
+        _ => anyhow::bail!("unknown launcher request {op}"),
+    }
+}
+
+/// Asks the running host to pass `op` to its launcher (it shares the launcher's session).
+fn ask_host(op: &str) -> bool {
+    crate::ipc::call(&crate::ipc::Request::Launcher { op: op.into() }).is_ok()
 }
 
 /// Registers the launcher (at logon if `start_at_login`) and (re)starts the host.
@@ -97,11 +144,17 @@ pub fn restart() -> Result<()> {
     if running() && signal("Local\\GlassAgentRestart") {
         return Ok(());
     }
+    // From another session the signal can't reach; the host can pass it on.
+    if ask_host("restart") {
+        return Ok(());
+    }
     spawn_launcher()
 }
 
 pub fn uninstall() -> Result<()> {
-    signal("Local\\GlassAgentStop");
+    if !signal("Local\\GlassAgentStop") {
+        ask_host("stop");
+    }
     remove_run_key();
     let _ = std::fs::remove_file(marker());
     Ok(())

@@ -37,6 +37,9 @@ pub enum Request {
         #[serde(default)]
         note: Option<String>,
     },
+    /// Windows: restart the host or stop the background launcher, asked from another
+    /// session (an SSH shell), which the launcher's own signals don't reach.
+    Launcher { op: String },
 }
 
 #[cfg(unix)]
@@ -162,11 +165,25 @@ async fn handle(req: Request) -> serde_json::Value {
             }
             json!({ "status": crate::computer::status(), "asks": crate::computer::asks(), "privacy": crate::privacy::active() })
         }
+        Request::Launcher { op } => match launcher(&op) {
+            Ok(()) => json!({ "ok": true }),
+            Err(e) => json!({ "error": format!("{e:#}") }),
+        },
         Request::AgentAnswer { id, ok, note } => {
             crate::computer::answer(id, crate::computer::Answer { ok, note });
             json!({ "ok": true })
         }
     }
+}
+
+#[cfg(windows)]
+fn launcher(op: &str) -> Result<()> {
+    crate::agent::from_host(op)
+}
+
+#[cfg(not(windows))]
+fn launcher(op: &str) -> Result<()> {
+    anyhow::bail!("`{op}` is for the Windows background launcher")
 }
 
 /// Sends one request to the running host.
