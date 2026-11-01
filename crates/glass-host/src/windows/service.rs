@@ -337,19 +337,27 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     let Ok(handle) = handle else { return };
     STATUS_HANDLE.store(handle.0 as isize, Ordering::SeqCst);
 
-    // SAFETY: two auto-reset events, kept for the service's life.
-    let (stop, wake) = unsafe {
+    // SAFETY: three auto-reset events, kept for the service's life. Only `sas` is
+    // inheritable: the helper gets it to ask for Ctrl+Alt+Del.
+    let (stop, wake, sas) = unsafe {
+        use windows::Win32::Security::SECURITY_ATTRIBUTES;
         use windows::Win32::System::Threading::CreateEventW;
+        let inherit = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: true.into(),
+        };
         (
             CreateEventW(None, false, false, None).unwrap_or_default(),
             CreateEventW(None, false, false, None).unwrap_or_default(),
+            CreateEventW(Some(&inherit), false, false, None).unwrap_or_default(),
         )
     };
     STOP_EVENT.store(stop.0 as isize, Ordering::SeqCst);
     WAKE_EVENT.store(wake.0 as isize, Ordering::SeqCst);
 
     set_status(SERVICE_STATE_RUNNING, 0);
-    keep_helper_alive(stop, wake);
+    keep_helper_alive(stop, wake, sas);
     set_status(SERVICE_STATE_STOPPED, 0);
 }
 
@@ -406,7 +414,7 @@ unsafe extern "system" fn handler(control: u32, _event: u32, _data: *mut core::f
 }
 
 /// Keeps the SYSTEM helper running in the active console session until the service stops.
-fn keep_helper_alive(stop: HANDLE, wake: HANDLE) {
+fn keep_helper_alive(stop: HANDLE, wake: HANDLE, sas: HANDLE) {
     use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
     use windows::Win32::System::Threading::WaitForMultipleObjects;
     let mut child: Option<HANDLE> = None;
@@ -429,7 +437,7 @@ fn keep_helper_alive(stop: HANDLE, wake: HANDLE) {
                 // Session changed: the old helper is in the wrong session; drop it.
                 terminate(h);
             }
-            match spawn_helper_in_session(session) {
+            match spawn_helper_in_session(session, sas) {
                 Ok(h) => {
                     child = Some(h);
                     child_session = session;
@@ -437,8 +445,9 @@ fn keep_helper_alive(stop: HANDLE, wake: HANDLE) {
                 Err(()) => {}
             }
         }
-        // Wake on stop, on the helper exiting, or every second to re-check the session.
-        let mut handles = vec![stop, wake];
+        // Wake on stop, on a Ctrl+Alt+Del request, on the helper exiting, or every second
+        // to re-check the session.
+        let mut handles = vec![stop, wake, sas];
         if let Some(h) = child {
             handles.push(h);
         }
@@ -446,6 +455,11 @@ fn keep_helper_alive(stop: HANDLE, wake: HANDLE) {
         let woke = unsafe { WaitForMultipleObjects(&handles, false, 1000) };
         if woke == WAIT_OBJECT_0 {
             break; // stop (handles[0])
+        }
+        if woke.0 == WAIT_OBJECT_0.0 + 2 {
+            // Needs the SoftwareSASGeneration policy (install sets it) and a service caller.
+            // SAFETY: no preconditions beyond those.
+            unsafe { windows::Win32::Security::Authentication::Identity::SendSAS(false) };
         }
     }
     if let Some(h) = child {
@@ -465,7 +479,7 @@ fn terminate(child: HANDLE) {
 /// Launches the SYSTEM helper in `session` on the default desktop, by duplicating this
 /// service's own (LocalSystem) token and moving the copy into that session. Returns the
 /// new process's handle.
-fn spawn_helper_in_session(session: u32) -> Result<HANDLE, ()> {
+fn spawn_helper_in_session(session: u32, sas: HANDLE) -> Result<HANDLE, ()> {
     use windows::Win32::Security::{
         DuplicateTokenEx, SECURITY_IMPERSONATION_LEVEL, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_TYPE,
         TokenPrimary, TokenSessionId,
@@ -509,7 +523,8 @@ fn spawn_helper_in_session(session: u32) -> Result<HANDLE, ()> {
         let mut env = std::ptr::null_mut();
         let have_env = CreateEnvironmentBlock(&mut env, Some(dup), false).is_ok();
 
-        let mut cmd: Vec<u16> = format!("\"{}\" {}", exe.display(), super::secure::HELPER_ARG)
+        // The Ctrl+Alt+Del event's handle value, inherited by the helper.
+        let mut cmd: Vec<u16> = format!("\"{}\" {} {}", exe.display(), super::secure::HELPER_ARG, sas.0 as isize)
             .encode_utf16()
             .chain([0])
             .collect();
@@ -527,7 +542,7 @@ fn spawn_helper_in_session(session: u32) -> Result<HANDLE, ()> {
             Some(PWSTR(cmd.as_mut_ptr())),
             None,
             None,
-            false,
+            true, // only the inheritable `sas` event goes along
             flags,
             if have_env { Some(env) } else { None },
             None,

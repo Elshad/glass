@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use glass_proto::InputEvent as Ev;
 use tokio::sync::broadcast;
 
+use super::pipe::Pipe;
 use crate::media::{EncodedFrame, VideoSource};
 
 /// The flag that starts the SYSTEM helper (spawned by the service in the console session).
@@ -45,8 +46,10 @@ const OP_FRAME: u8 = b'F'; // header + H.264 Annex B: an encoded frame to rebroa
 
 // ---- Host side ----
 
+/// The open pipe to the helper; writes from different threads take turns.
 struct Link {
-    writer: Mutex<std::fs::File>,
+    pipe: Arc<Pipe>,
+    writing: Mutex<()>,
 }
 
 static LINK: Mutex<Option<Arc<Link>>> = Mutex::new(None);
@@ -93,39 +96,36 @@ fn driver(frames: broadcast::Sender<Arc<EncodedFrame>>) {
 
 /// Opens the helper's pipe and starts reading its frames. False if it isn't there.
 fn connect(frames: broadcast::Sender<Arc<EncodedFrame>>) -> bool {
-    let mut file = match std::fs::OpenOptions::new().read(true).write(true).open(PIPE) {
-        Ok(f) => f,
+    let pipe = match Pipe::open(PIPE) {
+        Ok(p) => Arc::new(p),
         Err(_) => return false,
     };
     // Only SYSTEM's pipe is the helper: another process that took the name first could
     // otherwise show viewers a made-up lock screen.
-    if !owned_by_system(&file) {
+    if !owned_by_system(pipe.handle()) {
         warn_once("the secure-desktop pipe isn't SYSTEM's; ignoring it");
         return false;
     }
     let mut hello = [0u8; HANDSHAKE_LEN];
-    if file.read_exact(&mut hello).is_err() {
+    if (&*pipe).read_exact(&mut hello).is_err() {
         return false;
     }
     if hello != handshake() {
         warn_once("the secure-desktop service is from another version of Glass; run `glass service install` to update it");
         return false;
     }
-    let reader = match file.try_clone() {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    *LINK.lock().unwrap() = Some(Arc::new(Link { writer: Mutex::new(file) }));
+    *LINK.lock().unwrap() = Some(Arc::new(Link { pipe: pipe.clone(), writing: Mutex::new(()) }));
     std::thread::Builder::new()
         .name("glass-secure-rx".into())
-        .spawn(move || read_frames(reader, frames))
+        .spawn(move || read_frames(pipe, frames))
         .ok();
     true
 }
 
 /// Reads encoded frames from the helper and rebroadcasts them to viewers while the secure
 /// desktop is up. Ends (dropping the link) when the pipe closes.
-fn read_frames(mut pipe: std::fs::File, frames: broadcast::Sender<Arc<EncodedFrame>>) {
+fn read_frames(pipe: Arc<Pipe>, frames: broadcast::Sender<Arc<EncodedFrame>>) {
+    let mut pipe = &*pipe;
     loop {
         let mut op = [0u8; 1];
         if pipe.read_exact(&mut op).is_err() {
@@ -185,7 +185,8 @@ fn send(op: u8, payload: &[u8]) -> bool {
     let link = LINK.lock().unwrap().clone();
     let Some(link) = link else { return false };
     let ok = {
-        let mut w = link.writer.lock().unwrap();
+        let _turn = link.writing.lock().unwrap();
+        let mut w = &*link.pipe;
         w.write_all(&[op]).and_then(|_| w.write_all(payload)).is_ok()
     };
     if !ok {
@@ -242,48 +243,32 @@ enum InputCmd {
 /// The whole life of the SYSTEM helper: create the strict-ACL pipe, then serve the per-user
 /// host — inject on the input desktop, run SendSAS, and stream the secure desktop back.
 pub fn run_helper() -> anyhow::Result<()> {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Pipes::{ConnectNamedPipe, DisconnectNamedPipe};
+    use windows::Win32::System::Pipes::DisconnectNamedPipe;
 
     super::dpi_aware();
     IS_HELPER.store(true, Ordering::SeqCst);
     log_helper("secure helper: starting");
     let sd = security_descriptor();
     loop {
-        let handle = create_pipe(&sd)?;
-        // SAFETY: a valid pipe handle; waiting for the host to connect.
-        let connected = unsafe { ConnectNamedPipe(handle, None) }.is_ok();
-        if !connected {
-            // SAFETY: ERROR_PIPE_CONNECTED also means a client is there; serve it anyway.
-            let already = unsafe { windows::Win32::Foundation::GetLastError() }
-                == windows::Win32::Foundation::ERROR_PIPE_CONNECTED;
-            if !already {
-                // SAFETY: closing the handle we just made.
-                unsafe { let _ = windows::Win32::Foundation::CloseHandle(handle); }
-                continue;
-            }
+        let pipe = Arc::new(create_pipe(&sd)?);
+        if !pipe.connect() {
+            continue;
         }
-        match client_check(handle) {
-            Ok(()) => serve(handle),
+        match client_check(pipe.handle()) {
+            Ok(()) => serve(pipe.clone()),
             Err(why) => log_helper(&format!("secure helper: refused a connection: {why}")),
         }
-        // SAFETY: the handle is ours; disconnect and close before accepting the next host.
-        unsafe {
-            let _ = DisconnectNamedPipe(handle);
-            let _ = windows::Win32::Foundation::CloseHandle(handle);
-        }
-        let _ = HANDLE::default();
+        // SAFETY: our pipe; disconnect before accepting the next host (dropping closes it).
+        let _ = unsafe { DisconnectNamedPipe(pipe.handle()) };
     }
 }
 
-/// Serves one connected host until the pipe closes. `handle` is the server endpoint, owned
-/// by the caller; reader and writer get their own duplicate handles so they close cleanly.
-fn serve(handle: windows::Win32::Foundation::HANDLE) {
-    let (Some(mut reader), Some(mut writer)) = (dup_handle(handle), dup_handle(handle)) else {
-        return;
-    };
+/// Serves one connected host until the pipe closes: commands are read here while frames
+/// are written from the forwarding thread, at the same time (the pipe is overlapped).
+fn serve(pipe: Arc<Pipe>) {
+    let mut reader = &*pipe;
     // Which Glass this is: the host refuses a helper from another version.
-    if writer.write_all(&handshake()).is_err() {
+    if (&*pipe).write_all(&handshake()).is_err() {
         return;
     }
 
@@ -292,7 +277,7 @@ fn serve(handle: windows::Win32::Foundation::HANDLE) {
     let inject = std::thread::Builder::new().name("glass-inject".into()).spawn(move || inject_loop(rx)).ok();
 
     // The host's pipe for this connection: capture frames are forwarded here while enabled.
-    let writer = Arc::new(Mutex::new(writer));
+    let writer = Arc::new(Mutex::new(pipe.clone()));
 
     loop {
         let mut op = [0u8; 1];
@@ -371,13 +356,13 @@ fn serve(handle: windows::Win32::Foundation::HANDLE) {
 struct CaptureState {
     video: Arc<super::video::Video>,
     forward: AtomicBool,
-    writer: Mutex<Option<Arc<Mutex<std::fs::File>>>>,
+    writer: Mutex<Option<Arc<Mutex<Arc<Pipe>>>>>,
 }
 
 static CAPTURE: OnceLock<CaptureState> = OnceLock::new();
 
 /// Starts forwarding the secure desktop to `writer`; makes the capture the first time.
-fn capture_enable(writer: &Arc<Mutex<std::fs::File>>) {
+fn capture_enable(writer: &Arc<Mutex<Arc<Pipe>>>) {
     let state = CAPTURE.get_or_init(|| {
         let (frames, rx) = broadcast::channel::<Arc<EncodedFrame>>(64);
         let video = Arc::new(super::video::Video::for_helper(
@@ -433,14 +418,15 @@ fn spawn_forward(mut rx: broadcast::Receiver<Arc<EncodedFrame>>) {
 }
 
 /// Writes one encoded frame to the host (header + Annex B). False on a broken pipe.
-fn write_frame(writer: &Mutex<std::fs::File>, frame: &EncodedFrame) -> bool {
+fn write_frame(writer: &Mutex<Arc<Pipe>>, frame: &EncodedFrame) -> bool {
     let mut header = [0u8; 15];
     header[0] = OP_FRAME;
     header[1] = frame.stream;
     header[2] = frame.keyframe as u8;
     header[3..11].copy_from_slice(&frame.capture_us.to_le_bytes());
     header[11..15].copy_from_slice(&(frame.data.len() as u32).to_le_bytes());
-    let mut w = writer.lock().unwrap();
+    let pipe = writer.lock().unwrap();
+    let mut w = &**pipe;
     w.write_all(&header).and_then(|_| w.write_all(&frame.data)).is_ok()
 }
 
@@ -499,12 +485,19 @@ fn retarget_input_desktop() {
     }
 }
 
-/// Ctrl+Alt+Del, as if a person pressed it. Needs the SoftwareSASGeneration policy the
-/// service sets, and SYSTEM rights (the helper has both).
+/// Ctrl+Alt+Del, as if a person pressed it. Windows only takes SendSAS from a service
+/// process, so the helper signals the event the service handed it and the service calls it.
 fn send_sas_now() {
-    use windows::Win32::Security::Authentication::Identity::SendSAS;
-    // SAFETY: no preconditions beyond the policy/privilege, which the helper has.
-    unsafe { SendSAS(false) };
+    use windows::Win32::System::Threading::SetEvent;
+    let event = std::env::args().nth(2).and_then(|h| h.parse::<isize>().ok());
+    let Some(event) = event else {
+        log_helper("secure helper: no Ctrl+Alt+Del event from the service");
+        return;
+    };
+    // SAFETY: an event handle the service made inheritable and passed on our command line.
+    if unsafe { SetEvent(windows::Win32::Foundation::HANDLE(event as *mut _)) }.is_err() {
+        log_helper("secure helper: couldn't signal Ctrl+Alt+Del");
+    }
 }
 
 /// A SECURITY_DESCRIPTOR allowing LocalSystem, Administrators and the interactively
@@ -516,7 +509,9 @@ fn send_sas_now() {
 /// and the BA ACE wouldn't grant it; IU grants the console user regardless of elevation,
 /// and regardless of whether anyone was logged in when the helper (and its pipe) started.
 fn security_descriptor() -> SecurityDescriptor {
-    let mut sddl = String::from("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
+    // Owned by SYSTEM explicitly (a SYSTEM process's objects default to Administrators), so
+    // the host can tell the real helper's pipe from one another process made.
+    let mut sddl = String::from("O:SYD:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
     if let Some(sid) = console_user_sid() {
         sddl.push_str(&format!("(A;;GRGW;;;{sid})"));
     }
@@ -558,12 +553,12 @@ impl Drop for SecurityDescriptor {
 }
 
 /// Creates the pipe instance, with the strict ACL and remote clients rejected.
-fn create_pipe(sd: &SecurityDescriptor) -> anyhow::Result<windows::Win32::Foundation::HANDLE> {
+fn create_pipe(sd: &SecurityDescriptor) -> anyhow::Result<Pipe> {
     use windows::Win32::Security::SECURITY_ATTRIBUTES;
     use windows::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
-    use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
+    use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
     let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: sd.0.0,
@@ -573,7 +568,7 @@ fn create_pipe(sd: &SecurityDescriptor) -> anyhow::Result<windows::Win32::Founda
     let handle = unsafe {
         CreateNamedPipeW(
             &windows::core::HSTRING::from(PIPE),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             256 * 1024,
@@ -585,7 +580,7 @@ fn create_pipe(sd: &SecurityDescriptor) -> anyhow::Result<windows::Win32::Founda
     if handle.is_invalid() {
         anyhow::bail!("CreateNamedPipeW failed; is another helper running?");
     }
-    Ok(handle)
+    Ok(Pipe::from_handle(handle))
 }
 
 /// The SID string of the user signed in at the active console session, if any.
@@ -606,29 +601,13 @@ fn console_user_sid() -> Option<String> {
     }
 }
 
-/// An independent, separately-closable std File over the pipe: a duplicate of the server
-/// handle, so the reader and the frame-forward thread each own one and close it on drop
-/// without touching the caller's handle.
-fn dup_handle(handle: windows::Win32::Foundation::HANDLE) -> Option<std::fs::File> {
-    use std::os::windows::io::FromRawHandle;
-    use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
-    use windows::Win32::System::Threading::GetCurrentProcess;
-    let mut out = HANDLE::default();
-    // SAFETY: duplicating a valid handle within this process; `out` receives an owned copy
-    // that the returned File closes on drop.
-    unsafe {
-        let me = GetCurrentProcess();
-        DuplicateHandle(me, handle, me, &mut out, 0, false, DUPLICATE_SAME_ACCESS).ok()?;
-        Some(std::fs::File::from_raw_handle(out.0 as *mut _))
-    }
-}
-
 fn log_helper(line: &str) {
     tracing::info!("{line}");
     let dir = super::log_dir();
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("secure.log")) {
-        let _ = writeln!(f, "{line}");
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let _ = writeln!(f, "{secs} {line}");
     }
 }
 
@@ -655,9 +634,8 @@ fn warn_once(msg: &str) {
 }
 
 /// Whether the pipe's owner is LocalSystem.
-fn owned_by_system(file: &std::fs::File) -> bool {
-    use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+fn owned_by_system(handle: windows::Win32::Foundation::HANDLE) -> bool {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT};
     use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
     // SAFETY: queries our own open handle; the descriptor is freed after reading the owner.
@@ -665,7 +643,7 @@ fn owned_by_system(file: &std::fs::File) -> bool {
         let mut owner = PSID::default();
         let mut sd = PSECURITY_DESCRIPTOR::default();
         let got = GetSecurityInfo(
-            HANDLE(file.as_raw_handle() as *mut _),
+            handle,
             SE_KERNEL_OBJECT,
             OWNER_SECURITY_INFORMATION,
             Some(&mut owner),

@@ -35,9 +35,9 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Type any text (agents) | ✅ | ❌ | 🧪 Unicode key events | |
 | Pen pressure and tilt | ✅ | ❌ | 🧪 synthetic pen | |
 | Game controllers | ❌ | ✅ uinput | 🧪 ViGEmBus | Windows: a virtual Xbox 360 controller when ViGEmBus is installed |
-| Use the lock screen / sign-in screen (while signed in) | ✅ | ? | 🧪 SYSTEM helper | Windows: `glass service install` keeps a SYSTEM helper on the input desktop |
-| Control elevated windows, UAC prompts | — | — | 🧪 SYSTEM helper | Same service; input passes UIPI through SYSTEM |
-| Send Ctrl+Alt+Del | — | — | 🧪 SendSAS | Needs the secure-desktop service (sets the SoftwareSASGeneration policy) |
+| Use the lock screen / sign-in screen (while signed in) | ✅ | ? | ✅ SYSTEM helper | Windows: `glass service install` keeps a SYSTEM helper on the input desktop |
+| Control elevated windows, UAC prompts | — | — | ✅ SYSTEM helper | Same service; input passes UIPI through SYSTEM |
+| Send Ctrl+Alt+Del | — | — | ✅ SendSAS | Viewer's More menu. Needs the secure-desktop service (sets the SoftwareSASGeneration policy) |
 | Wake on LAN, restart Glass/computer | ✅ | ✅ | 🧪 | |
 | Stay awake with the lid closed | ✅ | ✅ | 🧪 power plan lid action | Windows: "Do nothing" on power while it's on, put back after |
 
@@ -83,7 +83,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Managed deployment | ❌ | ❌ | 🧪 per-machine MSI, winget manifests | `msiexec /i glass-….msi /qn`; Program Files, starts for every user, firewall rule |
 | Admin policies (locked settings) | ❌ | ❌ | 🧪 Group Policy / Intune (ADMX) | HKLM/HKCU\SOFTWARE\Policies\Glass; packaging/windows/policies |
 | Background service | ✅ LaunchAgent | ✅ systemd user | ✅ glassw at sign-in | |
-| Secure-desktop service (SYSTEM) | — | — | 🧪 optional | `glass service install`; keeps a SYSTEM helper in the console session for the lock screen, UAC and Ctrl+Alt+Del. Host stays the only network/auth endpoint |
+| Secure-desktop service (SYSTEM) | — | — | ✅ optional | `glass service install`; keeps a SYSTEM helper in the console session for the lock screen, UAC and Ctrl+Alt+Del. Host stays the only network/auth endpoint |
 | Self-update | ✅ | ✅ | ✅ | Windows MSI installs update with the MSI or winget; a policy can turn updates off |
 | Guided setup | ✅ | ✅ | ✅ (unattended) | Windows adds a firewall rule and offers the secure-desktop service (one UAC prompt each) |
 | Desktop app | ✅ Glass.app | ❌ | ✅ Start menu | Same window |
