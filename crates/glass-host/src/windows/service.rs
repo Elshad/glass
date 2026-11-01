@@ -120,6 +120,7 @@ fn install() -> Result<()> {
                 return Err(e).context("create the service");
             }
         };
+        restart_on_failure(svc);
         let started = StartServiceW(svc, None).is_ok();
         let _ = close_service_handle(svc.0);
         let _ = close_service_handle(scm.0);
@@ -195,6 +196,7 @@ fn refresh(bin: &str) -> Result<()> {
             None,
             None,
         );
+        restart_on_failure(svc);
         let mut st = SERVICE_STATUS::default();
         let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut st);
         for _ in 0..50 {
@@ -209,6 +211,28 @@ fn refresh(bin: &str) -> Result<()> {
         changed.context("update the service")?;
     }
     Ok(())
+}
+
+/// Windows starts the service again if it dies: the MSI's installer closes every
+/// glass.exe while it copies files (this one included), and a crash shouldn't leave the
+/// lock screen unreachable until the next reboot.
+///
+/// # Safety
+/// `svc` is an open service handle with SERVICE_CHANGE_CONFIG.
+unsafe fn restart_on_failure(svc: windows::Win32::System::Services::SC_HANDLE) {
+    use windows::Win32::System::Services::{
+        ChangeServiceConfig2W, SC_ACTION, SC_ACTION_RESTART, SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_FAILURE_ACTIONSW,
+    };
+    let mut actions = [SC_ACTION { Type: SC_ACTION_RESTART, Delay: 5000 }; 3];
+    let config = SERVICE_FAILURE_ACTIONSW {
+        dwResetPeriod: 24 * 3600,
+        lpRebootMsg: PWSTR::null(),
+        lpCommand: PWSTR::null(),
+        cActions: actions.len() as u32,
+        lpsaActions: actions.as_mut_ptr(),
+    };
+    // SAFETY: the config and its actions live for the call.
+    let _ = unsafe { ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, Some((&raw const config).cast())) };
 }
 
 fn uninstall() -> Result<()> {

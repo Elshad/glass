@@ -78,8 +78,13 @@
     <!-- Installed by hand (with its window): open the app, as the person who ran it, to set
          Glass up. A silent install (/qn) leaves that to sign-in. -->
     <CustomAction Id="OpenGlass" Directory="BinFolder" ExeCommand="&quot;[#GlasswExe]&quot; app" Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
+    <!-- Uninstalled for good (not upgraded): the optional secure-desktop service runs this
+         copy's glass.exe, so it goes too. An upgrade keeps it: the installer closes it with
+         the other copies of glass.exe, and Windows starts it again on the new one. -->
+    <CustomAction Id="RemoveSecureDesktop" FileRef="GlassExe" ExeCommand="service uninstall" Execute="deferred" Impersonate="no" Return="ignore" />
     <InstallExecuteSequence>
       <Custom Action="OpenGlass" After="InstallFinalize" Condition="UILevel &gt;= 5 AND NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RemoveSecureDesktop" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
   </Package>
 </Wix>

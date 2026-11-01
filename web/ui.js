@@ -428,7 +428,7 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
         checked: resolutionMode === 'auto',
         onSelect: () => { setMenuOpen('displays', false); onResolution?.('auto'); },
       }),
-      menuItem('This Mac', native ? `${native.width}×${native.height}` : 'full resolution', {
+      menuItem(hostOs === 'macos' ? 'This Mac' : 'Full size', native ? `${native.width}×${native.height}` : 'full resolution', {
         checked: resolutionMode === 'native',
         onSelect: () => { setMenuOpen('displays', false); onResolution?.('native'); },
       }),

@@ -344,6 +344,8 @@ pub struct Features {
     pub browse: bool,
     /// The viewer can become a second display ("Use as a second display").
     pub extend: bool,
+    /// The host's desktop can be reshaped to the viewer's screen ("Fit this device", macOS).
+    pub fit: bool,
     /// A quick-support session (`glass support`): the viewer is someone helping.
     pub support: bool,
 }

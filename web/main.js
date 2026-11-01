@@ -788,7 +788,7 @@ function onControl(msg) {
       guest = Boolean(msg.guest);
       // Remote: other machines aren't reachable from here, so no machines menu either.
       ui.setGuest(guest || Boolean(remoteKey));
-      ui.setCanFit(!guest);
+      ui.setCanFit(!guest && msg.features?.fit !== false);
       // A new session has no second display (the host removed it when the last one ended).
       extended = undefined;
       ui.setExtend({ available: Boolean(msg.features?.extend && (msg.perms ? msg.perms.owner : !guest)), on: false });
