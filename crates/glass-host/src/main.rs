@@ -31,6 +31,7 @@ mod media;
 mod mic;
 mod notify;
 mod now_playing;
+mod pcm;
 mod oidc;
 mod passkey;
 mod posture;
@@ -328,8 +329,9 @@ enum Command {
     Deny { id: Option<u64> },
     /// Send a message to everyone viewing.
     Chat { message: Vec<String> },
-    /// Viewers' microphones on this Mac (through BlackHole): status, or install BlackHole.
-    #[cfg(target_os = "macos")]
+    /// Viewers' microphones on this computer (macOS: Glass Microphone; Windows: VB-CABLE):
+    /// status, or install what they need.
+    #[cfg(any(target_os = "macos", windows))]
     Mic {
         #[arg(value_parser = ["status", "install", "uninstall"], default_value = "status")]
         action: String,
@@ -940,7 +942,7 @@ async fn async_main(args: Args) -> Result<()> {
         }
         Some(Command::Allow { id }) => decide_cli(*id, true),
         Some(Command::Deny { id }) => decide_cli(*id, false),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         Some(Command::Mic { action }) => {
             match action.as_str() {
                 "install" => println!("{}", mic::install(mic::Ask::Terminal)?),
@@ -953,6 +955,9 @@ async fn async_main(args: Args) -> Result<()> {
                     None if cfg!(target_os = "macos") => {
                         println!("Not set up: a viewer's microphone needs Glass Microphone, a small audio driver. Install it: glass mic install")
                     }
+                    None if cfg!(windows) => println!(
+                        "Not set up: a viewer's microphone needs VB-CABLE, a free virtual audio cable (https://vb-audio.com/Cable/). Get it: glass mic install"
+                    ),
                     None => println!("Not set up: a viewer's microphone needs pactl and PipeWire or PulseAudio. Set it up: glass mic install"),
                 },
             }

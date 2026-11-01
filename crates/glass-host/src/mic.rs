@@ -13,6 +13,11 @@
 //! default input while a mic is on (put back after). Without a driver the mic isn't
 //! offered: playing the voice through the speakers would feed it back to the viewer
 //! through the host's own audio capture, an echo rather than a microphone.
+//!
+//! Windows: only a driver can add a microphone, so through a virtual cable the user
+//! installs (VB-Audio's free VB-CABLE; `glass mic install` opens its download page). Glass
+//! plays the viewer's voice into the cable's output ("CABLE Input") with WASAPI; apps pick
+//! its other end ("CABLE Output") as their microphone.
 
 use glass_proto::{AUDIO_HEADER_LEN, KIND_MIC};
 
@@ -24,17 +29,21 @@ pub fn supported() -> bool {
     return mac::device().is_some();
     #[cfg(target_os = "linux")]
     return linux::pactl();
+    #[cfg(windows)]
+    return win::device().is_some();
     #[allow(unreachable_code)]
     false
 }
 
-/// What a viewer's mic comes in as: "Glass Microphone", "BlackHole 2ch", or on Linux
-/// "Glass microphone" (made while a mic is on); `None` when it can't yet.
+/// What a viewer's mic comes in as: "Glass Microphone", "BlackHole 2ch", on Linux "Glass
+/// microphone" (made while a mic is on), on Windows "CABLE Output"; `None` when it can't yet.
 pub fn device_name() -> Option<String> {
     #[cfg(target_os = "macos")]
     return mac::device().map(|(_, name)| name);
     #[cfg(target_os = "linux")]
     return linux::pactl().then(|| "Glass microphone".to_string());
+    #[cfg(windows)]
+    return win::device().map(|(_, name)| name);
     #[allow(unreachable_code)]
     None
 }
@@ -49,12 +58,14 @@ pub enum Ask {
 
 /// Installs what a viewer's microphone needs. macOS: the Glass Microphone driver shipped
 /// with Glass (or BlackHole's official installer when this build has no driver). Linux:
-/// `pactl`, with the system's package manager.
+/// `pactl`, with the system's package manager. Windows: VB-CABLE's download page.
 pub fn install(ask: Ask) -> anyhow::Result<String> {
     #[cfg(target_os = "macos")]
     return mac_install(ask);
     #[cfg(target_os = "linux")]
     return linux::install(ask);
+    #[cfg(windows)]
+    return win::install(ask);
     #[allow(unreachable_code)]
     {
         let _ = ask;
@@ -248,6 +259,10 @@ pub fn packet(data: &[u8]) {
     if let Some(pcm) = mono_pcm(data) {
         mac::write(&pcm);
     }
+    #[cfg(windows)]
+    if let Some(pcm) = mono_pcm(data) {
+        win::write(&pcm);
+    }
 }
 
 /// A session started (true) or stopped (false) sending.
@@ -259,18 +274,20 @@ pub fn active(on: bool) {
     linux::active(on);
     #[cfg(target_os = "macos")]
     mac::active(on);
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    win::active(on);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     let _ = on;
 }
 
 /// A short buffer of mono 48 kHz samples: the newest win when the viewer sends faster
 /// than the device plays, so delay never builds up.
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
 struct Ring {
     samples: std::collections::VecDeque<i16>,
 }
 
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
 impl Ring {
     /// Past this much buffered audio, trim back to `KEEP`.
     const MAX: usize = 48_000 * 120 / 1000;
@@ -283,6 +300,53 @@ impl Ring {
             self.samples.drain(..drop);
         }
     }
+
+    /// `frames` samples for a device at another rate (`step` = 48 kHz / its rate), read from
+    /// `pos` on; silence once it runs dry. Drops what it read.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    fn take(&mut self, frames: usize, step: f64, pos: &mut f64) -> Vec<f32> {
+        let mut p = *pos;
+        let mut out = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            out.push(self.samples.get(p as usize).map_or(0.0, |s| *s as f32 / 32768.0));
+            p += step;
+        }
+        let used = (p as usize).min(self.samples.len());
+        self.samples.drain(..used);
+        *pos = if used < p as usize { 0.0 } else { p.fract() };
+        out
+    }
+}
+
+/// The virtual cable to play a viewer's mic into, from Windows' output names: its index and
+/// the input apps pick ("CABLE Output" for "CABLE Input (VB-Audio Virtual Cable)"). VB-CABLE
+/// first, then its A/B/C/D and Hi-Fi siblings, then Virtual Audio Cable's lines (whose two
+/// ends share a name). `wanted` (GLASS_MIC_DEVICE) picks another output by name.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn pick_cable(outputs: &[String], wanted: Option<&str>) -> Option<(usize, String)> {
+    let short = |name: &str| name.split(" (").next().unwrap_or(name).trim().to_string();
+    let rank = |name: &str| -> Option<u8> {
+        if let Some(w) = wanted {
+            return name.contains(w).then_some(0);
+        }
+        let s = short(name);
+        if s == "CABLE Input" {
+            Some(0)
+        } else if s.ends_with("Input") && s.to_lowercase().contains("cable") {
+            Some(1)
+        } else if name.ends_with("(Virtual Audio Cable)") {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    let (_, i) = outputs.iter().enumerate().filter_map(|(i, n)| Some((rank(n)?, i))).min()?;
+    let name = &outputs[i];
+    let input = match short(name).strip_suffix("Input") {
+        Some(base) => format!("{base}Output"),
+        None => name.clone(),
+    };
+    Some((i, input))
 }
 
 #[cfg(target_os = "macos")]
@@ -607,6 +671,159 @@ mod mac {
     }
 }
 
+#[cfg(windows)]
+mod win {
+    //! A virtual cable through WASAPI: the viewer's voice plays into the cable's output and
+    //! comes out of its other end, which apps pick as their microphone. Windows has no
+    //! documented way to change the default input, so apps are told which one to pick.
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use anyhow::Context;
+    use windows::Win32::Media::Audio::{
+        AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, IAudioRenderClient, IMMDevice, WAVEFORMATEX,
+    };
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    use super::Ring;
+
+    const DOWNLOAD: &str = "https://vb-audio.com/Cable/";
+
+    /// What viewers send: 48 kHz mono s16 (the engine converts it to the cable's format).
+    const MONO: WAVEFORMATEX = WAVEFORMATEX {
+        wFormatTag: 1, // WAVE_FORMAT_PCM
+        nChannels: 1,
+        nSamplesPerSec: 48_000,
+        nAvgBytesPerSec: 96_000,
+        nBlockAlign: 2,
+        wBitsPerSample: 16,
+        cbSize: 0,
+    };
+    /// The engine's buffer, kept full: the mic's delay, so short (100 ns units).
+    const BUFFER_HNS: i64 = 30 * 10_000;
+
+    struct Playing {
+        stop: Arc<AtomicBool>,
+        /// Sessions with their mic on.
+        users: usize,
+    }
+
+    static PLAYING: Mutex<Option<Playing>> = Mutex::new(None);
+    static RING: Mutex<Ring> = Mutex::new(Ring { samples: std::collections::VecDeque::new() });
+
+    /// The cable's output (what Glass plays into) and the input apps pick.
+    pub fn device() -> Option<(IMMDevice, String)> {
+        let outputs = crate::audio::outputs();
+        let names: Vec<String> = outputs.iter().map(|(_, n)| n.clone()).collect();
+        let wanted = std::env::var("GLASS_MIC_DEVICE").ok();
+        let (i, input) = super::pick_cable(&names, wanted.as_deref())?;
+        Some((outputs.into_iter().nth(i)?.0, input))
+    }
+
+    pub fn install(ask: super::Ask) -> anyhow::Result<String> {
+        let _ = ask;
+        if let Some((_, input)) = device() {
+            return Ok(format!("The microphone is ready: while a viewer's mic is on, apps here can pick \"{input}\"."));
+        }
+        crate::platform::setup::open_url(DOWNLOAD);
+        Ok(format!(
+            "Opened VB-Audio's website ({DOWNLOAD}): download VB-CABLE, unzip it and run VBCABLE_Setup_x64.exe as administrator. Then turn on the mic in the viewer and pick \"CABLE Output\" as the microphone in your apps."
+        ))
+    }
+
+    pub fn active(on: bool) {
+        let mut playing = PLAYING.lock().unwrap();
+        if on {
+            if let Some(p) = playing.as_mut() {
+                p.users += 1;
+                return;
+            }
+            RING.lock().unwrap().samples.clear();
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            match std::thread::Builder::new().name("glass-mic".into()).spawn(move || play(&flag)) {
+                Ok(_) => *playing = Some(Playing { stop, users: 1 }),
+                Err(e) => tracing::warn!("microphone: {e}"),
+            }
+        } else if let Some(p) = playing.as_mut() {
+            p.users = p.users.saturating_sub(1);
+            if p.users == 0 {
+                playing.take().unwrap().stop.store(true, Ordering::Relaxed);
+                tracing::info!("microphone: off");
+            }
+        }
+    }
+
+    pub fn write(pcm: &[u8]) {
+        if PLAYING.lock().unwrap().is_some() {
+            RING.lock().unwrap().push(pcm);
+        }
+    }
+
+    /// Plays until stopped, opening the cable again if it goes away meanwhile.
+    fn play(stop: &AtomicBool) {
+        crate::audio::com_init();
+        let mut last_error = String::new();
+        while !stop.load(Ordering::Relaxed) {
+            if let Err(e) = render(stop) {
+                let msg = format!("{e:#}");
+                if msg != last_error {
+                    tracing::warn!("microphone: {msg}");
+                    last_error = msg;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+
+    fn render(stop: &AtomicBool) -> anyhow::Result<()> {
+        let (device, input) = device().with_context(|| format!("no virtual cable; install VB-CABLE ({DOWNLOAD})"))?;
+        let name = crate::audio::friendly_name(&device).unwrap_or_else(|| input.clone());
+        let event = crate::audio::event()?;
+        let (client, format) = crate::audio::open(&device, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, &MONO, BUFFER_HNS)
+            .with_context(|| format!("couldn't play into {name}"))?;
+        let frame_bytes = format.frame_bytes();
+        // SAFETY: the client is initialised; the event is declared before it, so it's closed
+        // after the client is released. The first buffer is filled with silence before
+        // starting, as WASAPI asks for event-driven playback.
+        let (writer, size): (IAudioRenderClient, u32) = unsafe {
+            client.SetEventHandle(*event)?;
+            let writer: IAudioRenderClient = client.GetService()?;
+            let size = client.GetBufferSize()?;
+            writer.GetBuffer(size)?;
+            writer.ReleaseBuffer(size, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)?;
+            client.Start()?;
+            (writer, size)
+        };
+        tracing::info!("microphone: playing into {name} ({format}); apps pick \"{input}\"");
+        let step = 48_000.0 / format.rate as f64;
+        let mut pos = 0.0;
+        while !stop.load(Ordering::Relaxed) {
+            // SAFETY: the event is open.
+            unsafe { WaitForSingleObject(*event, 50) };
+            // SAFETY: a plain COM call on a live interface.
+            let free = size - unsafe { client.GetCurrentPadding() }?;
+            if free == 0 {
+                continue;
+            }
+            let samples = RING.lock().unwrap().take(free as usize, step, &mut pos);
+            // SAFETY: GetBuffer returns room for `free` frames, written in full, then
+            // handed back.
+            unsafe {
+                let data = writer.GetBuffer(free)?;
+                let out = std::slice::from_raw_parts_mut(data, free as usize * frame_bytes);
+                crate::pcm::encode_mono(&samples, &format, out);
+                writer.ReleaseBuffer(free, 0)?;
+            }
+        }
+        // SAFETY: as above.
+        unsafe { client.Stop() }?;
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io::Write;
@@ -784,6 +1001,38 @@ mod tests {
         assert_eq!(ring.samples.len(), Ring::KEEP);
         // The newest samples are the ones kept.
         assert_eq!(*ring.samples.back().unwrap(), Ring::MAX as i16 + 99);
+    }
+
+    #[test]
+    fn reads_the_ring_at_other_rates() {
+        let mut ring = Ring { samples: Default::default() };
+        let pcm: Vec<u8> = [0i16, 8192, 16384, -16384].iter().flat_map(|s| s.to_le_bytes()).collect();
+        ring.push(&pcm);
+        let mut pos = 0.0;
+        // 96 kHz: every sample twice.
+        assert_eq!(ring.take(4, 0.5, &mut pos), [0.0, 0.0, 0.25, 0.25]);
+        assert_eq!(ring.samples.len(), 2);
+        // Runs dry into silence, and starts afresh after.
+        assert_eq!(ring.take(6, 0.5, &mut pos), [0.5, 0.5, -0.5, -0.5, 0.0, 0.0]);
+        assert!(ring.samples.is_empty());
+        assert_eq!(pos, 0.0);
+    }
+
+    #[test]
+    fn picks_a_virtual_cable() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let outputs = names(&["Speakers (Realtek(R) Audio)", "CABLE-A Input (VB-Audio Cable A)", "CABLE Input (VB-Audio Virtual Cable)"]);
+        assert_eq!(pick_cable(&outputs, None), Some((2, "CABLE Output".into())));
+        assert_eq!(pick_cable(&outputs[..2], None), Some((1, "CABLE-A Output".into())));
+        let hifi = names(&["Hi-Fi Cable Input (VB-Audio Hi-Fi Cable)"]);
+        assert_eq!(pick_cable(&hifi, None), Some((0, "Hi-Fi Cable Output".into())));
+        let vac = names(&["Speakers (High Definition Audio Device)", "Line 1 (Virtual Audio Cable)"]);
+        assert_eq!(pick_cable(&vac, None), Some((1, "Line 1 (Virtual Audio Cable)".into())));
+        // Nothing virtual: no microphone.
+        assert_eq!(pick_cable(&outputs[..1], None), None);
+        assert_eq!(pick_cable(&names(&["Headphones (Input Devices Inc)"]), None), None);
+        // GLASS_MIC_DEVICE picks by name.
+        assert_eq!(pick_cable(&outputs, Some("CABLE-A")), Some((1, "CABLE-A Output".into())));
     }
 
     #[test]
