@@ -535,6 +535,27 @@ Keys arrive as typed on Linux hosts: ⌘ on an Apple keyboard is Super. Paste fr
 
 While the session is locked (logind's lock hint, or a locker such as hyprlock or swaylock running), keys aren't shown to viewers or logged. **Stay awake with the lid closed** works on Linux laptops too; see [A locked screen, or a closed lid](#a-locked-screen-or-a-closed-lid).
 
+## Windows host (preview)
+
+On Windows 10 or 11 (x64 or Arm), run in PowerShell:
+
+```powershell
+irm glassdesk.dev/install.ps1 | iex
+```
+
+It installs to `%LOCALAPPDATA%\Programs\Glass` for your user (no administrator needed), starts Glass at sign-in, and runs `glass setup`. For managed installs there's a per-machine MSI (`msiexec /i glass-….msi /qn`) and Group Policy settings; see the release notes. The Windows host uses:
+
+- **Screen capture:** DXGI Desktop Duplication, every display, with the pointer drawn in.
+- **Encoding:** H.264 on the GPU through Media Foundation where there is one, otherwise OpenH264.
+- **Input:** `SendInput`, keys by scan code. Game controllers need the free [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver.
+- **Clipboard:** text, rich text (HTML) and images.
+- **Audio:** system audio through WASAPI loopback; the viewer's microphone through [VB-CABLE](https://vb-audio.com/Cable/) if it's installed.
+- **Terminal:** PowerShell in the viewer, through ConPTY.
+- **Background:** `glassw.exe` starts Glass at sign-in (the Run key), with an icon in the notification area showing who's viewing. Logs: `%LOCALAPPDATA%\Glass\Logs`.
+- **Lock screen, UAC and Ctrl+Alt+Del (optional):** `glass service install` (one UAC prompt) adds the Glass Secure Desktop service, which keeps a helper running as SYSTEM in the console session so viewers can see and use the lock screen, UAC prompts and elevated windows, and send Ctrl+Alt+Del. Only the signed-in console user's own Glass can talk to it, and it adds no network access. `glass service uninstall` removes it.
+
+To remove Glass, uninstall it in **Settings › Apps › Installed apps**: that takes away the programs, the start-at-sign-in entry, the Start menu shortcut, the firewall rule and the secure-desktop service (one UAC prompt), and keeps your settings in `%APPDATA%\Glass`. `glass uninstall` only stops Glass starting at sign-in.
+
 ## Viewing from Linux or Windows (Omarchy included)
 
 Open the Glass URL in Chromium, Chrome, or Firefox with Tailscale running. When the host is a Mac, **PC keyboard** mode (on by default for Linux and Windows browsers; toggle it in the ⌘ menu) translates PC conventions:
@@ -550,7 +571,7 @@ Hyprland keeps its own Super shortcuts. In fullscreen (Ctrl+Shift+F), Chromium's
 - All traffic is encrypted (TLS 1.3 via QUIC/HTTPS).
 - With Tailscale, traffic stays on your private tailnet and goes directly between devices when possible.
 - Access control: a device is let in if Tailscale reports it belongs to the same user as the Mac, or if it presents the access token. Glass sends nothing to a session (video, audio, clipboard, input) until it is authenticated. Links, single sign-on, LDAP, access rules, posture checks and passkeys can narrow that further; see above.
-- Glass runs as your user (a LaunchAgent on macOS, a systemd user service on Linux), never as root. The one exception you can opt into: **Stay awake with the lid closed** on a Mac installs a sudoers rule that lets it turn sleep off and on (`pmset -a disablesleep 0|1`), nothing else.
+- Glass runs as your user (a LaunchAgent on macOS, a systemd user service on Linux, a sign-in entry on Windows), never as root. On Windows you can opt into the Glass Secure Desktop service, whose SYSTEM helper only serves your own Glass (see [Windows host](#windows-host-preview)). The one exception you can opt into: **Stay awake with the lid closed** on a Mac installs a sudoers rule that lets it turn sleep off and on (`pmset -a disablesleep 0|1`), nothing else.
 - Keys pressed into a password field, or anywhere while a Linux session is locked, aren't shown to viewers or logged.
 - The file browser is for the computer's owner only (not links or guests), sees only the home folder (no `..`, no symlinks out), and moves to the Trash rather than deleting.
 - Fleet (opt-in) sends a computer's details to your glassdesk.dev account and lets that account ask for a fixed set of actions, each signed by your passkey and checked by the computer itself. See [Glass Fleet](#glass-fleet-new) for what's sent and what can and can't happen.
@@ -567,7 +588,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 - **Committers and reviewers:** [Nathan Tarasiuk](https://github.com/Ntarasiuk). A pull request from anyone else is reviewed by a committer before it's merged.
 - **Approvers:** [Nathan Tarasiuk](https://github.com/Ntarasiuk) approves every signing request by hand.
-- **Privacy:** what Glass sends and where is under [Security and privacy](#security-and-privacy).
+- **Privacy:** what Glass sends and where is under [Security and privacy](https://glassdesk.dev/docs#security-and-privacy).
 
 ## Requirements
 
@@ -606,7 +627,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 **Does it work on Linux?** Yes, as a viewer in any modern browser, and as a host on Wayland (beta).
 
-**Does it work on Windows?** As a viewer, yes, in any modern browser. Windows can't be the computer you control yet.
+**Does it work on Windows?** As a viewer, yes, in any modern browser. As a host, in preview: see [Windows host](#windows-host-preview).
 
 **Does it stream audio?** Yes, the host's system audio, toggled per device.
 

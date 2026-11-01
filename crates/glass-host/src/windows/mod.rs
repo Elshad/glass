@@ -14,6 +14,7 @@ pub mod permissions;
 pub mod pipe;
 pub mod policy;
 pub mod privacy;
+pub mod remove;
 pub mod script;
 pub mod secure;
 pub mod service;

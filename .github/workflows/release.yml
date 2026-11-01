@@ -274,19 +274,23 @@ jobs:
           if [ -e dist/windows-unsigned ]; then
             printf '\n> **Windows:** these builds are not code-signed yet, so SmartScreen may warn before the MSI runs (More info › Run anyway).\n' >> notes.md
           fi
-          printf '\n[Code signing policy](https://glassdesk.dev/docs#code-signing-policy)\n' >> notes.md
+          # The code signing policy, from the docs, so the download page carries it too.
+          { echo; awk '/^## Code signing policy$/ { on = 1 } on && /^## / && !/Code signing/ { exit } on' site/docs.md | sed 's/^## /### /'; } >> notes.md
+          # A version with a suffix (0.11.0-windows.1) is a pre-release: never "Latest".
+          case "$version" in *-*) pre=(--prerelease --latest=false) ;; *) pre=() ;; esac
           # Every platform's archive, the Windows MSIs, and their .sha256 files.
-          gh release create "$GITHUB_REF_NAME" dist/glass-[0-9]* --notes-file notes.md --generate-notes --title "Glass $GITHUB_REF_NAME"
+          gh release create "$GITHUB_REF_NAME" dist/glass-[0-9]* "${pre[@]}" --notes-file notes.md --generate-notes --title "Glass $GITHUB_REF_NAME"
       # The winget manifests for this release, to submit to microsoft/winget-pkgs by hand
       # (packaging/winget/README.md).
       - name: winget manifests
         run: node scripts/winget.mjs "${GITHUB_REF_NAME#v}" dist dist/winget
       - uses: actions/upload-artifact@v4
         with: { name: winget-manifests, path: dist/winget/ }
+      # Not for a pre-release: the installers and updates keep serving the last release.
       - uses: actions/setup-node@v4
-        if: env.CLOUDFLARE_API_TOKEN != ''
+        if: env.CLOUDFLARE_API_TOKEN != '' && !contains(github.ref_name, '-')
         with: { node-version: 24 }
       - name: Deploy glassdesk.dev (installer serves the new release)
-        if: env.CLOUDFLARE_API_TOKEN != ''
+        if: env.CLOUDFLARE_API_TOKEN != '' && !contains(github.ref_name, '-')
         working-directory: site
         run: npm ci && npm run deploy

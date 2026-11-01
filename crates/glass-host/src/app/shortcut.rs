@@ -7,10 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 pub fn path() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate::home().join("AppData").join("Roaming"))
-        .join(r"Microsoft\Windows\Start Menu\Programs\Glass.lnk")
+    crate::platform::remove::start_menu_link()
 }
 
 /// The windowless launcher (the all-users one, if Glass is installed for everyone).
@@ -42,6 +39,8 @@ pub fn install() -> Result<PathBuf> {
     );
     let status = crate::platform::powershell(&script).status().context("powershell")?;
     anyhow::ensure!(status.success(), "couldn't add Glass to the Start menu");
+    // And to Settings › Apps, so it can be uninstalled from there.
+    crate::platform::remove::register()?;
     Ok(link)
 }
 

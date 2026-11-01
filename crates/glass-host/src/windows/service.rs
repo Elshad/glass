@@ -283,7 +283,7 @@ fn elevate(action: &str) -> Result<()> {
 }
 
 /// Whether this process is elevated (runs with a full administrator token).
-fn is_elevated() -> bool {
+pub(super) fn is_elevated() -> bool {
     use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     // SAFETY: the token is closed right after the query.

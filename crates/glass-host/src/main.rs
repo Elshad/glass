@@ -227,7 +227,11 @@ enum Command {
     /// Restart the background service (viewers reconnect by themselves).
     Restart,
     /// Stop the background service and remove it from login items.
-    Uninstall,
+    Uninstall {
+        /// Windows: remove everything Glass added except its settings (Settings › Apps runs this).
+        #[arg(long, hide = true)]
+        everything: bool,
+    },
     /// Install the latest release (and restart the service onto it).
     Update,
     /// Make a one-time magic link that lets a device in without the token.
@@ -1087,7 +1091,7 @@ async fn async_main(args: Args) -> Result<()> {
         #[cfg(any(target_os = "macos", windows))]
         Some(Command::App { .. }) => unreachable!("handled before the runtime starts"),
         Some(Command::Support { .. }) => unreachable!("handled before the runtime starts"),
-        Some(Command::Uninstall) => {
+        Some(Command::Uninstall { everything }) => {
             // Published to the internet for agents: not any more.
             if grants::load().public
                 && let Err(e) = oauth::publish(false)
@@ -1095,6 +1099,14 @@ async fn async_main(args: Args) -> Result<()> {
                 eprintln!("Couldn't stop publishing to agents with Tailscale Funnel ({e:#}); run: tailscale funnel --https=8443 off");
             }
             agent::uninstall()?;
+            #[cfg(windows)]
+            if *everything {
+                platform::remove::everything()?;
+                println!("Glass is removed. Its settings stay in %APPDATA%\\Glass, in case you install it again.");
+                return Ok(());
+            }
+            #[cfg(not(windows))]
+            let _ = everything;
             if cfg!(windows) {
                 println!(
                     "Glass service removed. Delete %LOCALAPPDATA%\\Programs\\Glass and %APPDATA%\\Glass to remove everything."
