@@ -21,7 +21,12 @@ static STATE: Mutex<State> = Mutex::new(State {
 });
 
 pub fn supported() -> bool {
-    crate::testmode::enabled() || crate::platform::privacy::SUPPORTED
+    // Windows: it depends on the build (10 2004 or later), not just the target.
+    #[cfg(windows)]
+    let here = crate::platform::privacy::supported();
+    #[cfg(not(windows))]
+    let here = crate::platform::privacy::SUPPORTED;
+    crate::testmode::enabled() || here
 }
 
 /// Turns it on or off for as long as anyone stays connected.
