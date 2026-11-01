@@ -557,6 +557,18 @@ Hyprland keeps its own Super shortcuts. In fullscreen (Ctrl+Shift+F), Chromium's
 - Notifications are the one thing that leaves your network: the computer sends them through your browser's push service (Apple, Google, Mozilla or Microsoft), encrypted end to end (RFC 8291), so the push service can't read them. Only devices you turn them on for get them; guests only ever get messages.
 - The glassdesk.dev website uses Google Analytics on its pages (not on the remote viewer at glassdesk.dev/app), counts downloads using a salted hash of the IP address (no raw IPs stored) and stores feedback you choose to send, which is emailed to the maintainer. Downloads are also counted in Google Analytics under that same hash, with the country. The installer says which version it replaces, if any, so updates are counted apart from new installs. The Glass app itself sends nothing to glassdesk.dev except feedback you submit, its check for a new version, and, when you run `glass account add`, the computer's name and public key (plus, only if you run `glass fleet on`, the details listed under *Glass Fleet*). The /computers page loads no analytics.
 
+## Code signing policy
+
+Glass's programs are signed in GitHub Actions ([release.yml](https://github.com/Ntarasiuk/glass/blob/main/.github/workflows/release.yml)), built from this repository's source and nothing else: macOS builds with Glass's own key, Windows builds (`glass.exe`, `glassw.exe` and the MSI) with an Authenticode certificate. Only Glass's own code is signed, never third-party programs.
+
+Windows signing is being set up through SignPath Foundation's free program for open-source projects. Until it's in place, the Windows downloads are unsigned: SmartScreen may warn before the MSI runs (**More info › Run anyway**), and a PC with Smart App Control turned on may block Glass. Each release's notes say whether its Windows builds are signed.
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- **Committers and reviewers:** [Nathan Tarasiuk](https://github.com/Ntarasiuk). A pull request from anyone else is reviewed by a committer before it's merged.
+- **Approvers:** [Nathan Tarasiuk](https://github.com/Ntarasiuk) approves every signing request by hand.
+- **Privacy:** what Glass sends and where is under [Security and privacy](#security-and-privacy).
+
 ## Requirements
 
 - Host: macOS 13 Ventura or newer (Apple Silicon or Intel), or Linux (x86_64 or ARM64) with a Wayland compositor that supports the ScreenCast portal, plus PipeWire.

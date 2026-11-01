@@ -79,7 +79,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 |---|---|---|---|---|
 | One-line install | ✅ install.sh | ✅ install.sh | ✅ install.ps1 | `irm glassdesk.dev \| iex` |
 | Release builds | ✅ universal | ✅ x86_64 | 🧪 x64 + Arm64 zips and MSIs | |
-| Signed builds | ✅ stable identity | — | 🧪 Authenticode, timestamped | Windows: Azure Trusted Signing or a .pfx (release.yml) |
+| Signed builds | ✅ stable identity | — | 🧪 Authenticode, timestamped | Windows: Azure Artifact Signing, a .pfx or SignPath (release.yml); unsigned until one is set up |
 | Managed deployment | ❌ | ❌ | 🧪 per-machine MSI, winget manifests | `msiexec /i glass-….msi /qn`; Program Files, starts for every user, firewall rule |
 | Admin policies (locked settings) | ❌ | ❌ | 🧪 Group Policy / Intune (ADMX) | HKLM/HKCU\SOFTWARE\Policies\Glass; packaging/windows/policies |
 | Background service | ✅ LaunchAgent | ✅ systemd user | ✅ glassw at sign-in | |

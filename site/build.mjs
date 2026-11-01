@@ -80,7 +80,7 @@ function footer(modified, { wrap = true } = {}) {
   const compare = guides.map((g) => `<a href="${g.path}">${esc(g.label)}</a>`).join('');
   return `<footer class="site${wrap ? ' wrap' : ''}">
     <span>Glass is a free, open-source remote desktop for Mac and Linux (MIT). Updated <time datetime="${modified}">${human(modified)}</time>.</span>
-    <nav aria-label="Footer"><a href="/features">Features</a><a href="/docs">Documentation</a><a href="/changelog">Changelog</a><a href="/guides">Guides</a><a href="/help">Quick support</a><a href="/features#feedback">Feedback</a><a href="https://github.com/Ntarasiuk/glass">Star on GitHub</a><a href="/docs.md">docs.md</a><a href="/llms.txt">llms.txt</a><a href="/install.sh">install.sh</a></nav>
+    <nav aria-label="Footer"><a href="/features">Features</a><a href="/docs">Documentation</a><a href="/changelog">Changelog</a><a href="/guides">Guides</a><a href="/help">Quick support</a><a href="/docs#code-signing-policy">Code signing policy</a><a href="/features#feedback">Feedback</a><a href="https://github.com/Ntarasiuk/glass">Star on GitHub</a><a href="/docs.md">docs.md</a><a href="/llms.txt">llms.txt</a><a href="/install.sh">install.sh</a></nav>
     <nav aria-label="Guides and comparisons">${compare}</nav>
   </footer>`;
 }

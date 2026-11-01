@@ -249,6 +249,10 @@ Issues and pull requests are welcome. For anything bigger than a fix, open an is
 
 If Glass is useful to you, a ⭐ helps other people find it.
 
+## Code signing policy
+
+Releases are signed in GitHub Actions from this repository's source; Windows signing is being set up through SignPath Foundation. See the [code signing policy](https://glassdesk.dev/docs#code-signing-policy).
+
 ## License
 
 [MIT](LICENSE) © Nathan Tarasiuk
