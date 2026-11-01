@@ -447,9 +447,8 @@ impl Settings {
             }
             "scim-token" => {
                 let token = if value == "new" {
-                    use std::io::Read;
                     let mut bytes = [0u8; 24];
-                    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+                    crate::control::getrandom(&mut bytes)?;
                     bytes.iter().map(|b| format!("{b:02x}")).collect()
                 } else {
                     anyhow::ensure!(

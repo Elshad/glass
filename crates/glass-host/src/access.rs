@@ -500,9 +500,8 @@ fn update(path: &Path, f: impl FnOnce(&mut Store)) -> Result<()> {
 }
 
 fn random_code() -> Result<String> {
-    use std::io::Read;
     let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    crate::control::getrandom(&mut bytes)?;
     Ok(hex(&bytes))
 }
 

@@ -448,10 +448,12 @@ pub fn save_token(path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
-fn getrandom(buf: &mut [u8]) -> Result<()> {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")?.read_exact(buf)?;
-    Ok(())
+/// Fills `buf` from the system's secure random source (any OS).
+pub fn getrandom(buf: &mut [u8]) -> Result<()> {
+    use ring::rand::SecureRandom;
+    ring::rand::SystemRandom::new()
+        .fill(buf)
+        .map_err(|_| anyhow::anyhow!("no system randomness"))
 }
 
 /// Constant-time comparison so the token can't be guessed byte by byte from timing.
