@@ -184,6 +184,12 @@ fn mouse(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
 fn keyboard(key: Key, down: bool) -> INPUT {
     let up = if down { KEYBD_EVENT_FLAGS(0) } else { KEYEVENTF_KEYUP };
     let (vk, scan, flags) = match key {
+        // Modifiers go as virtual keys (with their scan code): while any low-level keyboard
+        // hook is installed (ours for privacy mode and agents, or another app's), Windows
+        // drops the modifier state of scan-code-only modifiers, so Shift+H types "h".
+        Key::Scan(code, extended) if let Some(vk) = modifier_vk(code, extended) => {
+            (vk, code, up | if extended { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) })
+        }
         Key::Scan(code, extended) => (
             0,
             code,
@@ -192,6 +198,21 @@ fn keyboard(key: Key, down: bool) -> INPUT {
         Key::Vk(vk) => (vk, 0, up),
     };
     keyboard_input(vk, scan, flags)
+}
+
+/// The left/right virtual key of a modifier's scan code (same on every layout).
+fn modifier_vk(scan: u16, extended: bool) -> Option<u16> {
+    Some(match (scan, extended) {
+        (0x2A, false) => 0xA0, // left Shift
+        (0x36, false) => 0xA1, // right Shift
+        (0x1D, false) => 0xA2, // left Ctrl
+        (0x1D, true) => 0xA3,  // right Ctrl
+        (0x38, false) => 0xA4, // left Alt
+        (0x38, true) => 0xA5,  // right Alt
+        (0x5B, true) => 0x5B,  // left Windows
+        (0x5C, true) => 0x5C,  // right Windows
+        _ => return None,
+    })
 }
 
 fn keyboard_input(vk: u16, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
@@ -267,6 +288,17 @@ impl crate::media::InputSink for Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modifiers_go_as_virtual_keys_and_other_keys_as_scan_codes() {
+        let flags = |i: INPUT| unsafe { (i.Anonymous.ki.wVk.0, i.Anonymous.ki.wScan, i.Anonymous.ki.dwFlags) };
+        assert_eq!(flags(keyboard(Key::Scan(0x2A, false), true)), (0xA0, 0x2A, KEYBD_EVENT_FLAGS(0)));
+        assert_eq!(flags(keyboard(Key::Scan(0x1D, true), false)), (0xA3, 0x1D, KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY));
+        assert_eq!(flags(keyboard(LEFT_WIN, true)).0, 0x5B);
+        assert_eq!(flags(keyboard(V, true)), (0, 0x2F, KEYEVENTF_SCANCODE));
+        // Keypad Enter shares Enter's scan code but isn't a modifier.
+        assert_eq!(modifier_vk(0x1C, true), None);
+    }
 
     #[test]
     fn absolute_coordinates_span_the_virtual_screen() {
