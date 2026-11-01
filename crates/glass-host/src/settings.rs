@@ -166,7 +166,14 @@ pub const KEYS: &[(&str, &str)] = &[
     ("recordings-dir", "folder for recordings"),
     ("privacy", "on/off: blank this screen and block local input while viewed"),
     ("hevc", "on/off: use HEVC when every viewer supports it"),
-    ("lid-awake", "on/off: stay awake with the lid closed while on power (laptops; on a Mac, asks for your password once)"),
+    (
+        "lid-awake",
+        if cfg!(windows) {
+            "on/off: stay awake with the lid closed while on power (laptops: closing the lid does nothing while plugged in)"
+        } else {
+            "on/off: stay awake with the lid closed while on power (laptops; on a Mac, asks for your password once)"
+        },
+    ),
     ("agents", "on/off: AI agents on other devices may ask to use this computer (glass agents)"),
     ("forward-ports", "comma-separated ports owner devices may open, e.g. 3000,8888"),
     (
@@ -304,6 +311,8 @@ impl Settings {
                 let on = on_off(value)?;
                 if on && !self.lid_awake {
                     crate::lid::allow()?;
+                } else if !on && self.lid_awake {
+                    crate::lid::release()?;
                 }
                 self.lid_awake = on;
             }

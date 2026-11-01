@@ -38,7 +38,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Unlock from the lock screen | ✅ | ? | ❌ | Windows needs a SYSTEM service |
 | Control elevated windows, UAC prompts | — | — | ❌ | Same: SYSTEM service |
 | Wake on LAN, restart Glass/computer | ✅ | ✅ | 🧪 | |
-| Stay awake with the lid closed | ✅ | ✅ | ❌ | |
+| Stay awake with the lid closed | ✅ | ✅ | 🧪 power plan lid action | Windows: "Do nothing" on power while it's on, put back after |
 
 ## Sound, clipboard, files
 
