@@ -1,6 +1,6 @@
 //! Glass in the Start menu: a shortcut to `glassw.exe app` (glassw has no console window,
 //! so none flashes up), with the Glass icon. There's one binary, and updating it updates
-//! the app.
+//! the app. Installed for everyone, the MSI adds the all-users shortcut instead.
 
 use std::path::PathBuf;
 
@@ -13,15 +13,19 @@ pub fn path() -> PathBuf {
         .join(r"Microsoft\Windows\Start Menu\Programs\Glass.lnk")
 }
 
-/// The windowless launcher beside this binary.
+/// The windowless launcher (the all-users one, if Glass is installed for everyone).
 fn launcher() -> Result<PathBuf> {
-    let path = std::env::current_exe()?.with_file_name("glassw.exe");
-    anyhow::ensure!(path.exists(), "{} is missing; reinstall Glass", path.display());
-    Ok(path)
+    crate::agent::launcher()
 }
 
 /// Writes (or refreshes) the shortcut and its icon.
 pub fn install() -> Result<PathBuf> {
+    if crate::agent::machine_dir().is_some() {
+        // The MSI's shortcut is there for everyone: a per-user one would be a second Glass.
+        let _ = std::fs::remove_file(path());
+        let all = std::env::var_os("ProgramData").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        return Ok(all.join(r"Microsoft\Windows\Start Menu\Programs\Glass.lnk"));
+    }
     let launcher = launcher()?;
     let icon = crate::platform::local_app_data().join("Glass").join("Glass.ico");
     std::fs::create_dir_all(icon.parent().unwrap())?;

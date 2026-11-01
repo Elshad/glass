@@ -536,7 +536,7 @@ impl GlassApp {
         let store = self.store.read(cx);
         let (checking, updating, checked) = (store.checking, store.updating, store.latest.is_some());
         let theme = cx.theme();
-        // Managed by a policy: say so instead of offering one.
+        // Managed (a policy, or installed for everyone): say so instead of offering one.
         if let Some(why) = crate::update::blocked() {
             return v_flex()
                 .mx_1()

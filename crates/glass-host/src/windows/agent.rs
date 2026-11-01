@@ -1,6 +1,10 @@
 //! Runs the host in the background: `glassw.exe` (src/bin/glassw.rs) starts at logon from
 //! the HKCU Run key, needing no administrator, and keeps the host running in the user's
 //! session (a Windows service would run in session 0, which can't see the desktop).
+//!
+//! Installed for everyone instead (the MSI, in Program Files), the HKLM Run key starts
+//! glassw for each user who signs in. Then that copy is the one to run, and its Run key
+//! is the administrator's: setup here only starts it, and never adds a per-user one.
 
 use std::path::PathBuf;
 
@@ -20,7 +24,18 @@ fn marker() -> PathBuf {
     super::local_app_data().join("Glass").join("agent")
 }
 
-fn launcher() -> Result<PathBuf> {
+/// Where the MSI installed Glass for everyone (`HKLM\SOFTWARE\Glass` InstallDir), if it did
+/// and it's still there.
+pub fn machine_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(super::registry_string(r"SOFTWARE\Glass", "InstallDir")?);
+    dir.join(r"bin\glassw.exe").exists().then_some(dir)
+}
+
+/// The launcher to run: the all-users copy if there is one, else the one beside this binary.
+pub fn launcher() -> Result<PathBuf> {
+    if let Some(dir) = machine_dir() {
+        return Ok(dir.join(r"bin\glassw.exe"));
+    }
     let exe = std::env::current_exe()?;
     let path = exe.with_file_name("glassw.exe");
     anyhow::ensure!(path.exists(), "{} is missing; reinstall Glass", path.display());
@@ -28,7 +43,7 @@ fn launcher() -> Result<PathBuf> {
 }
 
 pub fn is_installed() -> bool {
-    marker().exists()
+    machine_dir().is_some() || marker().exists()
 }
 
 /// Whether glassw is running in this session.
@@ -109,8 +124,14 @@ fn ask_host(op: &str) -> bool {
     crate::ipc::call(&crate::ipc::Request::Launcher { op: op.into() }).is_ok()
 }
 
-/// Registers the launcher (at logon if `start_at_login`) and (re)starts the host.
+/// Registers the launcher (at logon if `start_at_login`) and (re)starts the host. Installed
+/// for everyone, it already starts at sign-in, so this only (re)starts it.
 pub fn install(start_at_login: bool) -> Result<()> {
+    if machine_dir().is_some() {
+        // A per-user copy from before would start a second launcher at sign-in.
+        remove_run_key();
+        return restart();
+    }
     let path = launcher()?;
     if start_at_login {
         let command: Vec<u16> = format!("\"{}\"", path.display()).encode_utf16().chain([0]).collect();
@@ -152,6 +173,10 @@ pub fn restart() -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
+    anyhow::ensure!(
+        machine_dir().is_none(),
+        "Glass is installed for everyone on this computer, so it starts for each user. An administrator removes it in Settings › Apps › Installed apps."
+    );
     if !signal("Local\\GlassAgentStop") {
         ask_host("stop");
     }

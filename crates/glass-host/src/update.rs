@@ -24,10 +24,16 @@ pub fn available() -> Option<String> {
     LATEST.lock().unwrap().clone().filter(|v| newer(v, CURRENT))
 }
 
-/// Why this copy can't update itself, if it can't: a policy turned updates off.
+/// Why this copy can't update itself, if it can't: a policy turned updates off, or Glass
+/// was installed for everyone on the computer (the MSI), which the installer here can't
+/// replace: an administrator updates it, with the new MSI or winget.
 pub fn blocked() -> Option<&'static str> {
     if !crate::policy::load().allows("updates") {
         return Some("Updates are managed by your organization.");
+    }
+    #[cfg(windows)]
+    if crate::platform::agent::machine_dir().is_some() {
+        return Some("Glass is installed for everyone on this computer: an administrator updates it with the new MSI, or winget upgrade Glassdesk.Glass.");
     }
     None
 }

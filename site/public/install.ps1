@@ -28,6 +28,13 @@ $arch = switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 $Archive = "glass-latest-windows-$arch.zip"
 
+# Installed for everyone (the MSI, by an administrator): a second, per-user copy would start
+# beside it at sign-in. That one is updated the way it was installed.
+$machine = (Get-ItemProperty 'HKLM:\SOFTWARE\Glass' -Name InstallDir -ErrorAction SilentlyContinue).InstallDir
+if ($machine -and (Test-Path (Join-Path $machine 'bin\glass.exe'))) {
+    Fail "Glass is installed for everyone on this computer, in $machine. Update it with the new MSI (glassdesk.dev/releases/glass-latest-windows-$arch.msi) or: winget upgrade Glassdesk.Glass"
+}
+
 # What's there already, so an update can say so (and skip the setup guide). The download
 # says it too, so glassdesk.dev counts updates apart from new installs.
 $previous = ''
