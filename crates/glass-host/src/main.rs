@@ -762,6 +762,13 @@ fn set_token(path: &std::path::Path) -> Result<()> {
 const FEEDBACK_URL: &str = "https://glassdesk.dev/api/feedback";
 
 fn main() -> Result<()> {
+    // Windows: the helper holding the local-input hooks (see platform::front).
+    #[cfg(windows)]
+    if let [_, flag, pid] = std::env::args().collect::<Vec<_>>().as_slice()
+        && flag == platform::front::HOOK_HELPER_ARG
+    {
+        return platform::front::run_hook_helper(pid);
+    }
     let args = Args::parse();
     // Quick support keeps everything in its own temporary config, chosen before anything
     // (or any thread) reads the environment.

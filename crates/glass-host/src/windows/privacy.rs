@@ -8,7 +8,6 @@
 //! or locked; Ctrl+Alt+Del always gets through.
 
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -62,7 +61,7 @@ fn engage() -> anyhow::Result<()> {
     anyhow::ensure!(supported(), "privacy mode needs Windows 10 version 2004 or later");
     // Blocking first: a dark screen the person can still type into isn't private.
     anyhow::ensure!(front::watch(), "couldn't block local input (keyboard and mouse hooks refused)");
-    front::BLOCK_LOCAL.store(true, Ordering::SeqCst);
+    front::set_block_local(true);
     let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
     let spawned = std::thread::Builder::new().name("glass-privacy".into()).spawn(move || overlay(tx));
     let started = match spawned {
@@ -76,14 +75,14 @@ fn engage() -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => {
-            front::BLOCK_LOCAL.store(false, Ordering::SeqCst);
+            front::set_block_local(false);
             anyhow::bail!("couldn't blank the screen: {e}")
         }
     }
 }
 
 fn release() {
-    front::BLOCK_LOCAL.store(false, Ordering::SeqCst);
+    front::set_block_local(false);
     // try_lock: a panic while engaging holds the lock.
     let Ok(mut thread) = THREAD.try_lock() else { return };
     if let Some(tid) = thread.take() {
@@ -240,7 +239,7 @@ fn install_panic_restore() {
     ONCE.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            if front::BLOCK_LOCAL.load(Ordering::SeqCst) {
+            if front::block_local() {
                 release();
             }
             previous(info);

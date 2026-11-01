@@ -4,10 +4,11 @@
 //!
 //! Apps are named by their executable (see `convert::app_id`). Glass's own SendInput
 //! counts as input to Windows, so local input is watched with low-level hooks that skip
-//! injected events; privacy mode uses the same hooks to drop local input.
+//! injected events, in a helper process; privacy mode uses the same hooks to drop local
+//! input.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
@@ -184,21 +185,60 @@ pub fn secure_input() -> bool {
 }
 
 // ---- Local input ----
+//
+// The hooks run in a helper process (`glass --glass-input-hook <host pid>`), never in the
+// host: in the VM, a process holding a low-level keyboard hook that also injects input lost
+// its own modifiers (Shift+H typed "h", paste typed "v"). The two share a few counters in
+// named shared memory.
 
-/// When someone last used this computer's own keyboard or mouse (ms since the epoch; 0
-/// until they do).
-static REAL_AT: AtomicU64 = AtomicU64::new(0);
-/// Privacy mode: drop local keyboard and mouse input (Glass's own still goes through).
-pub static BLOCK_LOCAL: AtomicBool = AtomicBool::new(false);
+/// What the host and the hook helper share.
+#[repr(C)]
+struct Shared {
+    /// When someone last used this computer's own keyboard or mouse (ms since the epoch;
+    /// 0 until they do).
+    real_at: AtomicU64,
+    /// Privacy mode: drop local keyboard and mouse input (Glass's own still goes through).
+    block: AtomicU64,
+    /// Set by the helper: 1 once its hooks are in, 2 if Windows refused them.
+    ready: AtomicU64,
+}
+
+/// The flag that starts the helper instead of Glass.
+pub const HOOK_HELPER_ARG: &str = "--glass-input-hook";
+
+fn shared_name(host_pid: u32) -> windows::core::HSTRING {
+    windows::core::HSTRING::from(format!("Local\\GlassLocalInput-{host_pid}"))
+}
+
+/// Maps the shared counters, creating them (the host) or opening the host's (the helper).
+fn map_shared(host_pid: u32, create: bool) -> Option<&'static Shared> {
+    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, OpenFileMappingW, PAGE_READWRITE};
+    let name = shared_name(host_pid);
+    // SAFETY: a fresh (zeroed) or existing mapping of at least size_of::<Shared>() bytes,
+    // mapped for the life of the process and only touched through atomics.
+    unsafe {
+        let mapping = if create {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, None, PAGE_READWRITE, 0, std::mem::size_of::<Shared>() as u32, &name).ok()?
+        } else {
+            OpenFileMappingW(FILE_MAP_ALL_ACCESS.0, false, &name).ok()?
+        };
+        let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, std::mem::size_of::<Shared>());
+        (!view.Value.is_null()).then(|| &*(view.Value as *const Shared))
+    }
+}
+
+static SHARED: OnceLock<&'static Shared> = OnceLock::new();
 
 fn epoch_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
-/// A local event: noted, and dropped while privacy mode is on.
+/// In the helper: a local event, noted, and dropped while privacy mode is on.
 fn local() -> bool {
-    REAL_AT.store(epoch_ms(), Ordering::Relaxed);
-    BLOCK_LOCAL.load(Ordering::Relaxed)
+    let Some(shared) = SHARED.get() else { return false };
+    shared.real_at.store(epoch_ms(), Ordering::Relaxed);
+    shared.block.load(Ordering::Relaxed) != 0
 }
 
 unsafe extern "system" fn on_mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -225,34 +265,86 @@ unsafe extern "system" fn on_key(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe { CallNextHookEx(None, code, w, l) }
 }
 
-/// Starts watching local input (once): low-level mouse and keyboard hooks on a thread of
-/// their own, which must keep pumping messages or Windows drops them. False if they
-/// couldn't be set.
+/// The helper's whole life: hooks, then a message loop (Windows drops hooks whose thread
+/// stops pumping) until the host is gone.
+pub fn run_hook_helper(host_pid: &str) -> anyhow::Result<()> {
+    use windows::Win32::System::Threading::{INFINITE, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    let host_pid: u32 = host_pid.parse()?;
+    let shared = map_shared(host_pid, false).ok_or_else(|| anyhow::anyhow!("no host {host_pid}"))?;
+    let _ = SHARED.set(shared);
+    // SAFETY: the handle lives as long as this thread, which ends the process.
+    let host = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, host_pid)? };
+    let host = host.0 as usize;
+    std::thread::spawn(move || {
+        // SAFETY: waiting on the host's process handle.
+        unsafe { WaitForSingleObject(windows::Win32::Foundation::HANDLE(host as *mut _), INFINITE) };
+        std::process::exit(0);
+    });
+    // SAFETY: hooks set on this thread, which then runs its message loop for good.
+    unsafe {
+        let module = GetModuleHandleW(None).ok().map(Into::into);
+        let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(on_mouse), module, 0);
+        let keys = SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), module, 0);
+        if mouse.is_err() || keys.is_err() {
+            shared.ready.store(2, Ordering::SeqCst);
+            anyhow::bail!("Windows refused the input hooks");
+        }
+        shared.ready.store(1, Ordering::SeqCst);
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    Ok(())
+}
+
+/// Starts watching local input (once) through the hook helper. False if it couldn't start
+/// or Windows refused its hooks.
 pub fn watch() -> bool {
     static STARTED: OnceLock<bool> = OnceLock::new();
     *STARTED.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new().name("glass-local-input".into()).spawn(move || {
-            // SAFETY: hooks set on this thread, which then runs its message loop for good.
-            unsafe {
-                let module = GetModuleHandleW(None).ok().map(Into::into);
-                let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(on_mouse), module, 0);
-                let keys = SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), module, 0);
-                if let Err(e) = mouse.as_ref().and(keys.as_ref()) {
-                    tracing::warn!("local input: couldn't set hooks: {e}");
-                    let _ = tx.send(false);
-                    return;
-                }
-                let _ = tx.send(true);
-                let mut msg = MSG::default();
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
+        let pid = std::process::id();
+        let Some(shared) = map_shared(pid, true) else {
+            tracing::warn!("local input: no shared memory for the hook helper");
+            return false;
+        };
+        let _ = SHARED.set(shared);
+        let mut cmd = match std::env::current_exe() {
+            Ok(exe) => std::process::Command::new(exe),
+            Err(_) => return false,
+        };
+        cmd.args([HOOK_HELPER_ARG, &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        super::no_window(&mut cmd);
+        if let Err(e) = cmd.spawn() {
+            tracing::warn!("local input: couldn't start the hook helper: {e}");
+            return false;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match shared.ready.load(Ordering::SeqCst) {
+                1 => return true,
+                2 => break,
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
             }
-        });
-        spawned.is_ok() && rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap_or(false)
+        }
+        tracing::warn!("local input: the hook helper didn't set its hooks");
+        false
     })
+}
+
+/// Privacy mode: drop (or stop dropping) local keyboard and mouse input.
+pub fn set_block_local(on: bool) {
+    if let Some(shared) = SHARED.get() {
+        shared.block.store(on as u64, Ordering::SeqCst);
+    }
+}
+
+pub fn block_local() -> bool {
+    SHARED.get().is_some_and(|s| s.block.load(Ordering::SeqCst) != 0)
 }
 
 /// Seconds since someone used this computer's own keyboard or mouse (not input Glass
@@ -261,6 +353,6 @@ pub fn local_input_age() -> Option<f64> {
     if !watch() {
         return None;
     }
-    let at = REAL_AT.load(Ordering::Relaxed);
+    let at = SHARED.get()?.real_at.load(Ordering::Relaxed);
     (at != 0).then(|| epoch_ms().saturating_sub(at) as f64 / 1000.0)
 }
