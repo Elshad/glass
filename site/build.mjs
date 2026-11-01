@@ -474,6 +474,9 @@ cpSync('../web', 'public/app', { recursive: true });
 mkdirSync('public/releases', { recursive: true });
 const dist = '../dist';
 const PLATFORMS = ['darwin-universal', 'linux-x86_64', 'linux-aarch64'];
+// Windows ships zips; optional until releases include them.
+const WINDOWS = ['windows-x86_64', 'windows-arm64'];
+const archive = (p) => (p.startsWith('windows-') ? 'zip' : 'tar.gz');
 const missing = () => PLATFORMS.some((p) => !existsSync(`${dist}/glass-${version}-${p}.tar.gz`));
 if (missing()) {
   try {
@@ -495,9 +498,9 @@ if (existsSync(dist)) {
   }
 }
 // The installer verifies each platform's "latest" tarball against this checksum.
-for (const p of PLATFORMS) {
-  const release = `${dist}/glass-${version}-${p}.tar.gz`;
-  const f = `glass-latest-${p}.tar.gz`;
+for (const p of [...PLATFORMS, ...WINDOWS]) {
+  const release = `${dist}/glass-${version}-${p}.${archive(p)}`;
+  const f = `glass-latest-${p}.${archive(p)}`;
   if (!existsSync(release)) continue;
   if (small(release)) copyFileSync(release, `public/releases/${f}`);
   else rmSync(`public/releases/${f}`, { force: true });

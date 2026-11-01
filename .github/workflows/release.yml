@@ -85,8 +85,30 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: 'dist-linux-${{ matrix.arch }}', path: dist/ }
 
+  windows:
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, target: x86_64-pc-windows-msvc, runner: windows-latest }
+          - { arch: arm64, target: aarch64-pc-windows-msvc, runner: windows-11-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # NASM gives OpenH264 its x64 assembly (much faster encoding).
+      - if: matrix.arch == 'x86_64'
+        run: |
+          choco install nasm --no-progress -y
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: '${{ matrix.target }}' }
+      - uses: Swatinem/rust-cache@v2
+        with: { shared-key: 'release-${{ matrix.target }}', save-if: "${{ github.ref == 'refs/heads/main' }}" }
+      - run: pwsh scripts/package.ps1 ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with: { name: 'dist-windows-${{ matrix.arch }}', path: dist/ }
+
   publish:
-    needs: [macos, linux]
+    needs: [macos, linux, windows]
     # A hand-run build stops before here: nothing is published.
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest

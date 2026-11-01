@@ -11,7 +11,7 @@
     // The Worker decides who gets the install script and counts downloads.
     // /app/ keeps its slash: the web client's relative URLs (main.js, worker.js) need it.
     // Videos too: static assets ignore Range, and Safari (and link-card players) need it.
-    "run_worker_first": ["/", "/app", "/app/", "/install.sh", "/help", "/help.sh", "/releases/*", "/api/*", "/signal/*", "/og.mp4", "/mark.mp4"]
+    "run_worker_first": ["/", "/app", "/app/", "/install.sh", "/install.ps1", "/help", "/help.sh", "/releases/*", "/api/*", "/signal/*", "/og.mp4", "/mark.mp4"]
   },
   "d1_databases": [
     {
