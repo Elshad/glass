@@ -99,6 +99,9 @@ function finish(html, modified) {
 
 // Hosts check this to offer updates.
 const version = readFileSync('../Cargo.toml', 'utf8').match(/^version = "(.+)"/m)[1];
+// A pre-release (0.11.0-windows.1) is never offered to installed computers: the site only
+// ever carries a real release.
+if (version.includes('-')) throw new Error(`Cargo.toml is at pre-release ${version}: the site only serves releases (build it from main)`);
 writeFileSync('public/version.json', JSON.stringify({ version }) + '\n');
 
 // The agent skill, so `curl … /skill.md` installs it.

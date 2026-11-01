@@ -33,6 +33,11 @@ current release):
 
 The release notes get the code signing policy and say the Windows builds are unsigned.
 
+Installed computers never see it. Glass doesn't update by itself (someone clicks Update), and
+updates come from glassdesk.dev/version.json and glassdesk.dev/releases, not GitHub. The
+release doesn't deploy the site, and site/build.mjs refuses to build at a pre-release
+version, so a hand-run `npm run deploy` can't publish it either.
+
 ## 2. Ask SignPath first
 
 Send to info@signpath.io:
