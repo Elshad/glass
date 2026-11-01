@@ -563,6 +563,24 @@ async fn control(
     {
         auth = Some(Auth::Tailnet);
     }
+    // A policy can turn guest links (or, in its own host, quick support) off: new links and
+    // devices already let in by one are refused.
+    let policy = crate::policy::load();
+    if auth.is_none()
+        && !policy.allows(if crate::support::is_host() { "support" } else { "links" })
+        && (link.is_some()
+            || pass
+                .as_deref()
+                .and_then(|p| crate::access::check_pass(&access_file, p))
+                .is_some_and(|v| v.from_link))
+    {
+        refused(&device, "guest links are off by policy");
+        let msg = "Guest links are turned off on this computer by its organization.".into();
+        control::write_json(&mut send, &ServerMsg::Denied { msg }).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ctx.conn.close(1u32.into(), b"links off");
+        return Ok(());
+    }
     if auth.is_none()
         && let Some(p) = &pass
         && let Some(valid) = crate::access::check_pass(&access_file, p)
@@ -660,10 +678,14 @@ async fn control(
             return Ok(());
         }
     }
-    let perms = match &auth {
+    let mut perms = match &auth {
         Auth::Guest { scope, .. } => control::Perms::guest(scope),
         _ => control::Perms::owner(),
     };
+    // Files and the clipboard can be off for everyone, by policy.
+    perms.files &= policy.allows("files");
+    perms.clipboard &= policy.allows("clipboard");
+    let terminal = crate::terminal::SUPPORTED && policy.allows("terminal");
     let guest = !perms.owner;
     if matches!(auth, Auth::Tailnet)
         && let Some(name) = tailscale::device_name(peer).await
@@ -838,7 +860,7 @@ async fn control(
         mic: crate::mic::supported(),
         mic_install: perms.owner && !crate::mic::supported(),
         windows: shared.video.supports_windows(),
-        terminal: crate::terminal::SUPPORTED,
+        terminal,
         restart: true,
         record: crate::recording::supported(),
         hevc: shared.video.supports_hevc(),
@@ -1292,6 +1314,7 @@ async fn control(
                 info!("{peer}: microphone {}", if on { "on" } else { "off" });
             }
             ClientMsg::Term(_) if guest => refuse(OWNER_ONLY),
+            ClientMsg::Term(_) if !terminal => refuse("The terminal is turned off on this computer by its organization."),
             ClientMsg::Term(msg) => {
                 if let Err(e) = term.handle(msg, ctx.ctl_tx.clone()) {
                     refuse(&format!("{e:#}"));

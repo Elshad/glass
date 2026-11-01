@@ -253,6 +253,7 @@ fn show_menu(hwnd: HWND) {
     let list = viewers::subscribe().borrow().clone();
     let link = crate::status::current().and_then(|s| s.url);
     let update = crate::update::available();
+    let policy = crate::policy::load();
     // SAFETY: a popup menu built, shown and destroyed here, on the window's thread.
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
@@ -287,7 +288,7 @@ fn show_menu(hwnd: HWND) {
             }
             add(MESSAGE, "Send a message…", false, true);
             if crate::privacy::supported() {
-                add(PRIVACY, "Privacy screen (blank this computer)", crate::privacy::active(), true);
+                add(PRIVACY, "Privacy screen (blank this computer)", crate::privacy::active(), !policy.locked("privacy"));
             }
         }
         separator();
@@ -295,8 +296,9 @@ fn show_menu(hwnd: HWND) {
         add(COPY_LINK, "Copy link", false, link.is_some());
         separator();
         add(DISCONNECT_ALL, "Disconnect everyone", false, !list.is_empty());
-        add(REMOTE, "Remote access from anywhere", crate::remote::enabled(), true);
-        add(ASK_GUESTS, "Ask before guests connect", crate::settings::load().ask_guests, true);
+        // What a policy manages shows, greyed out.
+        add(REMOTE, "Remote access from anywhere", crate::remote::enabled(), !policy.locked("remote"));
+        add(ASK_GUESTS, "Ask before guests connect", crate::settings::load().ask_guests, !policy.locked("ask-guests"));
         add(REVOKE_LINKS, "Revoke all guest links", false, true);
         add(HISTORY, "Connection history", false, true);
         separator();

@@ -140,20 +140,45 @@ pub fn path() -> PathBuf {
     crate::config_dir().join("settings.json")
 }
 
+/// The settings in force: the owner's, with any policies (`policy`) over them.
 pub fn load() -> Settings {
+    with_policy(load_file(), &crate::policy::load())
+}
+
+fn with_policy(mut s: Settings, policy: &crate::policy::Policy) -> Settings {
+    for (key, value) in policy.settings() {
+        let _ = s.assign(key, value);
+    }
+    s
+}
+
+/// What to store: `s`, but with the owner's own values (`file`) for what `policy` sets.
+fn without_policy(mut s: Settings, file: &Settings, policy: &crate::policy::Policy) -> Result<Settings> {
+    for (key, _) in policy.settings() {
+        s.assign(key, &file.get(key)?)?;
+    }
+    Ok(s)
+}
+
+/// The owner's settings, as stored.
+fn load_file() -> Settings {
     std::fs::read(path())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
+/// Stores `s`, keeping the owner's own value of anything a policy sets, for when the
+/// policy goes.
 pub fn save(s: &Settings) -> Result<()> {
+    let policy = crate::policy::load();
+    let s = if policy.is_empty() { s.clone() } else { without_policy(s.clone(), &load_file(), &policy)? };
     let p = path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(s)?)?;
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&s)?)?;
     std::fs::rename(&tmp, &p)?;
     Ok(())
 }
@@ -295,8 +320,14 @@ impl Settings {
         })
     }
 
-    /// Sets `key` from its text form; an empty value resets optional ones.
+    /// Sets `key` from its text form; an empty value resets optional ones. A setting a
+    /// policy manages can't be changed.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        crate::policy::load().check(key, value)?;
+        self.assign(key, value)
+    }
+
+    fn assign(&mut self, key: &str, value: &str) -> Result<()> {
         let value = value.trim();
         match key {
             "ask-guests" => self.ask_guests = on_off(value)?,
@@ -517,6 +548,26 @@ mod tests {
         // Unknown and missing fields are fine.
         let old: Settings = serde_json::from_str(r#"{"ask_guests":true,"future":1}"#).unwrap();
         assert!(old.ask_guests && !old.record);
+    }
+
+    #[test]
+    fn policies_show_over_the_owners_settings_but_are_not_stored() {
+        use crate::policy::{Policy, Raw};
+        let machine = |n: &str| match n {
+            "AskGuests" => Some(Raw::Number(1)),
+            "Relay" => Some(Raw::Text("https://glass.example.com".into())),
+            _ => None,
+        };
+        let policy = Policy::merge(&[&machine]);
+        let file = Settings { name: Some("Studio".into()), ..Default::default() };
+        let mut shown = with_policy(file.clone(), &policy);
+        assert!(shown.ask_guests);
+        assert_eq!(shown.relay.as_deref(), Some("https://glass.example.com"));
+        // The owner changes something else; the policy's values aren't written.
+        shown.assign("privacy", "on").unwrap();
+        let stored = without_policy(shown, &file, &policy).unwrap();
+        assert!(stored.privacy && !stored.ask_guests && stored.relay.is_none());
+        assert_eq!(stored.name.as_deref(), Some("Studio"));
     }
 
     #[test]

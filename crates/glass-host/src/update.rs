@@ -16,9 +16,20 @@ pub fn base_url() -> String {
     std::env::var("GLASS_BASE").unwrap_or_else(|_| "https://glassdesk.dev".into())
 }
 
-/// The newest release we know of, if it's newer than this one.
+/// The newest release we know of, if it's newer than this one and this copy can install it.
 pub fn available() -> Option<String> {
+    if blocked().is_some() {
+        return None;
+    }
     LATEST.lock().unwrap().clone().filter(|v| newer(v, CURRENT))
+}
+
+/// Why this copy can't update itself, if it can't: a policy turned updates off.
+pub fn blocked() -> Option<&'static str> {
+    if !crate::policy::load().allows("updates") {
+        return Some("Updates are managed by your organization.");
+    }
+    None
 }
 
 /// Starts the periodic version check. `GLASS_TEST_LATEST` pins the result (tests).
@@ -27,7 +38,7 @@ pub fn watch() {
         *LATEST.lock().unwrap() = Some(v);
         return;
     }
-    if crate::testmode::enabled() {
+    if crate::testmode::enabled() || blocked().is_some() {
         return;
     }
     tokio::spawn(async {
@@ -81,6 +92,9 @@ fn installer() -> std::process::Command {
 /// Re-runs the installer in a new process group, detached, so it outlives this process
 /// when it restarts the service.
 pub fn start_self_update() -> anyhow::Result<()> {
+    if let Some(why) = blocked() {
+        anyhow::bail!(why);
+    }
     let log = crate::platform::log_dir().join("update.log");
     let _ = std::fs::create_dir_all(log.parent().unwrap());
     let mut cmd = installer();
@@ -104,6 +118,9 @@ pub fn start_self_update() -> anyhow::Result<()> {
 
 /// The installer, waited for, with its output in update.log (the app's Update button).
 pub fn run_logged() -> anyhow::Result<()> {
+    if let Some(why) = blocked() {
+        anyhow::bail!(why);
+    }
     let log = crate::platform::log_dir().join("update.log");
     let _ = std::fs::create_dir_all(log.parent().unwrap());
     let mut cmd = installer();
@@ -119,6 +136,9 @@ pub fn run_logged() -> anyhow::Result<()> {
 
 /// `glass update`: the installer, in the foreground.
 pub fn run_cli() -> anyhow::Result<()> {
+    if let Some(why) = blocked() {
+        anyhow::bail!(why);
+    }
     let status = installer().status()?;
     anyhow::ensure!(status.success(), "the installer failed");
     Ok(())

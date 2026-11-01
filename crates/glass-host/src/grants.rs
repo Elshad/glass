@@ -226,12 +226,17 @@ fn audit_path() -> PathBuf {
     crate::config_dir().join("agent-audit.jsonl")
 }
 
+/// The store, with `enabled` as a policy says if one does (update() keeps the owner's).
 pub fn load() -> Store {
-    read().unwrap_or_else(|e| {
+    let mut store = read().unwrap_or_else(|e| {
         tracing::warn!("agents: can't read {}: {e:#}", path().display());
         // Unreadable: nothing is allowed (an empty store), and update() won't overwrite it.
         Store { enabled: false, ..Default::default() }
-    })
+    });
+    if let Some(on) = crate::policy::load().flag("agents") {
+        store.enabled = on;
+    }
+    store
 }
 
 fn read() -> Result<Store> {
@@ -427,6 +432,7 @@ pub fn app_token(client: &Client, domain: &str) -> Result<(Grant, Issued)> {
 /// Agents from other devices on or off. Off also stops publishing them with Funnel, since
 /// nothing there would answer; grants are kept for when they're back on.
 pub fn set_enabled(on: bool) -> Result<()> {
+    crate::policy::load().check("agents", if on { "on" } else { "off" })?;
     let published = update(|s| {
         s.enabled = on;
         s.public

@@ -89,7 +89,7 @@ impl GlassApp {
                         .icon(I::Link)
                         .label("Make link")
                         .loading(f.busy)
-                        .disabled(!snap.running())
+                        .disabled(!snap.running() || !snap.policy.allows("links"))
                         .on_click(cx.listener(|this, _, window, cx| this.make_link(window, cx))),
                 )
                 .into_any_element(),

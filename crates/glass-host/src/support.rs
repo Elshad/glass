@@ -113,6 +113,10 @@ impl Session {
     /// Starts the session's host in `dir` (the current GLASS_CONFIG_DIR), waits for it, and
     /// gets a code for it.
     pub fn start(dir: PathBuf, test: bool) -> Result<Self> {
+        let policy = crate::policy::load();
+        policy.require("support")?;
+        // The helper always comes in over remote access.
+        policy.require("remote")?;
         let settings = crate::settings::Settings {
             ask_everyone: true,
             name: Some(computer_name()),

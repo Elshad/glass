@@ -204,6 +204,8 @@ pub struct Valid {
     pub expires: u64,
     pub scope: Scope,
     pub passkey: Option<Passkey>,
+    /// Let in by a link (not minted for a directory account by single sign-on or LDAP).
+    pub from_link: bool,
 }
 
 /// The access file that sits next to the token file.
@@ -218,7 +220,9 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// A guest link (`glass link`), unless a policy turned them off.
 pub fn create_link(path: &Path, grant: Duration, scope: Scope) -> Result<NewLink> {
+    crate::policy::load().require("links")?;
     create_link_for(path, LINK_TTL, grant, scope)
 }
 
@@ -373,6 +377,7 @@ pub fn check_pass(path: &Path, pass: &str) -> Option<Valid> {
             expires: p.expires,
             scope: p.scope,
             passkey: p.passkey.clone(),
+            from_link: p.account.is_none(),
         })
 }
 

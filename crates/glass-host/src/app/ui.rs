@@ -119,6 +119,12 @@ pub fn group(rows: Vec<AnyElement>, cx: &App) -> Div {
         .children(rows.into_iter().enumerate().map(|(i, row)| div().when(i > 0, |d| d.border_t_1().border_color(theme.border)).child(row)))
 }
 
+/// A setting's detail, saying so when a policy manages it (its control is then disabled).
+pub fn managed(detail: impl Into<String>, locked: bool) -> String {
+    let detail = detail.into();
+    if locked { format!("{detail} Managed by your organization.") } else { detail }
+}
+
 /// A row: what it is, a line of detail, and its control on the right.
 pub fn row(title: impl Into<SharedString>, detail: impl Into<SharedString>, control: impl IntoElement, cx: &App) -> AnyElement {
     let detail: SharedString = detail.into();

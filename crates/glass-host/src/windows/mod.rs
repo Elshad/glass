@@ -11,6 +11,7 @@ pub mod front;
 pub mod input;
 pub mod keymap;
 pub mod permissions;
+pub mod policy;
 pub mod privacy;
 pub mod script;
 pub mod session;

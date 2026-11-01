@@ -280,7 +280,7 @@ impl Store {
 
     /// Asks glassdesk.dev for the newest release (in the background).
     pub fn check_updates(&mut self, cx: &mut Context<Self>) {
-        if self.checking {
+        if self.checking || crate::update::blocked().is_some() {
             return;
         }
         self.checking = true;
@@ -536,6 +536,19 @@ impl GlassApp {
         let store = self.store.read(cx);
         let (checking, updating, checked) = (store.checking, store.updating, store.latest.is_some());
         let theme = cx.theme();
+        // Managed by a policy: say so instead of offering one.
+        if let Some(why) = crate::update::blocked() {
+            return v_flex()
+                .mx_1()
+                .mb_1()
+                .gap_1p5()
+                .px_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(format!("Glass {}", crate::update::CURRENT))
+                .child(why)
+                .into_any_element();
+        }
         let button = match &update {
             Some(v) => Button::new("update")
                 .primary()
@@ -572,6 +585,7 @@ impl GlassApp {
                         None => format!("Glass {}", crate::update::CURRENT),
                     }),
             )
+            .into_any_element()
     }
 
     /// Installs the newest release, restarts the service on it, and reopens this window

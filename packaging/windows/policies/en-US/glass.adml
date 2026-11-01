@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitionResources xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" revision="1.0" schemaVersion="1.0" xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <displayName>Glass</displayName>
+  <description>Settings for Glass, the remote desktop, that users can't change.</description>
+  <resources>
+    <stringTable>
+      <string id="Glass">Glass</string>
+      <string id="SUPPORTED_Glass">Glass on Windows 10 version 2004 or later</string>
+      <string id="AskGuests">Ask before guests connect</string>
+      <string id="AskGuests_Explain">Enabled: the person at the computer must allow each guest (someone with a link) before they connect. Disabled: guests connect without being asked, unless their link asks. Not configured: each user decides (glass config ask-guests). Computer Configuration wins over User Configuration.</string>
+      <string id="AskEveryone">Ask before anyone connects</string>
+      <string id="AskEveryone_Explain">Enabled: the person at the computer must allow every connection, the user's own devices included. Disabled: nobody is asked for (guests still may be). Not configured: each user decides (glass config ask-everyone). Computer Configuration wins over User Configuration.</string>
+      <string id="PrivacyScreen">Privacy screen while viewed</string>
+      <string id="PrivacyScreen_Explain">Enabled: while anyone is connected, this computer's screen is blanked and its keyboard and mouse are blocked, and nobody can turn that off. Disabled: never, and nobody can turn it on. Not configured: each user decides (glass config privacy). Computer Configuration wins over User Configuration.</string>
+      <string id="ReachFromAnywhere">Reach from anywhere</string>
+      <string id="ReachFromAnywhere_Explain">Enabled: remote access from any network (WebRTC through the relay) is on and stays on. Disabled: it's off, so Glass is reachable only on the user's tailnet. Not configured: each user decides (glass remote on|off). Computer Configuration wins over User Configuration.</string>
+      <string id="Agents">Agents from other devices</string>
+      <string id="Agents_Explain">Enabled: AI agents on other devices may ask to use this computer (each still needs the user's approval). Disabled: they are all refused. Not configured: each user decides (glass agents on|off). Computer Configuration wins over User Configuration.</string>
+      <string id="Relay">Relay for remote access</string>
+      <string id="Relay_Explain">Enabled: remote access goes through this self-hosted server (an https:// address) instead of glassdesk.dev, and users can't change it. Disabled or not configured: each user decides (glass config relay). Computer Configuration wins over User Configuration.</string>
+      <string id="GuestLinks">Allow guest links</string>
+      <string id="GuestLinks_Explain">Disabled: no guest links can be made (glass link), and devices let in by one can't connect. Enabled or not configured: guest links work. Computer Configuration wins over User Configuration.</string>
+      <string id="QuickSupport">Allow quick support</string>
+      <string id="QuickSupport_Explain">Disabled: quick support (glass support, or irm glassdesk.dev/help | iex) won't start on this computer. Enabled or not configured: it works. Computer Configuration wins over User Configuration.</string>
+      <string id="FileTransfer">Allow file transfer</string>
+      <string id="FileTransfer_Explain">Disabled: nobody, the user's own devices included, can send files to or get files from this computer through Glass. Enabled or not configured: guest links decide for guests. Computer Configuration wins over User Configuration.</string>
+      <string id="Clipboard">Allow clipboard sharing</string>
+      <string id="Clipboard_Explain">Disabled: copy and paste between this computer and viewers is off for everyone. Enabled or not configured: guest links decide for guests. Computer Configuration wins over User Configuration.</string>
+      <string id="Terminal">Allow the terminal</string>
+      <string id="Terminal_Explain">Disabled: the user's own devices can't open a terminal on this computer from the viewer (guests never can). Enabled or not configured: they can. Computer Configuration wins over User Configuration.</string>
+      <string id="Updates">Allow updates</string>
+      <string id="Updates_Explain">Disabled: Glass doesn't check for updates or update itself; deploy new versions with the MSI (or winget). Enabled or not configured: it checks, and users can update. Glass installed for all users with the MSI is always updated by an administrator. Computer Configuration wins over User Configuration.</string>
+    </stringTable>
+    <presentationTable>
+      <presentation id="Relay">
+        <textBox refId="Relay">
+          <label>Server address, like https://glass.example.com</label>
+        </textBox>
+      </presentation>
+    </presentationTable>
+  </resources>
+</policyDefinitionResources>

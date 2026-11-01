@@ -78,8 +78,9 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 |---|---|---|---|---|
 | One-line install | ✅ install.sh | ✅ install.sh | ✅ install.ps1 | `irm glassdesk.dev \| iex` |
 | Release builds | ✅ universal | ✅ x86_64 | 🧪 x64 + Arm64 zips | |
+| Admin policies (locked settings) | ❌ | ❌ | 🧪 Group Policy / Intune (ADMX) | HKLM/HKCU\SOFTWARE\Policies\Glass; packaging/windows/policies |
 | Background service | ✅ LaunchAgent | ✅ systemd user | ✅ glassw at sign-in | |
-| Self-update | ✅ | ✅ | ✅ | |
+| Self-update | ✅ | ✅ | ✅ | Windows: a policy can turn updates off |
 | Guided setup | ✅ | ✅ | ✅ (unattended) | Windows adds a firewall rule (one UAC prompt) |
 | Desktop app | ✅ Glass.app | ❌ | ✅ Start menu | Same window |
 | Status icon (who's viewing, quick controls) | ✅ menu bar | ❌ | ✅ notification area | |

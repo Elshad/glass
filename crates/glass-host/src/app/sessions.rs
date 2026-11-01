@@ -122,8 +122,8 @@ impl GlassApp {
                 .into_any_element(),
             ui::row(
                 "Privacy screen",
-                "Blank this screen and block its keyboard and mouse until everyone leaves.",
-                Switch::new("privacy-now").checked(snap.privacy).disabled(!live).on_click(|on: &bool, window, cx| {
+                ui::managed("Blank this screen and block its keyboard and mouse until everyone leaves.", snap.policy.locked("privacy")),
+                Switch::new("privacy-now").checked(snap.privacy).disabled(!live || snap.policy.locked("privacy")).on_click(|on: &bool, window, cx| {
                     let on = *on;
                     act(window, cx, move || actions::privacy(on))
                 }),

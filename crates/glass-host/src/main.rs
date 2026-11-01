@@ -34,6 +34,7 @@ mod now_playing;
 mod pcm;
 mod oidc;
 mod passkey;
+mod policy;
 mod posture;
 mod power;
 mod privacy;
@@ -541,8 +542,18 @@ fn config_cli(key: Option<&str>, value: Option<&str>) -> Result<()> {
     let mut s = settings::load();
     match (key, value) {
         (None, _) => {
+            let policy = policy::load();
             for (k, help) in settings::KEYS {
-                println!("{k:<16} {:<12} {help}", s.get(k)?);
+                let managed = if policy.locked(k) { format!(" ({})", policy::MANAGED) } else { String::new() };
+                println!("{k:<16} {:<12} {help}{managed}", s.get(k)?);
+            }
+            // Policies on things that aren't settings here (remote access, files…).
+            let others: Vec<_> = policy.iter().filter(|(d, _)| !settings::KEYS.iter().any(|(k, _)| *k == d.key)).collect();
+            if !others.is_empty() {
+                println!("\nAlso {}:", policy::MANAGED);
+                for (d, v) in others {
+                    println!("{:<16} {v:<12} {}", d.key, d.what);
+                }
             }
         }
         (Some(k), None) => println!("{}", s.get(k)?),

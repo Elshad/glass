@@ -3,7 +3,8 @@
 //! is unaffected: viewers still see the desktop.
 //!
 //! On when `glass config privacy on` (whenever anyone is viewing), when an owner turns it
-//! on from the viewer, or with `glass privacy on`. Always off once nobody is connected.
+//! on from the viewer, or with `glass privacy on`; or always, or never, by policy. Always
+//! off once nobody is connected.
 
 use std::sync::Mutex;
 
@@ -32,6 +33,7 @@ pub fn supported() -> bool {
 /// Turns it on or off for as long as anyone stays connected.
 pub fn set_forced(on: bool) -> anyhow::Result<()> {
     anyhow::ensure!(supported(), "privacy mode isn't available on this computer yet");
+    crate::policy::load().check("privacy", if on { "on" } else { "off" })?;
     STATE.lock().unwrap().forced = Some(on);
     apply()
 }
@@ -55,7 +57,9 @@ pub fn active() -> bool {
 
 fn apply() -> anyhow::Result<()> {
     let mut s = STATE.lock().unwrap();
-    let want = s.viewers > 0 && s.forced.unwrap_or_else(|| crate::settings::load().privacy);
+    // A policy decides over anyone's choice for now.
+    let locked = crate::policy::load().flag("privacy");
+    let want = s.viewers > 0 && locked.or(s.forced).unwrap_or_else(|| crate::settings::load().privacy);
     if want == s.engaged {
         return Ok(());
     }

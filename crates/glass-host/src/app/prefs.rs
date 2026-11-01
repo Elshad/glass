@@ -97,16 +97,18 @@ impl GlassApp {
 
     /// A text setting's row.
     pub(super) fn field(&self, key: &'static str, title: &str, detail: &str, cx: &App) -> AnyElement {
-        let input = Input::new(&self.fields[key]).small().w(px(250.)).when(secret(key), |i| i.mask_toggle());
-        ui::row(title.to_string(), detail.to_string(), input, cx)
+        let locked = self.store.read(cx).snap.policy.locked(key);
+        let input = Input::new(&self.fields[key]).small().w(px(250.)).disabled(locked).when(secret(key), |i| i.mask_toggle());
+        ui::row(title.to_string(), ui::managed(detail, locked), input, cx)
     }
 
     /// An on/off setting's row.
     pub(super) fn toggle(&self, key: &'static str, title: &str, detail: &str, on: bool, cx: &App) -> AnyElement {
+        let locked = self.store.read(cx).snap.policy.locked(key);
         ui::row(
             title.to_string(),
-            detail.to_string(),
-            Switch::new(key).checked(on).on_click(move |on: &bool, window, cx| {
+            ui::managed(detail, locked),
+            Switch::new(key).checked(on).disabled(locked).on_click(move |on: &bool, window, cx| {
                 let v = if *on { "on" } else { "off" };
                 act(window, cx, move || actions::set_setting(key, v))
             }),
@@ -127,8 +129,8 @@ impl GlassApp {
             self.toggle("privacy", "Privacy screen while viewed", "Blank this screen and block its keyboard and mouse.", s.privacy, cx),
             ui::row(
                 "Reach from anywhere",
-                "Links can work outside your tailnet, over WebRTC through glassdesk.dev.",
-                Switch::new("remote-s").checked(snap.remote).on_click(|on: &bool, window, cx| {
+                ui::managed("Links can work outside your tailnet, over WebRTC through glassdesk.dev.", snap.policy.locked("remote")),
+                Switch::new("remote-s").checked(snap.remote).disabled(snap.policy.locked("remote")).on_click(|on: &bool, window, cx| {
                     let on = *on;
                     act(window, cx, move || actions::set_remote(on))
                 }),
@@ -174,8 +176,8 @@ impl GlassApp {
         let agents = vec![
             ui::row(
                 "Agents from other devices",
-                "AI agents elsewhere (Vercel, claude.ai, a server) may ask to use this computer; you approve each once. Off refuses them all and keeps their grants.",
-                Switch::new("settings-agents-on").checked(agent.enabled).on_click(|on: &bool, window, cx| {
+                ui::managed("AI agents elsewhere (Vercel, claude.ai, a server) may ask to use this computer; you approve each once. Off refuses them all and keeps their grants.", snap.policy.locked("agents")),
+                Switch::new("settings-agents-on").checked(agent.enabled).disabled(snap.policy.locked("agents")).on_click(|on: &bool, window, cx| {
                     let on = *on;
                     act(window, cx, move || actions::agents_enabled(on))
                 }),
@@ -328,9 +330,10 @@ impl GlassApp {
         let about = vec![
             ui::row(
                 format!("Glass {}", crate::update::CURRENT),
-                match &update {
-                    Some(v) => format!("Version {v} is available."),
-                    None => "You're up to date.".into(),
+                match (&update, crate::update::blocked()) {
+                    (_, Some(why)) => why.into(),
+                    (Some(v), None) => format!("Version {v} is available."),
+                    (None, None) => "You're up to date.".into(),
                 },
                 h_flex()
                     .gap_2()
