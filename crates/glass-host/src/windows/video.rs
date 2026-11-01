@@ -1,6 +1,9 @@
 //! Captures each display with DXGI Desktop Duplication (one thread per display), draws the
-//! pointer in (duplication leaves it out), and encodes each with OpenH264 on its own
-//! thread. Coordinates are physical pixels: the process is per-monitor DPI aware.
+//! pointer in (duplication leaves it out), and encodes each on its own thread: on the GPU
+//! through Media Foundation where there's a hardware encoder, else with OpenH264.
+//! Coordinates are physical pixels: the process is per-monitor DPI aware.
+
+mod mf;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -37,6 +40,9 @@ use crate::soft_encode::{Encoder, Frame, PixelFormat};
 const IDLE_POLL: Duration = Duration::from_millis(100);
 /// How long a capture thread waits for the desktop to change before looking again.
 const ACQUIRE_MS: u32 = 100;
+/// OpenH264 keeps up with 60 frames a second at most; the hardware encoder takes what
+/// viewers ask for (crate::refresh).
+const SOFTWARE_MAX_FPS: u32 = 60;
 
 pub struct VideoConfig {
     pub fps: i32,
@@ -78,6 +84,9 @@ const PICTURE_MAX: [u32; 2] = [1600, 1600];
 
 /// Lossless refreshes wanted (sharp text): keep a BGRA copy of each new picture.
 static FULL_COLOUR: AtomicBool = AtomicBool::new(false);
+
+/// The frame rate viewers want (crate::refresh): 60, or up to 120 for fast screens.
+static VIEWER_FPS: AtomicU32 = AtomicU32::new(crate::refresh::DEFAULT);
 
 /// Monitor rects for input mapping, by display id.
 static RECTS: Mutex<Vec<Rect>> = Mutex::new(Vec::new());
@@ -554,6 +563,8 @@ impl Video {
     }
 }
 
+/// Encodes a monitor's newest picture whenever it's shown and a frame is due: at most the
+/// encoder's frame rate, and again on a keyframe request (static screens send nothing).
 fn encode_loop(
     monitor: Arc<Monitor>,
     rx: Arc<Mailbox>,
@@ -561,11 +572,15 @@ fn encode_loop(
     fps: u32,
     scale: f64,
 ) {
-    let mut encoder: Option<Encoder> = None;
+    let mut encoder: Option<VideoEncoder> = None;
     let mut applied_bitrate = 0;
     let mut last: Option<(Frame, u64)> = None;
+    // The latest picture hasn't been encoded yet (it came sooner than the frame rate allows).
+    let mut unsent = false;
+    let mut next_due = Instant::now();
     loop {
-        let fresh = match rx.recv_timeout(IDLE_POLL) {
+        let wait = if unsent { next_due.saturating_duration_since(Instant::now()) } else { IDLE_POLL };
+        let fresh = match rx.recv_timeout(wait) {
             Ok(f) => Some(f),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
@@ -576,6 +591,7 @@ fn encode_loop(
         {
             rx.recycle(old.data);
         }
+        unsent |= has_fresh;
         // Previews cover every monitor, shown or not. The first one comes from the last
         // frame: a still screen sends no new ones, and screenshots would never work.
         if (has_fresh || monitor.thumb.lock().unwrap().is_none())
@@ -590,37 +606,9 @@ fn encode_loop(
         if slot < 0 {
             continue;
         }
-        let wants_key = monitor.keyframe.load(Ordering::Relaxed);
-        // Nothing new: only re-encode the last frame to answer a keyframe request.
-        if !has_fresh && !wants_key {
-            continue;
-        }
         let Some((frame, captured_us)) = last.as_ref() else {
             continue;
         };
-        monitor.keyframe.store(false, Ordering::Relaxed);
-
-        let size = (frame.width, frame.height);
-        let mut force = wants_key;
-        if encoder.as_ref().is_none_or(|e| e.source_size() != size) {
-            applied_bitrate = monitor.bitrate.load(Ordering::Relaxed);
-            match Encoder::new(frame.width, frame.height, fps, applied_bitrate, scale) {
-                Ok(e) => encoder = Some(e),
-                Err(e) => {
-                    warn!("encoder: {e:#}");
-                    continue;
-                }
-            }
-            force = true;
-            let mut info = monitor.info.lock().unwrap();
-            (info.width, info.height) = size;
-        }
-        let encoder = encoder.as_mut().unwrap();
-        let target = monitor.bitrate.load(Ordering::Relaxed);
-        if target != applied_bitrate {
-            encoder.set_bitrate(target);
-            applied_bitrate = target;
-        }
         if has_fresh {
             monitor.generation.fetch_add(1, Ordering::Relaxed);
             // Duplication hands over BGRA as is: full colour, nothing to convert back
@@ -636,8 +624,46 @@ fn encode_loop(
                 }));
             }
         }
-        let capture_us = if has_fresh { *captured_us } else { now_us() };
-        match encoder.encode(frame, force) {
+        let wants_key = monitor.keyframe.load(Ordering::Relaxed);
+        // Nothing new, or too soon for it: only a keyframe request is answered now.
+        if !wants_key && (!unsent || Instant::now() < next_due) {
+            continue;
+        }
+        monitor.keyframe.store(false, Ordering::Relaxed);
+
+        let size = (frame.width, frame.height);
+        let wanted_fps = fps.min(VIEWER_FPS.load(Ordering::Relaxed)).max(1);
+        let mut force = wants_key;
+        if encoder.as_ref().is_none_or(|e| e.source_size() != size || e.wanted_fps != wanted_fps) {
+            applied_bitrate = monitor.bitrate.load(Ordering::Relaxed);
+            encoder = None;
+            match VideoEncoder::new(frame.width, frame.height, wanted_fps, applied_bitrate, scale) {
+                Ok(e) => {
+                    let id = monitor.info.lock().unwrap().id;
+                    info!("screen {id}: {}, {}x{} at up to {} fps", e.describe(), size.0, size.1, e.fps());
+                    encoder = Some(e);
+                }
+                Err(e) => {
+                    warn!("encoder: {e:#}");
+                    continue;
+                }
+            }
+            force = true;
+            let mut info = monitor.info.lock().unwrap();
+            (info.width, info.height) = size;
+        }
+        let enc = encoder.as_mut().unwrap();
+        let target = monitor.bitrate.load(Ordering::Relaxed);
+        if target != applied_bitrate {
+            enc.set_bitrate(target);
+            applied_bitrate = target;
+        }
+        let capture_us = if unsent { *captured_us } else { now_us() };
+        unsent = false;
+        // A little early is on time: a 60 Hz display's frames shouldn't wait for a 60 fps
+        // encoder because of jitter.
+        next_due = Instant::now() + Duration::from_secs_f64(0.9 / enc.fps() as f64);
+        match enc.encode(frame, force) {
             Ok(Some((data, keyframe))) => {
                 let _ = frames.send(Arc::new(EncodedFrame {
                     stream: slot as u8,
@@ -649,7 +675,100 @@ fn encode_loop(
                 }));
             }
             Ok(None) => {}
-            Err(e) => warn!("encode: {e:#}"),
+            Err(e) => {
+                warn!("encode: {e:#}");
+                if enc.is_hardware() {
+                    // Drop it; the picture goes again through OpenH264, as a keyframe.
+                    warn!("hardware encoding failed; using OpenH264 from now on");
+                    HARDWARE_FAILED.store(true, Ordering::Relaxed);
+                    encoder = None;
+                    monitor.keyframe.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// Set once the hardware encoder has failed (or there's none): the host stays on OpenH264
+/// after that.
+static HARDWARE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// The hardware encoder through Media Foundation where there is one, else OpenH264.
+/// `GLASS_ENCODER=software` asks for OpenH264.
+struct VideoEncoder {
+    kind: Kind,
+    /// The frame rate asked for when it was made (viewers' rate within --fps).
+    wanted_fps: u32,
+}
+
+enum Kind {
+    /// With the frame rate it runs at (at most SOFTWARE_MAX_FPS).
+    Soft(Encoder, u32),
+    Hard(mf::MfEncoder),
+}
+
+impl VideoEncoder {
+    fn new(width: usize, height: usize, fps: u32, bitrate: u32, scale: f64) -> Result<Self> {
+        let software = std::env::var("GLASS_ENCODER").is_ok_and(|e| e.eq_ignore_ascii_case("software"));
+        if software && !HARDWARE_FAILED.swap(true, Ordering::Relaxed) {
+            info!("GLASS_ENCODER=software: encoding with OpenH264");
+        }
+        if !HARDWARE_FAILED.load(Ordering::Relaxed) && crate::win_capture::hardware_fits((width, height), scale) {
+            if !mf::available() {
+                info!("no hardware H.264 encoder; encoding with OpenH264");
+                HARDWARE_FAILED.store(true, Ordering::Relaxed);
+            } else {
+                match mf::MfEncoder::new(width, height, fps, bitrate, scale) {
+                    Ok(e) => return Ok(Self { kind: Kind::Hard(e), wanted_fps: fps }),
+                    Err(e) => {
+                        warn!("hardware encoder unavailable, using OpenH264: {e:#}");
+                        HARDWARE_FAILED.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        let soft_fps = fps.min(SOFTWARE_MAX_FPS);
+        let e = Encoder::new(width, height, soft_fps, bitrate, scale)?;
+        Ok(Self { kind: Kind::Soft(e, soft_fps), wanted_fps: fps })
+    }
+
+    fn is_hardware(&self) -> bool {
+        matches!(self.kind, Kind::Hard(_))
+    }
+
+    /// Which encoder, for the log.
+    fn describe(&self) -> String {
+        match &self.kind {
+            Kind::Soft(..) => "OpenH264 (software)".into(),
+            Kind::Hard(e) => format!("{} (Media Foundation, hardware)", e.name),
+        }
+    }
+
+    fn fps(&self) -> u32 {
+        match &self.kind {
+            Kind::Soft(_, fps) => *fps,
+            Kind::Hard(e) => e.fps(),
+        }
+    }
+
+    fn source_size(&self) -> (usize, usize) {
+        match &self.kind {
+            Kind::Soft(e, _) => e.source_size(),
+            Kind::Hard(e) => e.source_size(),
+        }
+    }
+
+    fn set_bitrate(&mut self, bps: u32) {
+        match &mut self.kind {
+            Kind::Soft(e, _) => e.set_bitrate(bps),
+            Kind::Hard(e) => e.set_bitrate(bps),
+        }
+    }
+
+    fn encode(&mut self, frame: &Frame, force: bool) -> Result<Option<(Vec<u8>, bool)>> {
+        match &mut self.kind {
+            Kind::Soft(e, _) => e.encode(frame, force),
+            Kind::Hard(e) => e.encode(frame, force),
         }
     }
 }
@@ -697,6 +816,10 @@ impl VideoSource for Video {
         let monitors = self.monitors.lock().unwrap();
         let m = monitors.as_ref()?.iter().find(|m| m.slot.load(Ordering::Relaxed) == stream as i32)?;
         m.latest.lock().unwrap().clone()
+    }
+    /// Encoders follow on their next frame (a new encoder, so a keyframe).
+    fn set_max_fps(&self, fps: u32) {
+        VIEWER_FPS.store(fps, Ordering::Relaxed);
     }
     fn set_bitrate(&self, bps: u32) {
         if let Some(monitors) = self.monitors.lock().unwrap().as_ref() {

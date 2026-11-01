@@ -60,6 +60,8 @@ mod testmode;
 mod thumbs;
 mod update;
 mod viewers;
+#[cfg(any(windows, test))]
+mod win_capture;
 
 #[cfg(target_os = "macos")]
 #[path = "macos/mod.rs"]
@@ -1243,8 +1245,9 @@ async fn run_host(args: Args) -> Result<()> {
         lid::watch();
         let video = Arc::new(video::Video::new(
             video::VideoConfig {
-                // Linux and Windows encode in software: 60 at most.
-                fps: if cfg!(target_os = "macos") { args.fps } else { args.fps.min(60) },
+                // Linux encodes in software: 60 at most. Windows caps OpenH264 at 60 itself
+                // and lets its hardware encoder go faster.
+                fps: if cfg!(target_os = "linux") { args.fps.min(60) } else { args.fps },
                 bitrate: args.mbps * 1_000_000,
                 scale: args.scale,
             },
