@@ -59,21 +59,45 @@ pub async fn fetch_latest() -> Option<String> {
     json["version"].as_str().map(str::to_owned)
 }
 
+/// The installer: install.sh through sh, or install.ps1 through PowerShell on Windows.
+fn installer() -> std::process::Command {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
+            .arg(format!("irm {}/install.ps1 | iex", base_url()));
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &format!("curl -fsSL {}/install.sh | sh", base_url())]);
+        cmd
+    };
+    cmd.env("GLASS_BASE", base_url());
+    cmd
+}
+
 /// Re-runs the installer in a new process group, detached, so it outlives this process
 /// when it restarts the service.
 pub fn start_self_update() -> anyhow::Result<()> {
-    use std::os::unix::process::CommandExt;
     let log = crate::platform::log_dir().join("update.log");
     let _ = std::fs::create_dir_all(log.parent().unwrap());
-    let script = format!("curl -fsSL {base}/install.sh | sh", base = base_url());
-    std::process::Command::new("sh")
-        .args(["-c", &script])
-        .env("GLASS_BASE", base_url())
-        .stdin(std::process::Stdio::null())
+    let mut cmd = installer();
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::fs::File::create(&log)?)
-        .stderr(std::fs::File::options().append(true).open(&log)?)
-        .process_group(0)
-        .spawn()?;
+        .stderr(std::fs::File::options().append(true).open(&log)?);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+    }
+    cmd.spawn()?;
     tracing::info!("self-update started; log: {}", log.display());
     Ok(())
 }
@@ -82,23 +106,20 @@ pub fn start_self_update() -> anyhow::Result<()> {
 pub fn run_logged() -> anyhow::Result<()> {
     let log = crate::platform::log_dir().join("update.log");
     let _ = std::fs::create_dir_all(log.parent().unwrap());
-    let status = std::process::Command::new("sh")
-        .args(["-c", &format!("curl -fsSL {}/install.sh | sh", base_url())])
-        .env("GLASS_BASE", base_url())
-        .stdin(std::process::Stdio::null())
+    let mut cmd = installer();
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::fs::File::create(&log)?)
-        .stderr(std::fs::File::options().append(true).open(&log)?)
-        .status()?;
+        .stderr(std::fs::File::options().append(true).open(&log)?);
+    #[cfg(windows)]
+    crate::platform::no_window(&mut cmd);
+    let status = cmd.status()?;
     anyhow::ensure!(status.success(), "the update didn't finish; see update.log in Glass's logs");
     Ok(())
 }
 
 /// `glass update`: the installer, in the foreground.
 pub fn run_cli() -> anyhow::Result<()> {
-    let status = std::process::Command::new("sh")
-        .args(["-c", &format!("curl -fsSL {}/install.sh | sh", base_url())])
-        .env("GLASS_BASE", base_url())
-        .status()?;
+    let status = installer().status()?;
     anyhow::ensure!(status.success(), "the installer failed");
     Ok(())
 }

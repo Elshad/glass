@@ -1,5 +1,6 @@
-//! A Unix socket the running host listens on (`glass.sock` in the config dir, owner-only)
-//! so the CLI can act on it: answer connection requests, chat, privacy mode, viewers.
+//! A Unix socket the running host listens on (`glass.sock` in the config dir, owner-only;
+//! on Windows a named pipe, `\\.\pipe\glass-<config dir hash>`, local clients only) so the CLI can
+//! act on it: answer connection requests, chat, privacy mode, viewers.
 //! One JSON request per line, one JSON reply per line.
 
 use std::path::PathBuf;
@@ -38,11 +39,52 @@ pub enum Request {
     },
 }
 
+#[cfg(unix)]
 pub fn path() -> PathBuf {
     crate::config_dir().join("glass.sock")
 }
 
+/// One pipe per user (and per config dir, so tests and `glass support` get their own).
+#[cfg(windows)]
+pub fn path() -> PathBuf {
+    let dir = crate::config_dir().to_string_lossy().to_lowercase();
+    let digest = ring::digest::digest(&ring::digest::SHA256, dir.as_bytes());
+    let tag: String = digest.as_ref()[..8].iter().map(|b| format!("{b:02x}")).collect();
+    PathBuf::from(format!(r"\\.\pipe\glass-{tag}"))
+}
+
 /// Serves requests until the host exits.
+#[cfg(windows)]
+pub fn serve() -> Result<()> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let name = path();
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .reject_remote_clients(true)
+        .create(&name)
+        .with_context(|| format!("create {}", name.display()))?;
+    tokio::spawn(async move {
+        loop {
+            if server.connect().await.is_err() {
+                continue;
+            }
+            let next = match ServerOptions::new().reject_remote_clients(true).create(&name) {
+                Ok(next) => next,
+                Err(e) => {
+                    tracing::warn!("ipc: {e}");
+                    return;
+                }
+            };
+            let stream = std::mem::replace(&mut server, next);
+            let (read, write) = tokio::io::split(stream);
+            tokio::spawn(serve_one(read, write));
+        }
+    });
+    Ok(())
+}
+
+/// Serves requests until the host exits.
+#[cfg(unix)]
 pub fn serve() -> Result<()> {
     let p = path();
     if let Some(dir) = p.parent() {
@@ -58,24 +100,27 @@ pub fn serve() -> Result<()> {
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else { continue };
-            tokio::spawn(async move {
-                let (read, mut write) = stream.into_split();
-                let mut lines = BufReader::new(read).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let reply = match serde_json::from_str::<Request>(&line) {
-                        Ok(req) => handle(req).await,
-                        Err(e) => serde_json::json!({ "error": format!("bad request: {e}") }),
-                    };
-                    let mut out = reply.to_string();
-                    out.push('\n');
-                    if write.write_all(out.as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
-            });
+            let (read, write) = stream.into_split();
+            tokio::spawn(serve_one(read, write));
         }
     });
     Ok(())
+}
+
+/// One client: a reply for each request line, until it hangs up.
+async fn serve_one(read: impl tokio::io::AsyncRead + Unpin, mut write: impl tokio::io::AsyncWrite + Unpin) {
+    let mut lines = BufReader::new(read).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let reply = match serde_json::from_str::<Request>(&line) {
+            Ok(req) => handle(req).await,
+            Err(e) => serde_json::json!({ "error": format!("bad request: {e}") }),
+        };
+        let mut out = reply.to_string();
+        out.push('\n');
+        if write.write_all(out.as_bytes()).await.is_err() {
+            break;
+        }
+    }
 }
 
 async fn handle(req: Request) -> serde_json::Value {
@@ -127,9 +172,15 @@ async fn handle(req: Request) -> serde_json::Value {
 /// Sends one request to the running host.
 pub fn call(req: &Request) -> Result<serde_json::Value> {
     use std::io::{BufRead, Write};
-    let mut stream = std::os::unix::net::UnixStream::connect(path())
-        .map_err(|_| anyhow::anyhow!("Glass isn't running here. Start it (glass setup), then try again."))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    let not_running = |_| anyhow::anyhow!("Glass isn't running here. Start it (glass setup), then try again.");
+    #[cfg(unix)]
+    let mut stream = {
+        let stream = std::os::unix::net::UnixStream::connect(path()).map_err(not_running)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        stream
+    };
+    #[cfg(windows)]
+    let mut stream = std::fs::OpenOptions::new().read(true).write(true).open(path()).map_err(not_running)?;
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;

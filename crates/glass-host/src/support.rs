@@ -375,8 +375,7 @@ pub fn watch_parent() {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(2));
-            // SAFETY: signal 0 only checks that the process exists.
-            if unsafe { libc::kill(pid, 0) } != 0 {
+            if !crate::platform::process_alive(pid as u32) {
                 tracing::info!("support: glass support ended; stopping");
                 let _ = std::fs::remove_dir_all(crate::config_dir());
                 std::process::exit(0);

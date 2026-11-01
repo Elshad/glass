@@ -365,6 +365,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlinks_out_are_refused() {
         let root = tmp();
         let outside = std::env::temp_dir().join(format!("glass-outside-{}", rand_suffix()));

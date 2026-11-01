@@ -1,6 +1,7 @@
 //! Talking to the person at the computer: notifications, yes/no prompts and a text box.
 //! macOS uses AppleScript (works from the background service, no app bundle needed);
-//! Linux uses notify-send, with zenity or kdialog for prompts. Test mode never shows any.
+//! Linux uses notify-send, with zenity or kdialog for prompts; Windows uses PowerShell (a
+//! toast, a message box, an input box). Test mode never shows any.
 
 use std::time::Duration;
 
@@ -26,6 +27,22 @@ pub fn notify(title: &str, body: &str) {
         let _ = std::process::Command::new("notify-send")
             .args(["--app-name=Glass", title, body])
             .spawn();
+    }
+    #[cfg(windows)]
+    {
+        use crate::platform::ps_string;
+        // A toast under PowerShell's own app id: an unpackaged app has none of its own.
+        let script = format!(
+            "$m = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]; \
+             $x = $m::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
+             $t = $x.GetElementsByTagName('text'); \
+             [void]$t.Item(0).AppendChild($x.CreateTextNode({})); \
+             [void]$t.Item(1).AppendChild($x.CreateTextNode({})); \
+             $m::CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))",
+            ps_string(title),
+            ps_string(body)
+        );
+        let _ = crate::platform::powershell(&script).spawn();
     }
 }
 
@@ -104,6 +121,25 @@ pub async fn confirm(title: &str, body: &str, yes: &str, no: &str, timeout: Dura
         let _ = (title, body, yes, no, secs);
         None
     }
+    #[cfg(windows)]
+    {
+        use crate::platform::ps_string;
+        // Yes/No, a question icon, on top of other windows (MB_SYSTEMMODAL); -1 on timeout.
+        let script = format!(
+            "(New-Object -ComObject WScript.Shell).Popup({}, {secs}, {}, 4 + 32 + 4096)",
+            ps_string(&format!("{body}\n\nYes: {yes}\nNo: {no}")),
+            ps_string(title),
+        );
+        let out = tokio::process::Command::from(crate::platform::powershell(&script))
+            .output()
+            .await
+            .ok()?;
+        match String::from_utf8_lossy(&out.stdout).trim() {
+            "6" => Some(true),
+            "7" => Some(false),
+            _ => None,
+        }
+    }
 }
 
 /// Asks for a line of text (e.g. a chat reply); `None` if cancelled.
@@ -139,6 +175,22 @@ pub async fn ask_text(title: &str, prompt: &str) -> Option<String> {
             }
         }
         None
+    }
+    #[cfg(windows)]
+    {
+        use crate::platform::ps_string;
+        let script = format!(
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName Microsoft.VisualBasic; \
+             [Microsoft.VisualBasic.Interaction]::InputBox({}, {})",
+            ps_string(prompt),
+            ps_string(title)
+        );
+        let out = tokio::process::Command::from(crate::platform::powershell(&script))
+            .output()
+            .await
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !text.is_empty()).then_some(text)
     }
 }
 

@@ -49,6 +49,13 @@ jobs:
     uses: ./.github/workflows/host.yml
     with: { os: ubuntu-latest }
 
+  windows:
+    name: Windows
+    needs: changes
+    if: needs.changes.outputs.host == 'true'
+    uses: ./.github/workflows/host.yml
+    with: { os: windows-latest }
+
   site:
     needs: changes
     if: needs.changes.outputs.site == 'true'

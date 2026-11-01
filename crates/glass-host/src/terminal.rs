@@ -4,8 +4,11 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -34,7 +37,8 @@ pub enum ServerTerm {
     Exit { code: Option<i32> },
 }
 
-pub const SUPPORTED: bool = true;
+/// Windows needs a ConPTY instead of a pty; not yet.
+pub const SUPPORTED: bool = cfg!(unix);
 
 /// Output is sent in pieces of at most this many bytes.
 const CHUNK: usize = 16 << 10;
@@ -45,6 +49,20 @@ struct Shell {
     child: Arc<Mutex<Child>>,
 }
 
+#[cfg(not(unix))]
+impl Shell {
+    fn spawn(program: &str, args: &[&str], cols: u16, rows: u16) -> Result<(Self, File)> {
+        let _ = (program, args, cols, rows);
+        anyhow::bail!("the terminal isn't available on Windows yet")
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        let _ = (cols, rows);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 impl Shell {
     fn spawn(program: &str, args: &[&str], cols: u16, rows: u16) -> Result<(Self, File)> {
         let (master, slave) = openpty(cols, rows)?;
@@ -101,6 +119,7 @@ impl Drop for Shell {
     }
 }
 
+#[cfg(unix)]
 fn winsize(cols: u16, rows: u16) -> libc::winsize {
     libc::winsize {
         ws_row: rows.max(1),
@@ -110,6 +129,7 @@ fn winsize(cols: u16, rows: u16) -> libc::winsize {
     }
 }
 
+#[cfg(unix)]
 fn openpty(cols: u16, rows: u16) -> Result<(OwnedFd, OwnedFd)> {
     let (mut master, mut slave) = (0, 0);
     let mut ws = winsize(cols, rows);
@@ -208,6 +228,7 @@ impl Session {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn collect(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
     ) -> (String, Option<i32>) {
@@ -229,6 +250,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn runs_a_program_in_a_pty() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (shell, reader) = Shell::spawn(
@@ -248,6 +270,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn input_reaches_the_shell() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (mut shell, reader) = Shell::spawn("/bin/sh", &[], 80, 24).unwrap();

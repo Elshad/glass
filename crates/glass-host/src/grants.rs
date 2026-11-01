@@ -818,7 +818,7 @@ pub fn local_input_recent() -> bool {
     false
 }
 
-/// A password field has the keyboard (macOS secure input), or, on Linux, the session is
+/// A password field has the keyboard (macOS secure input), or, on Linux and Windows, the session is
 /// locked (there's no telling which field has the keyboard, but a lock screen's is one).
 pub fn secure_input() -> bool {
     if crate::testmode::enabled() {
@@ -828,11 +828,11 @@ pub fn secure_input() -> bool {
     {
         crate::platform::front::secure_input()
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         crate::platform::session::locked()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     false
 }
 

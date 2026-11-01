@@ -2589,6 +2589,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "webrtc",
+ "windows 0.62.2",
  "wtransport",
 ]
 

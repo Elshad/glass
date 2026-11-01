@@ -12,7 +12,9 @@
 //! with a MAC keyed by that code, which only the link's holder (you) can make, and the
 //! computer pins the key. Only passkeys using ES256 (nearly all) can manage computers.
 
+#[cfg(unix)]
 use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -283,6 +285,13 @@ fn run_script(name: &str) -> Result<String> {
     run_script_for(name, Duration::from_secs(SCRIPT_SECS))
 }
 
+#[cfg(not(unix))]
+fn run_script_for(name: &str, limit: Duration) -> Result<String> {
+    let _ = (name, limit);
+    bail!("fleet scripts aren't available on Windows yet")
+}
+
+#[cfg(unix)]
 fn run_script_for(name: &str, limit: Duration) -> Result<String> {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::process::CommandExt;
@@ -347,11 +356,14 @@ fn run_script_for(name: &str, limit: Duration) -> Result<String> {
 fn audit(action: &str, arg: &str, who: &str, ok: bool, message: &str) {
     use std::io::Write;
     let line = json!({ "t": now(), "action": action, "arg": arg, "passkey": who, "ok": ok, "message": message.chars().take(200).collect::<String>() });
-    use std::os::unix::fs::OpenOptionsExt;
     if crate::fleet::ensure_dir().is_err() {
         return;
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(dir().join("actions.log")) {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    if let Ok(mut f) = opts.open(dir().join("actions.log")) {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -485,6 +497,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn script(dir: &std::path::Path, name: &str, body: &str, mode: u32) {
         let scripts = dir.join("fleet").join("scripts");
         std::fs::create_dir_all(&scripts).unwrap();
@@ -494,6 +507,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn scripts_run_only_from_a_private_folder_as_yours_and_are_stopped_on_time() {
         let dir = scratch();
         script(&dir, "hi.sh", "#!/bin/sh\necho hi there\n", 0o755);
