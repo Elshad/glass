@@ -237,6 +237,12 @@ jobs:
           test -s notes.md || { echo "CHANGELOG.md has no '## $version' entry"; exit 1; }
           # Every platform's archive, the Windows MSIs, and their .sha256 files.
           gh release create "$GITHUB_REF_NAME" dist/glass-[0-9]* --notes-file notes.md --generate-notes --title "Glass $GITHUB_REF_NAME"
+      # The winget manifests for this release, to submit to microsoft/winget-pkgs by hand
+      # (packaging/winget/README.md).
+      - name: winget manifests
+        run: node scripts/winget.mjs "${GITHUB_REF_NAME#v}" dist dist/winget
+      - uses: actions/upload-artifact@v4
+        with: { name: winget-manifests, path: dist/winget/ }
       - uses: actions/setup-node@v4
         if: env.CLOUDFLARE_API_TOKEN != ''
         with: { node-version: 24 }

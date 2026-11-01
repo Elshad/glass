@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
+# A template: scripts/winget.mjs fills in the version, URLs and checksums for a release.
+
+PackageIdentifier: Glassdesk.Glass
+PackageVersion: 0.10.0
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.10.0

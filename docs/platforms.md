@@ -79,7 +79,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | One-line install | ✅ install.sh | ✅ install.sh | ✅ install.ps1 | `irm glassdesk.dev \| iex` |
 | Release builds | ✅ universal | ✅ x86_64 | 🧪 x64 + Arm64 zips and MSIs | |
 | Signed builds | ✅ stable identity | — | 🧪 Authenticode, timestamped | Windows: Azure Trusted Signing or a .pfx (release.yml) |
-| Managed deployment | ❌ | ❌ | 🧪 per-machine MSI | `msiexec /i glass-….msi /qn`; Program Files, starts for every user, firewall rule |
+| Managed deployment | ❌ | ❌ | 🧪 per-machine MSI, winget manifests | `msiexec /i glass-….msi /qn`; Program Files, starts for every user, firewall rule |
 | Admin policies (locked settings) | ❌ | ❌ | 🧪 Group Policy / Intune (ADMX) | HKLM/HKCU\SOFTWARE\Policies\Glass; packaging/windows/policies |
 | Background service | ✅ LaunchAgent | ✅ systemd user | ✅ glassw at sign-in | |
 | Self-update | ✅ | ✅ | ✅ | Windows MSI installs update with the MSI or winget; a policy can turn updates off |

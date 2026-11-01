@@ -26,6 +26,8 @@ jobs:
               - 'crates/**'
               - 'web/**'
               - 'tests/unit/**'
+              - 'packaging/**'
+              - 'scripts/winget.mjs'
               - 'Cargo.*'
               - '.github/workflows/**'
             site:
