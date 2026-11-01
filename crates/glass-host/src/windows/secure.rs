@@ -486,10 +486,16 @@ fn send_sas_now() {
     unsafe { SendSAS(false) };
 }
 
-/// A SECURITY_DESCRIPTOR allowing LocalSystem, Administrators and the console user, built
-/// from an SDDL string. Remote clients are rejected by the pipe itself.
+/// A SECURITY_DESCRIPTOR allowing LocalSystem, Administrators and the interactively
+/// logged-on console user, built from an SDDL string. Remote clients are rejected by the
+/// pipe itself (PIPE_REJECT_REMOTE_CLIENTS).
+///
+/// The Interactive-Users ACE (IU, S-1-5-4) is what the per-user host actually matches: an
+/// admin's ordinary host process runs unelevated, so its Administrators group is deny-only
+/// and the BA ACE wouldn't grant it; IU grants the console user regardless of elevation,
+/// and regardless of whether anyone was logged in when the helper (and its pipe) started.
 fn security_descriptor() -> SecurityDescriptor {
-    let mut sddl = String::from("D:(A;;GA;;;SY)(A;;GA;;;BA)");
+    let mut sddl = String::from("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
     if let Some(sid) = console_user_sid() {
         sddl.push_str(&format!("(A;;GRGW;;;{sid})"));
     }
