@@ -52,18 +52,9 @@ try {
     Expand-Archive -Path $zip -DestinationPath $tmp -Force
     $new = Join-Path $tmp 'glass'
 
-    # Stop Glass in the background so its files can be replaced.
-    $agent = $false
-    try {
-        [Threading.EventWaitHandle]::OpenExisting('Local\GlassAgentStop').Set() | Out-Null
-        $agent = $true
-    } catch {}
-    $deadline = (Get-Date).AddSeconds(10)
-    while ((Get-Date) -lt $deadline -and (Get-Process glassw -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 200 }
-
     # A running program can't be overwritten, but it can be renamed: move the old ones
-    # aside (this script may have been started by `glass update` itself) and clean up what
-    # earlier updates left.
+    # aside (Glass may be running, or have started this script) and clean up what earlier
+    # updates left. Nothing needs stopping first.
     New-Item -ItemType Directory -Force -Path $Bin | Out-Null
     Get-ChildItem $Bin -Filter '*.old' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     foreach ($exe in Get-ChildItem (Join-Path $new 'bin')) {
@@ -79,7 +70,7 @@ try {
 }
 
 # `glass` on the PATH for new terminals, and for this one.
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$userPath = ([Environment]::GetEnvironmentVariable('Path', 'User') + '').TrimEnd(';')
 if (-not (($userPath -split ';') -contains $Bin)) {
     $joined = if ($userPath) { "$userPath;$Bin" } else { $Bin }
     [Environment]::SetEnvironmentVariable('Path', $joined, 'User')
@@ -92,10 +83,12 @@ if (-not $previous) { Info "Installed Glass $version" }
 elseif ($previous -eq $version) { Info "Glass $version is the latest; reinstalled it" }
 else { Info "Updated Glass $previous -> $version" }
 
+# Restart the background host onto the new version (it reaches the desktop session from
+# an SSH shell too).
 $installed = Test-Path (Join-Path $env:LOCALAPPDATA 'Glass\agent')
-if ($installed -or $agent) {
-    Start-Process (Join-Path $Bin 'glassw.exe')
-    Info 'Restarted Glass in the background'
+if ($installed) {
+    & $Glass restart | Out-Null
+    if ($LASTEXITCODE -eq 0) { Info 'Restarted Glass in the background' }
 }
 
 Write-Host ''
