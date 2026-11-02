@@ -25,7 +25,8 @@ case "$(uname -s)-$(uname -m)" in
     TARBALL="glass-latest-darwin-universal.tar.gz"
     ;;
   Linux-x86_64) TARBALL="glass-latest-linux-x86_64.tar.gz" ;;
-  *) fail "Quick support runs on macOS and on Linux (x86_64)." ;;
+  Linux-aarch64|Linux-arm64) TARBALL="glass-latest-linux-aarch64.tar.gz" ;;
+  *) fail "Quick support runs on macOS and on Linux (x86_64 or ARM64)." ;;
 esac
 
 tmp=$(mktemp -d)
