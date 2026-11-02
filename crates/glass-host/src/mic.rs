@@ -15,7 +15,7 @@
 //! through the host's own audio capture, an echo rather than a microphone.
 //!
 //! Windows: only a driver can add a microphone, so through a virtual cable the user
-//! installs (VB-Audio's free VB-CABLE; `glass mic install` opens its download page). Glass
+//! installs (VB-Audio's free VB-CABLE; `glass mic install` downloads it and opens its installer). Glass
 //! plays the viewer's voice into the cable's output ("CABLE Input") with WASAPI; apps pick
 //! its other end ("CABLE Output") as their microphone.
 
@@ -58,7 +58,7 @@ pub enum Ask {
 
 /// Installs what a viewer's microphone needs. macOS: the Glass Microphone driver shipped
 /// with Glass (or BlackHole's official installer when this build has no driver). Linux:
-/// `pactl`, with the system's package manager. Windows: VB-CABLE's download page.
+/// `pactl`, with the system's package manager. Windows: VB-CABLE's installer.
 pub fn install(ask: Ask) -> anyhow::Result<String> {
     #[cfg(target_os = "macos")]
     return mac_install(ask);
@@ -690,6 +690,11 @@ mod win {
     use super::Ring;
 
     const DOWNLOAD: &str = "https://vb-audio.com/Cable/";
+    /// VB-CABLE's official package (x64 and Arm64), and its SHA-256: Glass downloads it
+    /// as is and opens VB-Audio's own installer. Its license doesn't allow building it into
+    /// another program's installation, so it's installed by the person, not silently.
+    const PACK: &str = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip";
+    const PACK_SHA256: &str = "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb";
 
     /// What viewers send: 48 kHz mono s16 (the engine converts it to the cable's format).
     const MONO: WAVEFORMATEX = WAVEFORMATEX {
@@ -727,10 +732,39 @@ mod win {
         if let Some((_, input)) = device() {
             return Ok(format!("The microphone is ready: while a viewer's mic is on, apps here can pick \"{input}\"."));
         }
-        crate::platform::setup::open_url(DOWNLOAD);
-        Ok(format!(
-            "Opened VB-Audio's website ({DOWNLOAD}): download VB-CABLE, unzip it and run VBCABLE_Setup_x64.exe as administrator. Then turn on the mic in the viewer and pick \"CABLE Output\" as the microphone in your apps."
-        ))
+        match open_installer() {
+            Ok(()) => Ok("VB-CABLE's installer is open on this computer: click Install Driver, then restart the computer when it asks. After that, turn on the mic in the viewer and pick \"CABLE Output\" as the microphone in your apps.".into()),
+            Err(e) => {
+                tracing::warn!("microphone: VB-CABLE download: {e:#}");
+                Err(anyhow::anyhow!(
+                    "couldn't get VB-CABLE ({e:#}). Install it from {DOWNLOAD} (run VBCABLE_Setup_x64.exe as administrator), then turn on the mic in the viewer."
+                ))
+            }
+        }
+    }
+
+    /// Downloads VB-CABLE's package, checks it, and opens its installer (one UAC prompt).
+    fn open_installer() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let zip = ureq::get(PACK).call()?.body_mut().with_config().limit(16 << 20).read_to_vec()?;
+        let got: String = ring::digest::digest(&ring::digest::SHA256, &zip).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        anyhow::ensure!(got == PACK_SHA256, "the download didn't match its checksum");
+        let dir = std::env::temp_dir().join("glass-vbcable");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let archive = dir.join("VBCABLE_Driver_Pack.zip");
+        std::fs::write(&archive, zip)?;
+        let ps = crate::platform::ps_string;
+        let setup = dir.join("VBCABLE_Setup_x64.exe");
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; Expand-Archive -LiteralPath {} -DestinationPath {} -Force; Start-Process -FilePath {} -Verb RunAs",
+            ps(&archive.display().to_string()),
+            ps(&dir.display().to_string()),
+            ps(&setup.display().to_string()),
+        );
+        let ok = crate::platform::powershell(&script).status().context("powershell")?.success();
+        anyhow::ensure!(ok, "the installer didn't start (administrator approval was declined?)");
+        Ok(())
     }
 
     pub fn active(on: bool) {

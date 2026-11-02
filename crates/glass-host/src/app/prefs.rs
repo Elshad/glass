@@ -141,7 +141,7 @@ impl GlassApp {
                 match &snap.mic {
                     Some(name) if cfg!(windows) => format!("Ready: a viewer's mic plays into {name}; pick it as the microphone in your apps."),
                     Some(name) => format!("Ready: a viewer's mic plays into {name}, the Mac's default input while it's on."),
-                    None if cfg!(windows) => "Needs VB-CABLE, a free virtual audio cable. Install… opens its download page.".into(),
+                    None if cfg!(windows) => "Needs VB-CABLE, a free virtual audio cable. Install… opens its installer (then restart the computer).".into(),
                     None => "Needs Glass Microphone, a small audio driver. Installing asks for your Mac's password once.".into(),
                 },
                 match &snap.mic {
