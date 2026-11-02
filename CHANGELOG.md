@@ -2,7 +2,9 @@
 
 What changed in each release of Glass. `glass update` (or the Glass app) installs the newest; every build is on [GitHub Releases](https://github.com/Ntarasiuk/glass/releases).
 
-## Unreleased
+## 0.11.0
+
+November 2, 2026
 
 ### Fit this device
 
