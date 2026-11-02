@@ -4,6 +4,15 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 
 ## Unreleased
 
+### Fit this device
+
+- Fitting now gives your iPad or iPhone its full resolution: a Retina display in its shape (3180×2320 on a 12.9" iPad, laid out like 1590×1160), so text is sharp and a normal size.
+- The fitted display stands in for the one you're watching: that monitor turns off while you're fitted, and the fitted display takes its place, menu bar and all. Before, the monitor mirrored it, which some monitors can't show (they lost the signal every few seconds and the screens flipped).
+- Your other displays stay where they are, and come back exactly as they were when you stop.
+- Turning your device resizes the fitted display to match, and windows that don't fit on it any more shrink and move onto it.
+- The pointer reaches the very top of the fitted display, so the menu bar can be clicked.
+- If Glass quits while fitted, macOS turns the monitor back on.
+
 ### Listen addresses
 
 - `--bind` (or `glass config bind`) picks the addresses Glass listens on, for example `--bind tailscale --bind 127.0.0.1` to stay on your tailnet and this computer. `tailscale` means this machine's Tailscale addresses. The default is unchanged: every address. Also in the Mac app's settings. Thanks [@ddedic](https://github.com/ddedic).

@@ -68,8 +68,11 @@ fn contains(b: CGRect, p: CGPoint) -> bool {
 
 pub struct Injector {
     source: Option<CFRetained<CGEventSource>>,
-    /// Global bounds of each streamed display, indexed by stream number.
-    bounds: Vec<CGRect>,
+    /// The streamed displays, indexed by stream number. Their bounds are looked up as
+    /// they're used: a display we just added or mirrored settles a moment later.
+    displays: Vec<CGDirectDisplayID>,
+    /// A streamed window's global bounds, instead of the displays.
+    window: Option<CGRect>,
     pos: CGPoint,
     buttons: [bool; 3],
     flags: CGEventFlags,
@@ -102,11 +105,11 @@ unsafe impl Send for Injector {}
 
 impl Injector {
     pub fn new(display: CGDirectDisplayID) -> Self {
-        let bounds = CGDisplayBounds(display);
         Self {
             source: CGEventSource::new(CGEventSourceStateID::HIDSystemState),
-            bounds: vec![bounds],
-            pos: bounds.origin,
+            displays: vec![display],
+            window: None,
+            pos: CGDisplayBounds(display).origin,
             buttons: [false; 3],
             flags: CGEventFlags(0),
             last_click: None,
@@ -119,16 +122,25 @@ impl Injector {
     /// Retargets absolute mouse coordinates after the streamed displays change.
     pub fn set_displays(&mut self, displays: &[CGDirectDisplayID]) {
         self.release_all();
-        self.bounds = displays.iter().map(|&d| CGDisplayBounds(d)).collect();
+        self.displays = displays.to_vec();
+        self.window = None;
+    }
+
+    /// Global bounds of a stream (or the first one).
+    fn bounds(&self, stream: usize) -> Option<CGRect> {
+        if let Some(w) = self.window {
+            return Some(w);
+        }
+        self.displays.get(stream).or(self.displays.first()).map(|&d| CGDisplayBounds(d))
     }
 
     pub fn handle(&mut self, ev: InputEvent) {
         match ev {
             InputEvent::MouseMove { x, y, stream } => {
-                let Some(b) = self.bounds.get(stream as usize).or(self.bounds.first()) else {
+                let Some(b) = self.bounds(stream as usize) else {
                     return;
                 };
-                self.move_to(to_global(*b, x, y));
+                self.move_to(to_global(b, x, y));
             }
             InputEvent::MouseDown { button } | InputEvent::MouseUp { button } => {
                 let down = matches!(ev, InputEvent::MouseDown { .. });
@@ -155,12 +167,15 @@ impl Injector {
             }
             InputEvent::MouseMoveBy { dx, dy } => {
                 // Stay on the display the pointer is on (or the first streamed one).
-                let b = self
-                    .bounds
-                    .iter()
-                    .find(|b| contains(**b, self.pos))
-                    .or(self.bounds.first())
-                    .copied();
+                let b = match self.window {
+                    Some(w) => Some(w),
+                    None => self
+                        .displays
+                        .iter()
+                        .map(|&d| CGDisplayBounds(d))
+                        .find(|b| contains(*b, self.pos))
+                        .or_else(|| self.bounds(0)),
+                };
                 let Some(b) = b else { return };
                 let to = CGPoint {
                     x: (self.pos.x + dx as f64).clamp(b.origin.x, b.origin.x + b.size.width - 1.0),
@@ -376,13 +391,13 @@ impl crate::media::InputSink for Injector {
         // `None`: set_displays already put the display bounds back.
         // No release here: the window may be moving because it's being dragged.
         if let Some([x, y, w, h]) = rect {
-            self.bounds = vec![CGRect {
+            self.window = Some(CGRect {
                 origin: CGPoint { x, y },
                 size: objc2_core_foundation::CGSize {
                     width: w,
                     height: h,
                 },
-            }];
+            });
         }
     }
     fn set_displays(&mut self, displays: &[u32]) {

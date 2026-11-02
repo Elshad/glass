@@ -1216,6 +1216,23 @@ function sendFit() {
   if (w && h) control({ t: 'fit', size: [w, h] });
 }
 
+// Turning the device while fitted: the same share of the screen, the other way round (the
+// host resizes the display it made, so windows stay on it).
+let turnTimer;
+addEventListener('resize', () => {
+  clearTimeout(turnTimer);
+  turnTimer = setTimeout(() => {
+    if (!resolutionMode.startsWith('fit:') || guest) return;
+    const [w, h] = resolutionMode.slice(4).split('x').map(Number);
+    if (!w || !h || (w > h) === (innerWidth > innerHeight)) return;
+    const sizes = fitSizes();
+    const near = (s) => Math.abs(s[0] * s[1] - w * h);
+    const [nw, nh] = sizes.length ? sizes.reduce((a, b) => (near(b) < near(a) ? b : a)) : [h, w];
+    log('info', 'fit: turned', { from: [w, h], to: [nw, nh] });
+    setResolution(`fit:${nw}x${nh}`);
+  }, 400);
+});
+
 /**
  * Desktop sizes in this device's shape (its viewing area, in device pixels, at full, ¾ and
  * ½ size), when that shape differs from the Mac display's. Empty when they already match.
