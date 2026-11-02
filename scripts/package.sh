@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds release tarballs into dist/.
-#   scripts/package.sh            macOS universal (on a Mac) and Linux x86_64 (natively on
-#                                 Linux, or in Docker on a Mac when it's running)
+#   scripts/package.sh            macOS universal (on a Mac) and Linux (natively on Linux, for
+#                                 its own architecture, or x86_64 in Docker on a Mac when it's running)
 #   scripts/package.sh macos      just macOS
 #   scripts/package.sh linux      just Linux
 # Layout: glass/bin/glass, glass/share/glass/web/*, and on macOS
@@ -78,7 +78,7 @@ package_macos() {
 package_linux() {
   if [ "$(uname -s)" = Linux ]; then
     cargo build --release -p glass-host
-    tarball linux-x86_64 target/release/glass-host
+    tarball "linux-$(uname -m)" target/release/glass-host
   elif docker info >/dev/null 2>&1; then
     scripts/linux/build.sh
     tarball linux-x86_64 target/linux-x86_64/release/glass-host
