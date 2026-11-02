@@ -2,6 +2,12 @@
 
 What changed in each release of Glass. `glass update` (or the Glass app) installs the newest; every build is on [GitHub Releases](https://github.com/Ntarasiuk/glass/releases).
 
+## Unreleased
+
+### Listen addresses
+
+- `--bind` (or `glass config bind`) picks the addresses Glass listens on, for example `--bind tailscale --bind 127.0.0.1` to stay on your tailnet and this computer. `tailscale` means this machine's Tailscale addresses. The default is unchanged: every address. Also in the Mac app's settings. Thanks [@ddedic](https://github.com/ddedic).
+
 ## 0.10.0
 
 October 31, 2026
