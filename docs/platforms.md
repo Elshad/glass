@@ -38,6 +38,7 @@ Windows is in a stack of PRs (#75 onwards) and GitHub pre-releases (0.11.0-windo
 | Game controllers | ❌ | ✅ uinput | 🧪 ViGEmBus | Windows: a virtual Xbox 360 controller when ViGEmBus is installed |
 | Use the lock screen / sign-in screen (while signed in) | ✅ | ? | ✅ SYSTEM helper | Windows: `glass service install` keeps a SYSTEM helper on the input desktop |
 | Control elevated windows, UAC prompts | — | — | ✅ SYSTEM helper | Same service; input passes UIPI through SYSTEM |
+| Sign in after a restart (nobody signed in yet) | ❌ | ❌ | ✅ sign-in host | Windows: the same service serves the sign-in screen (screen and input only) until someone signs in, then the user's own host takes over |
 | Send Ctrl+Alt+Del | — | — | ✅ SendSAS | Viewer's More menu. Needs the secure-desktop service (sets the SoftwareSASGeneration policy) |
 | Wake on LAN, restart Glass/computer | ✅ | ✅ | 🧪 | Windows: restarting Glass works in the VM |
 | Stay awake with the lid closed | ✅ | ✅ | 🧪 power plan lid action | Windows: "Do nothing" on power while it's on, put back after |

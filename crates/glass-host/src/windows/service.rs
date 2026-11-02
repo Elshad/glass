@@ -5,6 +5,10 @@
 //! per-user host stays exactly as it was and remains the only thing that serves and
 //! authenticates viewers.
 //!
+//! While nobody is signed in at the console (after a restart), it also runs the sign-in
+//! host there (see `signin.rs`), from the copy of the owner's settings `install` makes, and
+//! stops it the moment someone signs in.
+//!
 //! The service account is LocalSystem so it can duplicate its own token into the console
 //! session and call SendSAS; nothing else about Glass moves to SYSTEM. Install also sets
 //! the SoftwareSASGeneration policy so SendSAS (Ctrl+Alt+Del) is allowed.
@@ -82,6 +86,16 @@ fn install() -> Result<()> {
     }
     let exe = protected_copy()?;
     let bin = format!("\"{}\" {SERVICE_ARG}", exe.display());
+    // The sign-in host runs this copy: it needs its own firewall rule (private networks,
+    // like glass setup's), as SYSTEM can't answer Windows' prompt.
+    if super::firewall::inbound(&exe) != Some(super::firewall::Inbound::Allowed) && !super::firewall::add_rule_quietly(&exe) {
+        println!("Couldn't let the sign-in screen's Glass through Windows Firewall; viewers may not reach it.");
+    }
+    // The sign-in screen after a restart (signin.rs): this user's token and access rules.
+    match copy_signin_settings() {
+        Ok(()) => println!("Viewers can sign in to this computer after it restarts."),
+        Err(e) => println!("Not on the sign-in screen after a restart ({e:#})."),
+    }
     use windows::Win32::System::Services::{
         CreateServiceW, OpenSCManagerW, SC_MANAGER_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_ALL_ACCESS,
         SERVICE_ERROR_NORMAL, SERVICE_WIN32_OWN_PROCESS, StartServiceW,
@@ -162,6 +176,13 @@ fn protected_copy() -> Result<std::path::PathBuf> {
         for dll in std::fs::read_dir(src)?.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".dll")) {
             let _ = std::fs::copy(dll.path(), dir.join(dll.file_name()));
         }
+    }
+    // The web client, where the copy looks for it (<prefix>\share\glass\web, the prefix
+    // being Program Files\Glass): the sign-in host serves it.
+    if let Some(web) = exe.parent().and_then(|bin| bin.parent()).map(|p| p.join(r"share\glass\web")).filter(|d| d.is_dir()) {
+        let to = dir.parent().context("no Glass folder")?.join(r"share\glass\web");
+        let _ = std::fs::remove_dir_all(&to);
+        copy_all(&web, &to).with_context(|| format!("copy the web client to {}", to.display()))?;
     }
     Ok(dest)
 }
@@ -262,6 +283,14 @@ fn uninstall() -> Result<()> {
         anyhow::ensure!(deleted, "couldn't remove the service");
     }
     let _ = set_sas_policy(false);
+    let _ = std::fs::remove_dir_all(signin_dir());
+    // The copy's own rule (an MSI install's rule belongs to the MSI).
+    if super::agent::machine_dir().is_none()
+        && let Some(pf) = std::env::var_os("ProgramFiles")
+    {
+        super::firewall::remove_rule_quietly(&std::path::PathBuf::from(&pf).join(r"Glass\Service\glass.exe"));
+        let _ = std::fs::remove_dir_all(std::path::PathBuf::from(&pf).join(r"Glass\share"));
+    }
     println!("Removed the Glass secure-desktop service.");
     Ok(())
 }
@@ -445,6 +474,9 @@ fn keep_helper_alive(stop: HANDLE, wake: HANDLE, sas: HANDLE) {
     use windows::Win32::System::Threading::WaitForMultipleObjects;
     let mut child: Option<HANDLE> = None;
     let mut child_session = 0xFFFF_FFFFu32;
+    // The sign-in host (signin.rs), while nobody is signed in at the console.
+    let mut signin: Option<HANDLE> = None;
+    let mut signin_session = 0xFFFF_FFFFu32;
     loop {
         // SAFETY: plain query.
         let session = unsafe { WTSGetActiveConsoleSessionId() };
@@ -463,13 +495,36 @@ fn keep_helper_alive(stop: HANDLE, wake: HANDLE, sas: HANDLE) {
                 // Session changed: the old helper is in the wrong session; drop it.
                 terminate(h);
             }
-            match spawn_helper_in_session(session, sas) {
+            match spawn_in_session(session, super::secure::HELPER_ARG, &[], Some(sas)) {
                 Ok(h) => {
                     child = Some(h);
                     child_session = session;
                 }
                 Err(()) => {}
             }
+        }
+        // The sign-in host: up while the console session has nobody signed in (and the owner's
+        // settings were copied at install), gone the moment someone signs in, so their own
+        // host can start in its place.
+        if let Some(h) = signin
+            && !super::process_alive_handle(h)
+        {
+            // SAFETY: closing the exited child's handle.
+            unsafe { let _ = CloseHandle(h); }
+            signin = None;
+        }
+        let wanted = usable && signin_dir().join("token").exists() && !signed_in(session);
+        if wanted && (signin.is_none() || session != signin_session) {
+            if let Some(h) = signin.take() {
+                terminate(h);
+            }
+            let env = [("GLASS_CONFIG_DIR", signin_dir().display().to_string()), ("GLASS_NO_MENUBAR", "1".into())];
+            if let Ok(h) = spawn_in_session(session, crate::signin::ARG, &env, None) {
+                signin = Some(h);
+                signin_session = session;
+            }
+        } else if !wanted && let Some(h) = signin.take() {
+            terminate(h);
         }
         // Wake on stop, on a Ctrl+Alt+Del request, on the helper exiting, or every second
         // to re-check the session.
@@ -491,6 +546,65 @@ fn keep_helper_alive(stop: HANDLE, wake: HANDLE, sas: HANDLE) {
     if let Some(h) = child {
         terminate(h);
     }
+    if let Some(h) = signin {
+        terminate(h);
+    }
+}
+
+/// Whether someone is signed in to `session` (locked counts: their own host serves that).
+fn signed_in(session: u32) -> bool {
+    use windows::Win32::System::RemoteDesktop::{WTS_CURRENT_SERVER_HANDLE, WTSFreeMemory, WTSQuerySessionInformationW, WTSUserName};
+    // SAFETY: the buffer comes from WTS and is freed with WTSFreeMemory.
+    unsafe {
+        let mut name = PWSTR::null();
+        let mut bytes = 0u32;
+        if WTSQuerySessionInformationW(Some(WTS_CURRENT_SERVER_HANDLE), session, WTSUserName, &mut name, &mut bytes).is_err() {
+            return true; // can't tell: leave it to the user's host
+        }
+        let someone = !name.is_null() && !name.to_string().unwrap_or_default().is_empty();
+        WTSFreeMemory(name.0.cast());
+        someone
+    }
+}
+
+/// Where the sign-in host keeps its copy of the owner's settings: SYSTEM and
+/// administrators only.
+pub fn signin_dir() -> std::path::PathBuf {
+    let data = std::env::var_os("ProgramData").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\ProgramData".into());
+    data.join(r"Glass\signin")
+}
+
+/// Copies what the sign-in host needs of this user's settings (signin::FILES) to
+/// `signin_dir`, locked to SYSTEM and administrators. Run as administrator (install).
+fn copy_signin_settings() -> Result<()> {
+    let from = crate::config_dir();
+    anyhow::ensure!(from.join("token").exists(), "no token in {} yet: run glass setup first", from.display());
+    let to = signin_dir();
+    let _ = std::fs::remove_dir_all(&to);
+    std::fs::create_dir_all(&to).with_context(|| format!("create {}", to.display()))?;
+    // Only SYSTEM and administrators, before anything secret goes in (ProgramData lets
+    // every user read by default).
+    let mut icacls = std::process::Command::new("icacls");
+    icacls.arg(&to).args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"]);
+    super::no_window(&mut icacls);
+    let locked = icacls.stdout(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+    anyhow::ensure!(locked, "couldn't restrict {}", to.display());
+    for name in crate::signin::FILES {
+        copy_all(&from.join(name), &to.join(name))?;
+    }
+    Ok(())
+}
+
+fn copy_all(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for e in std::fs::read_dir(from)?.flatten() {
+            copy_all(&e.path(), &to.join(e.file_name()))?;
+        }
+    } else if from.is_file() {
+        std::fs::copy(from, to).with_context(|| format!("copy {}", from.display()))?;
+    }
+    Ok(())
 }
 
 fn terminate(child: HANDLE) {
@@ -505,7 +619,7 @@ fn terminate(child: HANDLE) {
 /// Launches the SYSTEM helper in `session` on the default desktop, by duplicating this
 /// service's own (LocalSystem) token and moving the copy into that session. Returns the
 /// new process's handle.
-fn spawn_helper_in_session(session: u32, sas: HANDLE) -> Result<HANDLE, ()> {
+fn spawn_in_session(session: u32, arg: &str, env_extra: &[(&str, String)], sas: Option<HANDLE>) -> Result<HANDLE, ()> {
     use windows::Win32::Security::{
         DuplicateTokenEx, SECURITY_IMPERSONATION_LEVEL, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_TYPE,
         TokenPrimary, TokenSessionId,
@@ -548,9 +662,31 @@ fn spawn_helper_in_session(session: u32, sas: HANDLE) -> Result<HANDLE, ()> {
         }
         let mut env = std::ptr::null_mut();
         let have_env = CreateEnvironmentBlock(&mut env, Some(dup), false).is_ok();
+        // SYSTEM's environment, plus `env_extra`: NAME=value strings, each NUL-ended, and
+        // one more NUL at the end.
+        let mut block: Vec<u16> = Vec::new();
+        if have_env {
+            let mut p = env as *const u16;
+            while *p != 0 {
+                let start = p;
+                while *p != 0 {
+                    p = p.add(1);
+                }
+                block.extend_from_slice(std::slice::from_raw_parts(start, p.offset_from(start) as usize + 1));
+                p = p.add(1);
+            }
+        }
+        for (k, v) in env_extra {
+            block.extend(format!("{k}={v}").encode_utf16().chain([0]));
+        }
+        block.push(0);
 
-        // The Ctrl+Alt+Del event's handle value, inherited by the helper.
-        let mut cmd: Vec<u16> = format!("\"{}\" {} {}", exe.display(), super::secure::HELPER_ARG, sas.0 as isize)
+        // The helper gets the Ctrl+Alt+Del event's handle value, inherited.
+        let line = match sas {
+            Some(sas) => format!("\"{}\" {arg} {}", exe.display(), sas.0 as isize),
+            None => format!("\"{}\" {arg}", exe.display()),
+        };
+        let mut cmd: Vec<u16> = line
             .encode_utf16()
             .chain([0])
             .collect();
@@ -568,9 +704,9 @@ fn spawn_helper_in_session(session: u32, sas: HANDLE) -> Result<HANDLE, ()> {
             Some(PWSTR(cmd.as_mut_ptr())),
             None,
             None,
-            true, // only the inheritable `sas` event goes along
+            sas.is_some(), // only the inheritable `sas` event goes along
             flags,
-            if have_env { Some(env) } else { None },
+            if have_env || !env_extra.is_empty() { Some(block.as_ptr().cast()) } else { None },
             None,
             &mut si,
             &mut pi,

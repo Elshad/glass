@@ -125,6 +125,20 @@ pub fn add_rule_quietly(exe: &Path) -> bool {
     cmd.status().is_ok_and(|s| s.success())
 }
 
+/// Removes Glass's rule for `exe` (as administrator).
+pub fn remove_rule_quietly(exe: &Path) -> bool {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("netsh");
+    cmd.raw_arg(format!(
+        "advfirewall firewall delete rule name=\"Glass\" program=\"{}\"",
+        crate::browse::shell_path(&exe.to_string_lossy())
+    ))
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    super::no_window(&mut cmd);
+    cmd.status().is_ok_and(|s| s.success())
+}
+
 /// Adds the rule as administrator: Windows shows its approval prompt once.
 pub fn add_rule_elevated(exe: &Path) -> bool {
     let script = format!(

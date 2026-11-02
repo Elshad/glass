@@ -43,6 +43,7 @@ mod push;
 mod recording;
 mod scim;
 mod settings;
+mod signin;
 mod sharp;
 mod terminal;
 mod wol;
@@ -137,8 +138,9 @@ struct Args {
     #[arg(long, requires = "cert")]
     key: Option<PathBuf>,
     /// Host the browser should connect WebTransport to, when it differs from the page's
-    /// host (e.g. page served through a tunnel, video direct over the LAN).
-    #[arg(long)]
+    /// host (e.g. page served through a tunnel, video direct over the LAN). GLASS_WT_HOST
+    /// sets it too, for a host started by the background service.
+    #[arg(long, env = "GLASS_WT_HOST")]
     wt_host: Option<String>,
     /// Test mode: a generated test pattern instead of screen capture, recorded input, an
     /// in-memory clipboard, no Tailscale, and /test/* hooks. Never touches the real desktop.
@@ -806,6 +808,16 @@ fn main() -> Result<()> {
             _ => {}
         }
     }
+    // Windows: the sign-in host (see signin.rs) is the host, minus its flag.
+    #[cfg(windows)]
+    let args = if std::env::args().nth(1).as_deref() == Some(signin::ARG) {
+        signin::enable();
+        platform::secure::mark_helper();
+        Args::parse_from(std::env::args().enumerate().filter(|(i, _)| *i != 1).map(|(_, a)| a))
+    } else {
+        Args::parse()
+    };
+    #[cfg(not(windows))]
     let args = Args::parse();
     // Quick support keeps everything in its own temporary config, chosen before anything
     // (or any thread) reads the environment.
@@ -863,7 +875,7 @@ fn main() -> Result<()> {
     // The host on Windows shows a notification-area icon (who's viewing) on its own thread.
     #[cfg(windows)]
     // (Quick support's host sets GLASS_NO_MENUBAR, as on a Mac: its window is the UI.)
-    if args.command.is_none() && !args.test && std::env::var_os("GLASS_NO_MENUBAR").is_none() {
+    if args.command.is_none() && !args.test && std::env::var_os("GLASS_NO_MENUBAR").is_none() && !signin::active() {
         platform::tray::start(rt.handle().clone());
     }
     rt.block_on(async_main(args))
@@ -1229,9 +1241,13 @@ async fn run_host(args: Args) -> Result<()> {
     // Windows: link to the SYSTEM secure-desktop helper if the service is installed, so
     // viewers can use the lock screen, answer UAC, control elevated windows and Ctrl+Alt+Del.
     // A no-op (degrading to today's behaviour) when it isn't.
+    // (The sign-in host is SYSTEM itself, on the sign-in screen: it needs no helper.)
     #[cfg(windows)]
-    if !args.test {
+    if !args.test && !signin::active() {
         platform::secure::start(frames.clone());
+    }
+    if signin::active() {
+        info!("sign-in host: the sign-in screen, until someone signs in (screen, keyboard and mouse only)");
     }
 
     let token = control::load_or_create_token(&args.token_file)?;
@@ -1349,7 +1365,9 @@ async fn run_host(args: Args) -> Result<()> {
                 }
             }
         };
-        clipboard::watch(events.clone());
+        if !signin::active() {
+            clipboard::watch(events.clone());
+        }
         let tailnet_owner = match tailscale::self_login().await {
             Ok(login) => {
                 info!("tailnet devices owned by {login} connect without a token");
@@ -1369,9 +1387,13 @@ async fn run_host(args: Args) -> Result<()> {
         )
     };
     status::set_capturing(true);
-    update::watch();
-    if let Err(e) = ipc::serve() {
-        tracing::warn!("CLI socket: {e:#}");
+    // The sign-in host neither updates itself nor takes CLI commands (the user's host,
+    // started at sign-in, does).
+    if !signin::active() {
+        update::watch();
+        if let Err(e) = ipc::serve() {
+            tracing::warn!("CLI socket: {e:#}");
+        }
     }
 
     let test_routes = args

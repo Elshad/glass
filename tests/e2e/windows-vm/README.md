@@ -36,6 +36,15 @@ The tests start the host themselves (hidden, in the desktop session, with `--wt-
 and tunnel its web server to localhost, so the page is a secure context. They turn off
 the Windows Firewall's public profile on the VM so WebTransport gets through.
 
+## Restarting (`restart.vm.mjs`)
+
+Restarts Glass, then the computer, from the viewer, and checks the same page comes back
+each time: through the sign-in screen (served by the sign-in host) to the desktop. It
+restarts the VM, so it only runs when asked: `GLASS_VM_REBOOT=1 npx playwright test -c windows-vm.config.mjs restart`.
+It needs the secure-desktop service, automatic sign-in off (Winlogon `AutoAdminLogon` 0),
+and `GLASS_WT_HOST` set machine-wide to the VM's address, since Windows starts the hosts.
+It types the password from `~/VMs/win11/credentials.txt` (`password: …`).
+
 ## Notes
 
 - Commands that need the desktop (the clipboard, windows, notifications) run there through

@@ -127,7 +127,8 @@ fn type_key(vk: u16, shift: bool, layout: HKL) {
     std::thread::sleep(MIN_HOLD);
     send(&[keyboard_input(vk, scan, KEYEVENTF_KEYUP)]);
     if shift {
-        settle();
+        // Held past the key, as for viewers' keys: let go at once, "#" came out "3".
+        std::thread::sleep(MODIFIER_TAIL);
         send(&[keyboard(shift_key, false)]);
     }
     settle();
@@ -583,6 +584,8 @@ fn send(inputs: &[INPUT]) {
     if inputs.is_empty() {
         return;
     }
+    // In the helper and the sign-in host (SYSTEM): onto whatever desktop takes input now.
+    super::secure::follow_input_desktop();
     // SAFETY: a slice of fully initialized INPUTs.
     let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
     if (sent as usize) < inputs.len() {

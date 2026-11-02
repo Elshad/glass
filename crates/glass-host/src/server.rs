@@ -88,11 +88,14 @@ pub async fn run(
     };
     info!("WebTransport listening on {wt_where} udp/{wt_port}");
     crate::remote::watch(wt_port, listen.wt_dial());
-    crate::fleet::watch();
-    // What the computer is playing, for viewers' media controls (while anyone is connected).
-    crate::now_playing::watch(shared.events.clone());
-    // A mic left on when the host last stopped left BlackHole as the default input.
-    crate::mic::recover();
+    // Fleet's scripts and the microphone belong to a signed-in user, not the sign-in screen.
+    if !crate::signin::active() {
+        crate::fleet::watch();
+        // What the computer is playing, for viewers' media controls (while anyone is connected).
+        crate::now_playing::watch(shared.events.clone());
+        // A mic left on when the host last stopped left BlackHole as the default input.
+        crate::mic::recover();
+    }
 
     let cert_hash = cert_hash.map(|h| serde_json::from_str::<Vec<u8>>(&h).unwrap());
     let version_dir = web_dir.clone();
@@ -118,18 +121,26 @@ pub async fn run(
     let machines_cache: MachinesCache = Arc::new(tokio::sync::Mutex::new(None));
     let manifest_cache = machines_cache.clone();
     let manifest_dir = web_dir.clone();
+    // The sign-in host (SYSTEM) serves the viewer and nothing else: forwarded ports, the
+    // admin console, single sign-on, agents and file links would all act as SYSTEM.
+    let extras = if crate::signin::active() {
+        axum::Router::new()
+    } else {
+        axum::Router::new()
+            .merge(crate::forward::routes())
+            .merge(crate::oidc::routes())
+            .merge(crate::admin::routes())
+            .merge(crate::ldap::routes())
+            .merge(crate::scim::routes())
+            .merge(crate::acl::routes())
+            .merge(crate::computer::routes())
+            .merge(crate::oauth::routes())
+            .merge(crate::push::routes())
+            .merge(crate::browse::routes())
+    };
     let app = axum::Router::new()
         .merge(extra_routes.unwrap_or_default())
-        .merge(crate::forward::routes())
-        .merge(crate::oidc::routes())
-        .merge(crate::admin::routes())
-        .merge(crate::ldap::routes())
-        .merge(crate::scim::routes())
-        .merge(crate::acl::routes())
-        .merge(crate::computer::routes())
-        .merge(crate::oauth::routes())
-        .merge(crate::push::routes())
-        .merge(crate::browse::routes())
+        .merge(extras)
         .route("/config.json", get(client_config))
         .route(
             "/manifest.webmanifest",
@@ -152,7 +163,9 @@ pub async fn run(
     // Agents from anywhere: only the OAuth and MCP routes, on this computer alone, for
     // Tailscale Funnel to publish (glass agents public on). This listener is loopback-only
     // and does not follow --bind.
-    crate::oauth::serve_public();
+    if !crate::signin::active() {
+        crate::oauth::serve_public();
+    }
     let web_port = http_listeners
         .first()
         .context("no web listener")?
@@ -688,6 +701,16 @@ async fn control(
     perms.files &= policy.allows("files");
     perms.clipboard &= policy.allows("clipboard");
     let terminal = crate::terminal::SUPPORTED && policy.allows("terminal");
+    // The sign-in host runs as SYSTEM: its owner-only features would be the whole computer.
+    // Everyone gets the screen and input there, and nothing else.
+    let signin = crate::signin::active();
+    let asked = !perms.owner;
+    if signin {
+        perms.owner = false;
+        perms.files = false;
+        perms.clipboard = false;
+    }
+    let terminal = terminal && !signin;
     let guest = !perms.owner;
     if matches!(auth, Auth::Tailnet)
         && let Some(name) = tailscale::device_name(peer).await
@@ -727,7 +750,8 @@ async fn control(
     // Ask before connecting: the person at the computer allows (or denies) this viewer.
     let settings = crate::settings::load();
     let scope_asks = matches!(&auth, Auth::Guest { scope, .. } if scope.ask);
-    if settings.ask_everyone || (guest && (settings.ask_guests || scope_asks)) {
+    // (Nobody is at the sign-in screen to ask.)
+    if !signin && (settings.ask_everyone || (asked && (settings.ask_guests || scope_asks))) {
         let msg = "Waiting for the person at this computer to let you in…".into();
         control::write_json(&mut send, &ServerMsg::Waiting { msg }).await?;
         let mut who = viewer.describe();

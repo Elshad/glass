@@ -450,6 +450,12 @@ fn inject_loop(rx: std::sync::mpsc::Receiver<InputCmd>) {
 /// put its capture threads on the input desktop — needed to duplicate the secure desktop.
 static IS_HELPER: AtomicBool = AtomicBool::new(false);
 
+/// This process captures and injects on the input desktop itself: the helper, or the
+/// sign-in host (signin.rs), both SYSTEM.
+pub fn mark_helper() {
+    IS_HELPER.store(true, Ordering::SeqCst);
+}
+
 /// Called by each capture thread (video.rs): in the helper, follow the input desktop so
 /// DXGI duplication can see the lock screen / UAC desktop; a no-op in the per-user host.
 pub fn follow_input_desktop() {

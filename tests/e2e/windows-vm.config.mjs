@@ -6,6 +6,8 @@ import { defineConfig } from '@playwright/test';
 export default defineConfig({
   testDir: './windows-vm',
   testMatch: '*.vm.mjs',
+  // restart.vm.mjs restarts the VM: only when asked (GLASS_VM_REBOOT=1).
+  testIgnore: process.env.GLASS_VM_REBOOT ? [] : ['**/restart.vm.mjs'],
   timeout: 120_000,
   // One computer, one desktop: the tests take turns.
   workers: 1,
