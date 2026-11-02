@@ -573,10 +573,15 @@ async fn control(
         && hello_ok
         // Over WebRTC the address is public, never a tailnet device's.
         && ctx.relayed.is_none()
-        && let Some(owner) = &shared.tailnet_owner
-        && tailscale::is_trusted(peer, owner).await
+        && let Some(login) = tailscale::identity(peer).await
     {
-        auth = Some(Auth::Tailnet);
+        if shared.tailnet_owner.as_deref() == Some(login.as_str()) {
+            auth = Some(Auth::Tailnet);
+        } else if let Some(scope) = tailnet_guest_scope(&login) {
+            // Someone else on the tailnet: the access rules name them, or the owner lets the
+            // whole tailnet in (tailnet-members).
+            auth = Some(Auth::TailnetGuest { login, scope });
+        }
     }
     // A policy can turn guest links (or, in its own host, quick support) off: new links and
     // devices already let in by one are refused.
@@ -694,7 +699,7 @@ async fn control(
         }
     }
     let mut perms = match &auth {
-        Auth::Guest { scope, .. } => control::Perms::guest(scope),
+        Auth::Guest { scope, .. } | Auth::TailnetGuest { scope, .. } => control::Perms::guest(scope),
         _ => control::Perms::owner(),
     };
     // Files and the clipboard can be off for everyone, by policy.
@@ -712,14 +717,14 @@ async fn control(
     }
     let terminal = terminal && !signin;
     let guest = !perms.owner;
-    if matches!(auth, Auth::Tailnet)
+    if matches!(auth, Auth::Tailnet | Auth::TailnetGuest { .. })
         && let Some(name) = tailscale::device_name(peer).await
     {
         device = format!("{name} ({device})");
     }
     let how = match &auth {
         Auth::Token => crate::viewers::How::Token,
-        Auth::Tailnet => crate::viewers::How::Tailnet,
+        Auth::Tailnet | Auth::TailnetGuest { .. } => crate::viewers::How::Tailnet,
         Auth::Guest { .. } => crate::viewers::How::Guest,
     };
     let session_id = crate::viewers::next_id();
@@ -733,6 +738,7 @@ async fn control(
     };
     let scope_detail = match &auth {
         Auth::Guest { scope, .. } => scope.describe(),
+        Auth::TailnetGuest { login, scope } => format!("{login}, {}", scope.describe()),
         _ => String::new(),
     };
 
@@ -749,7 +755,7 @@ async fn control(
 
     // Ask before connecting: the person at the computer allows (or denies) this viewer.
     let settings = crate::settings::load();
-    let scope_asks = matches!(&auth, Auth::Guest { scope, .. } if scope.ask);
+    let scope_asks = matches!(&auth, Auth::Guest { scope, .. } | Auth::TailnetGuest { scope, .. } if scope.ask);
     // (Nobody is at the sign-in screen to ask.)
     if !signin && (settings.ask_everyone || (asked && (settings.ask_guests || scope_asks))) {
         let msg = "Waiting for the person at this computer to let you in…".into();
@@ -777,6 +783,9 @@ async fn control(
     match &auth {
         Auth::Token => info!("{peer}: authenticated via token"),
         Auth::Tailnet => info!("{peer}: authenticated via tailnet identity"),
+        Auth::TailnetGuest { login, scope } => {
+            info!("{peer}: authenticated via tailnet identity {login}, a guest ({})", scope.describe())
+        }
         Auth::Guest {
             expires,
             new,
@@ -1835,6 +1844,11 @@ async fn set_layout(ctx: &SessionCtx, layout: Layout) -> Result<()> {
 enum Auth {
     Token,
     Tailnet,
+    /// Someone else's tailnet device, let in by the access rules or `tailnet-members`.
+    TailnetGuest {
+        login: String,
+        scope: crate::access::Scope,
+    },
     /// Via a magic link: `new` when the link was opened just now (the pass is sent back).
     Guest {
         pass: String,
@@ -1843,6 +1857,15 @@ enum Auth {
         scope: crate::access::Scope,
         passkey: Option<crate::access::Passkey>,
     },
+}
+
+/// What someone else on the tailnet (`login`) may do: the access rules' first match, else a
+/// guest's default if the owner lets the whole tailnet in; `None`: they need the token.
+fn tailnet_guest_scope(login: &str) -> Option<crate::access::Scope> {
+    if let Some((scope, _)) = crate::acl::decide(&crate::acl::effective(), login, &[]) {
+        return Some(scope);
+    }
+    crate::settings::load().tailnet_members.then(crate::access::Scope::default)
 }
 
 /// How often a guest session re-checks that its pass is still valid.

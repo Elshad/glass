@@ -1315,7 +1315,8 @@ async fn run_host(args: Args) -> Result<()> {
             video,
             Box::new(testmode::FakeInput),
             Arc::new(testmode::FakeClipboard),
-            None,
+            // Who owns the computer on Tailscale, when a test says (see tailscale::identity).
+            std::env::var("GLASS_TEST_TAILNET_OWNER").ok(),
             None,
         )
     } else {

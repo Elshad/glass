@@ -432,6 +432,8 @@ glass acl remove 0        # by position
 
 A rule matches an email, `@domain`, `group:name` or `*`, and takes the same limits as `glass link`. With no rules, nobody signs in with a directory account. Rules live in `~/.config/glass/acl.json`.
 
+**People on your tailnet.** The rules apply to Tailscale too: someone else on the computer's tailnet (a member you invited, or a device you shared it with) whose Tailscale login a rule names connects without the token, as a guest with that rule's limits. `glass config tailnet-members on` lets everyone on the tailnet in that way (off by default; on a company tailnet that's everyone in it). Devices tagged in Tailscale belong to no one and never count.
+
 **SCIM.** `glass config scim-token new` prints a token for SCIM 2.0 provisioning at `https://<computer>/scim/v2` (Okta, Entra ID). Users and groups stay in sync; deactivated users can't sign in and lose their sessions at once.
 
 **Device posture.** Checked on every connection:
@@ -570,7 +572,7 @@ Hyprland keeps its own Super shortcuts. In fullscreen (Ctrl+Shift+F), Chromium's
 
 - All traffic is encrypted (TLS 1.3 via QUIC/HTTPS).
 - With Tailscale, traffic stays on your private tailnet and goes directly between devices when possible.
-- Access control: a device is let in if Tailscale reports it belongs to the same user as the Mac, or if it presents the access token. Glass sends nothing to a session (video, audio, clipboard, input) until it is authenticated. Links, single sign-on, LDAP, access rules, posture checks and passkeys can narrow that further; see above.
+- Access control: a device is let in if Tailscale reports it belongs to the same user as the Mac, if it presents the access token, or (as a guest) if its Tailscale user is named by an access rule or `tailnet-members` is on. Glass sends nothing to a session (video, audio, clipboard, input) until it is authenticated. Links, single sign-on, LDAP, access rules, posture checks and passkeys can narrow that further; see above.
 - Glass runs as your user (a LaunchAgent on macOS, a systemd user service on Linux, a sign-in entry on Windows), never as root. On Windows you can opt into the Glass Secure Desktop service, whose SYSTEM helper only serves your own Glass (see [Windows host](#windows-host-preview)). The one exception you can opt into: **Stay awake with the lid closed** on a Mac installs a sudoers rule that lets it turn sleep off and on (`pmset -a disablesleep 0|1`), nothing else.
 - Keys pressed into a password field, or anywhere while a Linux session is locked, aren't shown to viewers or logged.
 - The file browser is for the computer's owner only (not links or guests), sees only the home folder (no `..`, no symlinks out), and moves to the Trash rather than deleting.

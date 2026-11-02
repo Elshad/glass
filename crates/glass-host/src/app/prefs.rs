@@ -126,6 +126,7 @@ impl GlassApp {
         let mut connections = vec![
             self.toggle("ask-guests", "Ask before guests connect", "Someone with a link waits until you allow them.", s.ask_guests, cx),
             self.toggle("ask-everyone", "Ask before anyone connects", "Your own devices too.", s.ask_everyone, cx),
+            self.toggle("tailnet-members", "Let everyone on this tailnet in", "Without the token, as guests. Otherwise only your own devices, and the people your access rules name.", s.tailnet_members, cx),
             self.toggle("privacy", "Privacy screen while viewed", "Blank this screen and block its keyboard and mouse.", s.privacy, cx),
             ui::row(
                 "Reach from anywhere",

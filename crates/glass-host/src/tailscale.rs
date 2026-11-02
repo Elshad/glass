@@ -252,19 +252,31 @@ fn is_tailscale_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// True if `peer` is a tailnet device owned by `owner`.
-pub async fn is_trusted(peer: IpAddr, owner: &str) -> bool {
+/// Who a tailnet device belongs to: its user's login name, or `None` for a device that
+/// isn't anyone's (tagged, e.g. a server), or one off the tailnet.
+pub async fn identity(peer: IpAddr) -> Option<String> {
+    // Tests: every viewer is this tailnet user (GLASS_TEST_TAILNET_LOGIN).
+    if crate::testmode::enabled() {
+        return std::env::var("GLASS_TEST_TAILNET_LOGIN").ok();
+    }
     let peer = peer.to_canonical();
     if !is_tailscale_ip(peer) {
-        return false;
+        return None;
     }
     match json(&["whois", "--json", &peer.to_string()]).await {
-        Ok(who) => who["UserProfile"]["LoginName"].as_str() == Some(owner),
+        Ok(who) => login_of(&who),
         Err(e) => {
             tracing::warn!("tailscale whois {peer}: {e:#}");
-            false
+            None
         }
     }
+}
+
+/// A whois answer's person: tagged devices have none ("tagged-devices").
+fn login_of(who: &Value) -> Option<String> {
+    let tagged = who["Node"]["Tags"].as_array().is_some_and(|t| !t.is_empty());
+    let login = who["UserProfile"]["LoginName"].as_str()?;
+    (!tagged && login != "tagged-devices" && !login.is_empty()).then(|| login.to_string())
 }
 
 /// What Tailscale knows about a tailnet peer, for device posture: `None` off the tailnet.
@@ -290,6 +302,15 @@ pub async fn device_name(peer: IpAddr) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_person_owns_a_device_a_tag_does_not() {
+        let who = |v: &str| login_of(&serde_json::from_str(v).unwrap());
+        assert_eq!(who(r#"{"UserProfile":{"LoginName":"ana@example.com"},"Node":{}}"#), Some("ana@example.com".into()));
+        assert_eq!(who(r#"{"UserProfile":{"LoginName":"ana@example.com"},"Node":{"Tags":["tag:server"]}}"#), None);
+        assert_eq!(who(r#"{"UserProfile":{"LoginName":"tagged-devices"},"Node":{}}"#), None);
+        assert_eq!(who(r#"{"Node":{}}"#), None);
+    }
 
     #[test]
     fn tailscale_ranges() {
