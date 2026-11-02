@@ -533,6 +533,33 @@ test.describe('clipboard and files', () => {
     expect((await host.input()).pastes).toBe(1);
   });
 
+  it('focuses the hidden key field while ⌘ is down, so Safari fires paste', async ({ page, host }) => {
+    await open(page, host);
+    await page.locator('#screens').click();
+    expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('keys');
+    await page.keyboard.down('Meta');
+    expect(await page.evaluate(() => document.activeElement?.id)).toBe('keys');
+    await page.keyboard.up('Meta');
+    expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('keys');
+  });
+
+  it('offers to send the clipboard on return where reading it needs a tap (Safari)', async ({ page, host }) => {
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: host.base });
+    await page.addInitScript(() => {
+      // Look like Safari: no userAgentData, so the clipboard can't be read without a tap.
+      Object.defineProperty(Navigator.prototype, 'userAgentData', { get: () => undefined });
+      localStorage.setItem('glass.clipboardSync', '1');
+    });
+    await open(page, host);
+    await page.evaluate(() => navigator.clipboard.writeText('copied on the iPad'));
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    const toast = page.locator('.toast', { hasText: 'Send it to the computer' });
+    await expect(toast).toHaveCount(1);
+    await toast.getByRole('button', { name: 'Send' }).click();
+    await expect.poll(() => host.get('/test/clipboard')).toBe('copied on the iPad');
+    expect((await host.input()).pastes).toBe(0);
+  });
+
   // A 1×1 PNG.
   const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 

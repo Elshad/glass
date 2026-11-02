@@ -359,7 +359,7 @@ More in the toolbar:
   - **Picture in picture:** the screen in a floating window while you do something else.
   - **Use all my screens:** with several monitors here and several displays there, one display on each (Chrome and Edge).
   - **Capture mouse:** for games and 3D apps, the pointer stays in the picture and sends relative motion; Esc releases it.
-  - **Sync clipboard:** switching back to Glass puts this device's clipboard on the computer (Chrome and Edge).
+  - **Sync clipboard:** switching back to Glass puts this device's clipboard on the computer. Chrome and Edge do it by themselves; Safari and Firefox show a Send button, then their own Paste button to confirm.
   - **Pause while away:** stops the video while this computer is locked or idle (Chrome and Edge).
   - **Install Glass:** its own window and icon. On a desktop, the toolbar moves into the title bar.
 

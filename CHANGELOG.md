@@ -2,6 +2,15 @@
 
 What changed in each release of Glass. `glass update` (or the Glass app) installs the newest; every build is on [GitHub Releases](https://github.com/Ntarasiuk/glass/releases).
 
+## 0.11.1
+
+November 2, 2026
+
+### Clipboard from iPad and iPhone
+
+- ⌘V on an iPad with a keyboard now pastes what's on the iPad, as it does elsewhere. Before, Safari didn't hand Glass the clipboard, and the Mac pasted whatever was already on its own.
+- Sync clipboard now works in Safari too (turn it on in the menu): when you come back to Glass after copying in another app, a Send button puts it on the Mac's clipboard. Safari asks you to tap Paste to confirm; Chrome and Edge still send it without asking.
+
 ## 0.11.0
 
 November 2, 2026
