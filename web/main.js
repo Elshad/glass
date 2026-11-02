@@ -680,6 +680,7 @@ const videoSizes = [];
 let status = 'connecting…';
 let codec = '';
 let statsCount = 0;
+let loggedPeak = 0; // the highest audioPeak since stats were last logged
 let targetMbps;
 let displays = [];
 // Ids of windows (not displays) this viewer has seen or picked, so a streamed window never
@@ -720,7 +721,12 @@ worker.onmessage = ({ data }) => {
     case 'stats':
       // Over RTP the worker sees no video; the connection's own stats describe it.
       if (rtpVideo) data = { ...data, ...rtpStats };
-      if (++statsCount % 5 === 0) log('info', 'stats', data);
+      // Logged every fifth: with the loudest sound since the last one logged.
+      loggedPeak = Math.max(loggedPeak, data.audioPeak ?? 0);
+      if (++statsCount % 5 === 0) {
+        log('info', 'stats', { ...data, audioPeak: loggedPeak });
+        loggedPeak = 0;
+      }
       if (data.fps > 0) hideStatus();
       renderHud(data);
       break;

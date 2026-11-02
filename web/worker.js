@@ -45,6 +45,7 @@ let audioPackets = 0;
 let audioLost = 0;
 let lastAudioSeq;
 let audioUnderruns = 0;
+let audioPeak = 0; // 0..32768, since the last stats
 let micOn = false;
 let micSeq = 0;
 let transport;
@@ -469,6 +470,12 @@ function onAudio(view, bytes) {
   audioPackets++;
   // Copy into a fresh, aligned buffer and hand it over without another copy.
   const pcm = bytes.slice(AUDIO_HEADER_LEN).buffer;
+  // The loudest sample since the last stats (silence still comes as packets).
+  const samples = new Int16Array(pcm);
+  for (let i = 0; i < samples.length; i++) {
+    const v = Math.abs(samples[i]);
+    if (v > audioPeak) audioPeak = v;
+  }
   audioPort.postMessage({ pcm, channels: view.getUint8(1) }, [pcm]);
 }
 
@@ -515,11 +522,13 @@ function reportStats() {
     audioPackets,
     audioLost,
     audioUnderruns,
+    audioPeak: audioPeak / 32768,
     lossless: stats.lossless,
     // Showing a lossless picture now (until the screen changes).
     holding: streams.some((v) => v?.holding),
   });
   audioPackets = 0;
   audioLost = 0;
+  audioPeak = 0;
   Object.assign(stats, { frames: 0, bytes: 0, latencySamples: 0, latencySum: 0, latencyMax: 0, dropped: 0, lossless: 0 });
 }

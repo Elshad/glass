@@ -62,6 +62,17 @@ const hostClipboard = () => desk('Get-Clipboard -Raw');
 const setDeviceClipboard = (text) => page.evaluate((t) => navigator.clipboard.writeText(t), text);
 const deviceClipboard = () => page.evaluate(() => navigator.clipboard.readText());
 
+/** micprobe.exe (./micprobe) on the computer: plays a tone into an output, records an input. */
+let probed = false;
+function micprobe() {
+  if (probed) return;
+  const crate = join(import.meta.dirname, 'micprobe');
+  const exe = join(crate, 'target/x86_64-pc-windows-gnu/release/micprobe.exe');
+  if (!existsSync(exe)) execFileSync('cargo', ['build', '--release', '--target', 'x86_64-pc-windows-gnu'], { cwd: crate, stdio: 'inherit' });
+  put(exe, `${WORK}\\micprobe.exe`);
+  probed = true;
+}
+
 /** A fresh Notepad, maximized and in front, with the keyboard in it. */
 async function notepad() {
   const file = `${WORK}\\vm-${Date.now()}.txt`;
@@ -244,6 +255,34 @@ test('turning sound on works, or says why there is none', async () => {
   await page.locator('#btn-audio').click();
 });
 
+test("the computer's sound reaches the viewer", async () => {
+  // What the host records: the default output (never Glass Microphone's feed).
+  const output = [...hostLog().matchAll(/audio: recording (.+?) \(\d+ Hz/g)].pop()?.[1];
+  test.skip(!output, 'the computer has no sound output');
+  micprobe();
+  // The page's stats, logged to the host every few seconds, since `since` (ms).
+  const stats = (since) =>
+    ps(`Get-Content "$env:LOCALAPPDATA\\Glass\\Logs\\client.log" -Tail 400`)
+      .split('\n')
+      .filter((l) => l.includes('"stats"') && Number(l.match(/"t":(\d+)/)?.[1] ?? 0) >= since);
+  // How loud the sound reaching the page was (0..1), per stats interval.
+  const packets = (lines) => lines.map((l) => Number(l.match(/"audioPeak":([\d.e-]+)/)?.[1] ?? 0));
+  await page.locator('#btn-audio').click();
+  // Nothing playing: nothing to send.
+  const quiet = Date.now();
+  await page.waitForTimeout(12_000);
+  const before = packets(stats(quiet));
+  // A tone into that output for 3 s ("(" matches any input; the recording isn't used).
+  const loud = Date.now();
+  desk(`${WORK}\\micprobe.exe "${output}" "("`, { timeout: 60 });
+  await page.waitForTimeout(6000);
+  await page.locator('#btn-audio').click();
+  const during = packets(stats(loud));
+  expect(Math.max(0, ...before), `peak level with nothing playing: ${before}`).toBeLessThan(0.01);
+  // micprobe's tone is at half scale.
+  expect(Math.max(0, ...during), `peak level with a tone playing: ${during}`).toBeGreaterThan(0.2);
+});
+
 test('a one-time link lets a guest in', async ({ browser }) => {
   const link = ps(`& "$env:LOCALAPPDATA\\Programs\\Glass\\bin\\glass.exe" link`).match(/#l=[0-9a-f]+/)?.[0];
   expect(link).toBeTruthy();
@@ -300,10 +339,7 @@ test("a viewer's microphone reaches apps as Glass Microphone", async () => {
   // Its endpoints' names: "Microphone (Glass Microphone)" and "Feed (Glass Microphone)"
   // (Windows can keep the names from an earlier build of the driver).
   test.skip(!/\(Glass Microphone\)/.test(ps("Get-PnpDevice -PresentOnly -Class AudioEndpoint | ForEach-Object FriendlyName")), 'Glass Microphone is not installed');
-  const crate = join(import.meta.dirname, 'micprobe');
-  const exe = join(crate, 'target/x86_64-pc-windows-gnu/release/micprobe.exe');
-  if (!existsSync(exe)) execFileSync('cargo', ['build', '--release', '--target', 'x86_64-pc-windows-gnu'], { cwd: crate, stdio: 'inherit' });
-  put(exe, `${WORK}\\micprobe.exe`);
+  micprobe();
   await page.locator('#btn-mic').click();
   await expect.poll(() => hostLog(), { timeout: 15_000 }).toMatch(/microphone: playing into .*\(Glass Microphone\)/);
   // The only input with that in its name is the microphone.

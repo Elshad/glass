@@ -222,6 +222,8 @@ fn capture(packets: &AudioPackets, packetizer: &mut Packetizer, failures: &mut u
     let mut silence = Vec::new();
     let mut checked = Instant::now();
     let mut heard = Instant::now();
+    // The loudest sample each second, at debug level: is anything being heard?
+    let mut peak = 0i16;
     loop {
         // Some Windows versions never signal loopback events either: the timeout keeps it
         // going.
@@ -245,6 +247,7 @@ fn capture(packets: &AudioPackets, packetizer: &mut Packetizer, failures: &mut u
                 unsafe { std::slice::from_raw_parts(data, len) }
             };
             converter.convert(bytes, &mut pcm);
+            peak = pcm.iter().fold(peak, |m, &v| m.max(v.saturating_abs()));
             // SAFETY: hands back the buffer from GetBuffer, no longer used.
             unsafe { reader.ReleaseBuffer(frames) }?;
             // A gap (nothing played): start afresh rather than glue on a stale bit.
@@ -260,6 +263,8 @@ fn capture(packets: &AudioPackets, packetizer: &mut Packetizer, failures: &mut u
         }
         if checked.elapsed() > Duration::from_secs(1) {
             checked = Instant::now();
+            tracing::debug!("audio: peak {:.3}", peak as f32 / i16::MAX as f32);
+            peak = 0;
             // SAFETY: a plain COM call on a live interface.
             let now = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.ok();
             if now.as_ref().and_then(device_id) != id {
