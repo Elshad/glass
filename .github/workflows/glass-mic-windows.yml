@@ -32,12 +32,20 @@ jobs:
       - uses: microsoft/setup-msbuild@v2
       - name: WDK
         run: |
-          $bin = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0'
-          if (-not (Test-Path "$bin\x86\Inf2Cat.exe")) { throw 'no WDK on this image' }
-          # The image's INF check looks for x86\InfVerif.dll below the x86 tools folder.
-          New-Item -ItemType Directory -Force "$bin\x86\x86" | Out-Null
-          Copy-Item "$bin\x86\InfVerif.dll" "$bin\x86\x86\" -Force
-          "BIN=$bin" >> $env:GITHUB_ENV
+          $kits = 'C:\Program Files (x86)\Windows Kits\10\bin'
+          $find = { param($name) Get-ChildItem $kits -Recurse -Filter $name -EA 0 | Where-Object { $_.FullName -match '\\x(86|64)\\' } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName }
+          $inf2cat = & $find 'Inf2Cat.exe'; $signtool = & $find 'signtool.exe'; $infverif = & $find 'InfVerif.dll'
+          "Inf2Cat: $inf2cat"; "signtool: $signtool"; "InfVerif: $infverif"
+          if (-not $inf2cat -or -not $signtool) { throw 'no WDK tools on this image' }
+          "INF2CAT=$inf2cat" >> $env:GITHUB_ENV
+          "SIGNTOOL=$signtool" >> $env:GITHUB_ENV
+          # The image's INF check looks for x86\InfVerif.dll below each x86 tools folder.
+          if ($infverif) {
+            Get-ChildItem $kits -Directory -Recurse -Filter x86 -EA 0 | ForEach-Object {
+              New-Item -ItemType Directory -Force "$($_.FullName)\x86" | Out-Null
+              Copy-Item $infverif "$($_.FullName)\x86\" -Force -EA 0
+            }
+          }
       # Signed below, with a test certificate. The API check can't run its Arm64 helper on
       # an x64 runner.
       - name: Build
@@ -49,12 +57,12 @@ jobs:
           Get-ChildItem $built
           Copy-Item "$built\glassmic.sys", "$built\glassmic.inf" $out
           $os = if ('${{ matrix.platform }}' -eq 'ARM64') { '10_RS3_ARM64' } else { '10_X64' }
-          & "$env:BIN\x86\Inf2Cat.exe" /driver:$out /os:$os /uselocaltime
+          & $env:INF2CAT /driver:$out /os:$os /uselocaltime
           if ($LASTEXITCODE -ne 0) { throw 'Inf2Cat failed' }
           # A throwaway test certificate: trusted only where its .cer is installed (the test VM).
           $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Glass Microphone (test)' -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(2)
           Export-Certificate -Cert $cert -FilePath "$out\glassmic-test.cer" | Out-Null
-          & "$env:BIN\x64\signtool.exe" sign /fd sha256 /sha1 $cert.Thumbprint /s My "$out\glassmic.sys" "$out\glassmic.cat"
+          & $env:SIGNTOOL sign /fd sha256 /sha1 $cert.Thumbprint /s My "$out\glassmic.sys" "$out\glassmic.cat"
           if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
           Get-ChildItem $out
       - uses: actions/upload-artifact@v4
