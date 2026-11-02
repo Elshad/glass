@@ -2,6 +2,7 @@
 
 import { Input, penFields } from './proto.js';
 import { MAC_KEYCODES, charToKey, KVK_SHIFT } from './keymap.js';
+import { log } from './log.js';
 
 const LONG_PRESS_MS = 500;
 const TAP_SLOP_PX = 10;
@@ -542,6 +543,14 @@ export function attachInput({
 
   const heldKeys = new Set();
   let pasteHandled = true;
+  // Safari fires `paste` only into a focused text field, so ⌘ going down focuses the hidden
+  // one until ⌘ is released: ⌘V then pastes this device's clipboard rather than the Mac's own.
+  let focusedForPaste = false;
+  function unfocusAfterPaste() {
+    if (!focusedForPaste) return;
+    focusedForPaste = false;
+    if (document.activeElement === keySink) keySink.blur();
+  }
   function releaseKeys(filter = () => true) {
     for (const keycode of heldKeys) {
       if (filter(keycode)) {
@@ -563,6 +572,10 @@ export function attachInput({
 
   window.addEventListener('keydown', (e) => {
     if (localField(e.target)) return;
+    if (e.metaKey && document.activeElement !== keySink) {
+      keySink.focus({ preventScroll: true });
+      focusedForPaste = document.activeElement === keySink;
+    }
     if (e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey && ['KeyF', 'KeyH'].includes(e.code)) {
       e.preventDefault();
       onLocalShortcut(e.code);
@@ -581,6 +594,7 @@ export function attachInput({
       pasteHandled = false;
       setTimeout(() => {
         if (pasteHandled) return;
+        log('info', 'paste: no paste event, sent ⌘V as a keystroke', { focused: document.activeElement === keySink });
         send(Input.KEY_DOWN, { keycode });
         send(Input.KEY_UP, { keycode });
       }, PASTE_FALLBACK_MS);
@@ -614,6 +628,7 @@ export function attachInput({
 
   window.addEventListener('keyup', (e) => {
     if (localField(e.target)) return;
+    if (!e.metaKey) unfocusAfterPaste();
     const code = codeOf(e);
     const keycode = MAC_KEYCODES[code];
     if (keycode === undefined) return;
@@ -632,6 +647,7 @@ export function attachInput({
   window.addEventListener('blur', () => {
     releaseKeys();
     remappedCtrl = undefined;
+    unfocusAfterPaste();
   });
 
   document.addEventListener('paste', (e) => {
@@ -643,6 +659,7 @@ export function attachInput({
     const html = data?.getData('text/html') || undefined;
     const image = [...(data?.files ?? [])].find((f) => f.type.startsWith('image/'));
     if (!text && !html && !image) return;
+    log('info', 'paste: sent this device\'s clipboard', { length: text.length, html: Boolean(html), image: image?.size });
     if (onPaste) onPaste({ text, html, image });
     else control({ t: 'clipboard', text, paste: true });
   });
