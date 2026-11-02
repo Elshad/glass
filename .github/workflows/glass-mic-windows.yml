@@ -32,19 +32,31 @@ jobs:
       - uses: microsoft/setup-msbuild@v2
       - name: WDK
         run: |
-          $kits = 'C:\Program Files (x86)\Windows Kits\10'
-          Get-ChildItem "$kits\Include" -Directory | Select-Object -ExpandProperty Name
-          if (-not (Get-ChildItem "$kits\Include\*\km" -EA 0)) { throw 'no WDK on this image' }
+          $bin = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0'
+          if (-not (Test-Path "$bin\x86\Inf2Cat.exe")) { throw 'no WDK on this image' }
+          # The image's INF check looks for x86\InfVerif.dll below the x86 tools folder.
+          New-Item -ItemType Directory -Force "$bin\x86\x86" | Out-Null
+          Copy-Item "$bin\x86\InfVerif.dll" "$bin\x86\x86\" -Force
+          "BIN=$bin" >> $env:GITHUB_ENV
+      # Signed below, with a test certificate. The API check can't run its Arm64 helper on
+      # an x64 runner.
       - name: Build
-        run: msbuild VirtualAudioDriver.sln /m /p:Configuration=Release /p:Platform=${{ matrix.platform }}
-      - name: Package
+        run: msbuild VirtualAudioDriver.sln /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:SignMode=Off /p:ApiValidator_Enable=false
+      - name: Package and test-sign
         run: |
           $out = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\glassmic"
-          Get-ChildItem -Recurse -Include glassmic.sys, glassmic.inf, glassmic.cat, *.cer |
-            Where-Object { $_.FullName -match '\\${{ matrix.platform }}\\Release\\' } |
-            ForEach-Object { Write-Host $_.FullName; Copy-Item $_.FullName $out -Force }
+          $built = "Source\Main\${{ matrix.platform }}\Release"
+          Get-ChildItem $built
+          Copy-Item "$built\glassmic.sys", "$built\glassmic.inf" $out
+          $os = if ('${{ matrix.platform }}' -eq 'ARM64') { '10_RS3_ARM64' } else { '10_X64' }
+          & "$env:BIN\x86\Inf2Cat.exe" /driver:$out /os:$os /uselocaltime
+          if ($LASTEXITCODE -ne 0) { throw 'Inf2Cat failed' }
+          # A throwaway test certificate: trusted only where its .cer is installed (the test VM).
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Glass Microphone (test)' -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(2)
+          Export-Certificate -Cert $cert -FilePath "$out\glassmic-test.cer" | Out-Null
+          & "$env:BIN\x64\signtool.exe" sign /fd sha256 /sha1 $cert.Thumbprint /s My "$out\glassmic.sys" "$out\glassmic.cat"
+          if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
           Get-ChildItem $out
-          if (-not (Test-Path "$out\glassmic.sys") -or -not (Test-Path "$out\glassmic.inf")) { throw 'no driver built' }
       - uses: actions/upload-artifact@v4
         with:
           name: glassmic-${{ matrix.platform }}
