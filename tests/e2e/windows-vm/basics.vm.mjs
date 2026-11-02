@@ -262,6 +262,39 @@ test('Ctrl+Alt+Del opens the secure screen (with the secure-desktop service)', a
   await page.waitForTimeout(2000);
 });
 
+test('an agent can type any text, through glass mcp', async () => {
+  await notepad();
+  // Agents wait while a person is using the computer: give them the keyboard.
+  await page.waitForTimeout(4000);
+  // Not real words: Notepad's autocorrect would "fix" them (Ünïcödé became Unicode).
+  const text = 'agent typed: Ü1ï2ö3é ✓ 日本 #42!';
+  const calls = [
+    { name: 'screenshot', arguments: {} },
+    { name: 'type_text', arguments: { text } },
+  ];
+  const out = desk(
+    `$p = New-Object System.Diagnostics.Process
+$p.StartInfo.FileName = "$env:LOCALAPPDATA\\Programs\\Glass\\bin\\glass.exe"
+$p.StartInfo.Arguments = 'mcp'
+$p.StartInfo.UseShellExecute = $false
+$p.StartInfo.RedirectStandardInput = $true
+$p.StartInfo.RedirectStandardOutput = $true
+$p.StartInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
+[void]$p.Start()
+$in = New-Object System.IO.StreamWriter($p.StandardInput.BaseStream, (New-Object System.Text.UTF8Encoding $false))
+function Ask($m) { $in.WriteLine($m); $in.Flush(); $line = $p.StandardOutput.ReadLine(); if ($line.Length -gt 300) { $line.Substring(0, 120) + '...' } else { $line } }
+Ask '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vm-test","version":"1"}}}'
+$in.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}'); $in.Flush()
+${calls.map((c, i) => `Ask '${JSON.stringify({ jsonrpc: '2.0', id: 10 + i, method: 'tools/call', params: c })}'`).join('\n')}
+$p.Kill()`,
+    { timeout: 90 },
+  );
+  expect(out).toContain('"id":11');
+  await page.keyboard.press('Control+KeyA');
+  await page.keyboard.press('Control+KeyC');
+  await expect.poll(hostClipboard, { timeout: 10_000 }).toBe(text);
+});
+
 test('policies turn features off', async () => {
   ps(`New-Item HKLM:\\SOFTWARE\\Policies\\Glass -Force | Out-Null; New-ItemProperty HKLM:\\SOFTWARE\\Policies\\Glass -Name FileTransfer -Value 0 -PropertyType DWord -Force | Out-Null`);
   try {
