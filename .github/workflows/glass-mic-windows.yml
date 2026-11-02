@@ -21,7 +21,8 @@ jobs:
       fail-fast: false
       matrix:
         platform: [x64, ARM64]
-    runs-on: windows-latest
+    # windows-2022 has the WDK (and its Visual Studio extension); windows-latest (2025) has not.
+    runs-on: windows-2022
     defaults:
       run:
         shell: pwsh
