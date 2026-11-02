@@ -2,7 +2,18 @@
 
 What changed in each release of Glass. `glass update` (or the Glass app) installs the newest; every build is on [GitHub Releases](https://github.com/Ntarasiuk/glass/releases).
 
-## Unreleased
+## 0.11.0
+
+November 2, 2026
+
+### Fit this device
+
+- Fitting now gives your iPad or iPhone its full resolution: a Retina display in its shape (3180×2320 on a 12.9" iPad, laid out like 1590×1160), so text is sharp and a normal size.
+- The fitted display stands in for the one you're watching: that monitor turns off while you're fitted, and the fitted display takes its place, menu bar and all. Before, the monitor mirrored it, which some monitors can't show (they lost the signal every few seconds and the screens flipped).
+- Your other displays stay where they are, and come back exactly as they were when you stop.
+- Turning your device resizes the fitted display to match, and windows that don't fit on it any more shrink and move onto it.
+- The pointer reaches the very top of the fitted display, so the menu bar can be clicked.
+- If Glass quits while fitted, macOS turns the monitor back on.
 
 ### Listen addresses
 

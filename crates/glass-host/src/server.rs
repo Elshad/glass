@@ -1414,6 +1414,48 @@ async fn fit(ctx: &SessionCtx, session: u64, size: Option<[u32; 2]>) -> Result<(
     let peer = ctx.conn.remote_address();
     // Put any current one back first (dropping it unmirrors and removes it).
     let old = FIT.lock().unwrap().take();
+    // The display to reshape: the one this fit replaces mirrored, else the one being
+    // watched (main when it's a window, every display, or a second display we added).
+    let target = match old.as_ref().and_then(|f| f._display.replaced()) {
+        Some(id) => Some(id),
+        None => {
+            let shared = ctx.shared.clone();
+            tokio::task::spawn_blocking(move || {
+                let streams = shared.video.streams();
+                let [watching] = streams.as_slice() else { return None };
+                let added = EXTENDED.lock().unwrap().iter().any(|(_, d)| d.id == watching.id);
+                let physical = shared.video.displays().is_ok_and(|ds| ds.iter().any(|d| d.id == watching.id));
+                (physical && !added).then_some(watching.id)
+            })
+            .await?
+        }
+    };
+    let size = size.map(|[w, h]| [w & !3, h & !3]); // even points
+    // A new size for the same viewer (it turned): resize the display it has, so the windows
+    // on it stay there.
+    let old = match (old, size) {
+        (Some(mut fit), Some([w, h])) => {
+            let (fit, resized) = tokio::task::spawn_blocking(move || {
+                let resized = fit._display.resize(w, h);
+                (fit, resized)
+            })
+            .await?;
+            match resized {
+                Ok(()) => {
+                    let id = fit._display.id;
+                    info!("{peer}: fit resized to {w}×{h} (virtual display {id})");
+                    *FIT.lock().unwrap() = Some(Fit { owner: session, _display: fit._display });
+                    fit_windows(id);
+                    return set_layout(ctx, Layout::Single(Some(id))).await;
+                }
+                Err(e) => {
+                    info!("{peer}: can't resize the fit in place ({e:#}); making a new one");
+                    Some(fit)
+                }
+            }
+        }
+        (old, _) => old,
+    };
     let had = old.is_some();
     if let Some(old) = old {
         tokio::task::spawn_blocking(move || drop(old)).await?;
@@ -1421,14 +1463,14 @@ async fn fit(ctx: &SessionCtx, session: u64, size: Option<[u32; 2]>) -> Result<(
     let Some([w, h]) = size else {
         if had {
             info!("{peer}: displays restored");
-            set_layout(ctx, Layout::Single(None)).await?;
+            set_layout(ctx, Layout::Single(target)).await?;
         }
         return Ok(());
     };
-    let (w, h) = (w & !1, h & !1);
     let created = tokio::task::spawn_blocking(move || {
-        let mut display = crate::platform::virtual_display::VirtualDisplay::create(w, h)?;
-        display.mirror_main()?;
+        // Retina: the viewer's pixels, at the size things look on it.
+        let mut display = crate::platform::virtual_display::VirtualDisplay::create_scaled(w, h, true)?;
+        display.replace(target.unwrap_or_else(|| objc2_core_graphics::CGMainDisplayID()))?;
         anyhow::Ok(display)
     })
     .await?;
@@ -1442,7 +1484,8 @@ async fn fit(ctx: &SessionCtx, session: u64, size: Option<[u32; 2]>) -> Result<(
         }
     };
     let id = display.id;
-    info!("{peer}: fitting the desktop to {w}×{h} (virtual display {id})");
+    let [vw, vh] = [display.width, display.height];
+    info!("{peer}: fitting the desktop to {vw}×{vh} for {w}×{h} (virtual display {id})");
     *FIT.lock().unwrap() = Some(Fit {
         owner: session,
         _display: display,
@@ -1458,8 +1501,33 @@ async fn fit(ctx: &SessionCtx, session: u64, size: Option<[u32; 2]>) -> Result<(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    fit_windows(id);
     set_layout(ctx, Layout::Single(Some(id))).await
 }
+
+/// Once a fitted display has its size: windows that don't fit on it any more shrink and
+/// move onto it (in the background; asking every app can take a moment).
+#[cfg(target_os = "macos")]
+fn fit_windows(id: u32) {
+    tokio::task::spawn_blocking(move || {
+        // macOS moves windows off a display that changed a moment after it does.
+        std::thread::sleep(Duration::from_millis(400));
+        let b = objc2_core_graphics::CGDisplayBounds(id);
+        let display = [b.origin.x, b.origin.y, b.size.width, b.size.height];
+        // The menu bar is on the main display.
+        let bar = if objc2_core_graphics::CGMainDisplayID() == id { MENU_BAR } else { 0.0 };
+        let area = [display[0], display[1] + bar, display[2], display[3] - bar];
+        let moved = crate::platform::ax::fit_windows(display, area);
+        if moved > 0 {
+            let [_, _, fw, fh] = area;
+            info!("fit: {moved} windows resized or moved to fit {fw}×{fh}");
+        }
+    });
+}
+
+/// The menu bar's height, in points.
+#[cfg(target_os = "macos")]
+const MENU_BAR: f64 = 25.0;
 
 #[cfg(not(target_os = "macos"))]
 async fn fit(ctx: &SessionCtx, _session: u64, size: Option<[u32; 2]>) -> Result<()> {

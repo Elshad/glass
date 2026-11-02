@@ -43,6 +43,7 @@ unsafe extern "C" {
     fn AXValueGetTypeID() -> usize;
     fn AXValueGetType(value: *const c_void) -> u32;
     fn AXValueGetValue(value: *const c_void, kind: u32, out: *mut c_void) -> u8;
+    fn AXValueCreate(kind: u32, value: *const c_void) -> *const c_void;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -209,6 +210,16 @@ impl Element {
         unsafe { AXUIElementPerformAction(self.0.ptr(), cf_ptr(&n)) }
     }
 
+    /// Sets a point or size attribute.
+    fn set_pair(&self, attribute: &str, kind: u32, a: f64, b: f64) -> AXError {
+        let p = Point { x: a, y: b };
+        // SAFETY: a CGPoint or CGSize (two f64s) for `kind`; the new AXValue is released here.
+        let Some(value) = Cf::owned(unsafe { AXValueCreate(kind, (&p as *const Point).cast()) }) else {
+            return AX_CANNOT_COMPLETE;
+        };
+        self.set(attribute, value.ptr())
+    }
+
     fn set(&self, attribute: &str, value: *const c_void) -> AXError {
         let n = name(attribute);
         // SAFETY: valid element, attribute name and CF value.
@@ -373,6 +384,55 @@ impl Walker {
     }
 }
 
+/// Shrinks and moves every window that sits on `display` (its center there) but doesn't
+/// fit inside `area` (the display less the menu bar), so nothing hangs off a display that
+/// just got smaller. Global points; returns how many windows changed.
+pub fn fit_windows(display: [f64; 4], area: [f64; 4]) -> usize {
+    let [dx, dy, dw, dh] = display;
+    let mut moved = 0;
+    for app in NSWorkspace::sharedWorkspace().runningApplications().iter() {
+        if app.activationPolicy() != objc2_app_kit::NSApplicationActivationPolicy::Regular {
+            continue;
+        }
+        let Some(root) = Cf::owned(unsafe { AXUIElementCreateApplication(app.processIdentifier()) }).map(Element::from) else {
+            continue;
+        };
+        let Ok(windows) = root.attr("AXWindows") else { continue };
+        for window in windows.items().into_iter().map(Element::from) {
+            let flag = |a: &str| window.attr(a).ok().and_then(|v| v.boolean()).unwrap_or(false);
+            if flag("AXMinimized") || flag("AXFullScreen") {
+                continue;
+            }
+            let pos = window.attr("AXPosition").ok().and_then(|p| p.pair(AX_POINT));
+            let size = window.attr("AXSize").ok().and_then(|p| p.pair(AX_SIZE));
+            let Some(((x, y), (w, h))) = pos.zip(size) else { continue };
+            let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+            if cx < dx || cy < dy || cx >= dx + dw || cy >= dy + dh {
+                continue;
+            }
+            let Some([fx, fy, fw, fh]) = fitted([x, y, w, h], area) else { continue };
+            if (fw, fh) != (w, h) {
+                window.set_pair("AXSize", AX_SIZE, fw, fh);
+            }
+            window.set_pair("AXPosition", AX_POINT, fx, fy);
+            moved += 1;
+        }
+    }
+    moved
+}
+
+/// Where a window at `frame` goes to fit inside `area`: no bigger than it, and moved in
+/// just enough. `None` when it already fits.
+fn fitted(frame: [f64; 4], area: [f64; 4]) -> Option<[f64; 4]> {
+    let [x, y, w, h] = frame;
+    let [ax, ay, aw, ah] = area;
+    let (fw, fh) = (w.min(aw), h.min(ah));
+    let fx = x.clamp(ax, ax + aw - fw);
+    let fy = y.clamp(ay, ay + ah - fh);
+    let out = [fx, fy, fw, fh];
+    (out != frame).then_some(out)
+}
+
 /// The app meant: by bundle id or name, or the one in front.
 pub fn find_app(query: Option<&str>) -> Result<Found, String> {
     let workspace = NSWorkspace::sharedWorkspace();
@@ -534,6 +594,17 @@ fn outcome(err: AXError) -> Outcome {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_shrink_and_move_inside() {
+        let area = [0.0, 25.0, 1590.0, 1135.0];
+        // Fits already: left alone.
+        assert_eq!(super::fitted([100.0, 100.0, 800.0, 600.0], area), None);
+        // Bigger than the display: as big as it, at its corner.
+        assert_eq!(super::fitted([0.0, 25.0, 2560.0, 1415.0], area), Some([0.0, 25.0, 1590.0, 1135.0]));
+        // Hanging off the right and bottom: moved in, same size.
+        assert_eq!(super::fitted([1200.0, 900.0, 800.0, 400.0], area), Some([790.0, 760.0, 800.0, 400.0]));
+    }
+
     use super::*;
 
     #[test]
