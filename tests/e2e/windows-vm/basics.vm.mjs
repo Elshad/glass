@@ -297,14 +297,17 @@ $p.Kill()`,
 });
 
 test("a viewer's microphone reaches apps as Glass Microphone", async () => {
-  test.skip(!/Microphone \(Glass Microphone\)/.test(ps("Get-PnpDevice -PresentOnly -Class AudioEndpoint | ForEach-Object FriendlyName")), 'Glass Microphone is not installed');
+  // Its endpoints' names: "Microphone (Glass Microphone)" and "Feed (Glass Microphone)"
+  // (Windows can keep the names from an earlier build of the driver).
+  test.skip(!/\(Glass Microphone\)/.test(ps("Get-PnpDevice -PresentOnly -Class AudioEndpoint | ForEach-Object FriendlyName")), 'Glass Microphone is not installed');
   const crate = join(import.meta.dirname, 'micprobe');
   const exe = join(crate, 'target/x86_64-pc-windows-gnu/release/micprobe.exe');
   if (!existsSync(exe)) execFileSync('cargo', ['build', '--release', '--target', 'x86_64-pc-windows-gnu'], { cwd: crate, stdio: 'inherit' });
   put(exe, `${WORK}\\micprobe.exe`);
   await page.locator('#btn-mic').click();
-  await expect.poll(() => hostLog(), { timeout: 15_000 }).toMatch(/microphone: playing into Feed \(Glass Microphone\)/);
-  const heard = desk(`${WORK}\\micprobe.exe - "Microphone (Glass Microphone)"`, { timeout: 60 });
+  await expect.poll(() => hostLog(), { timeout: 15_000 }).toMatch(/microphone: playing into .*\(Glass Microphone\)/);
+  // The only input with that in its name is the microphone.
+  const heard = desk(`${WORK}\\micprobe.exe - "(Glass Microphone)"`, { timeout: 60 });
   await page.locator('#btn-mic').click();
   const rms = Number(heard.match(/rms ([\d.]+)/)?.[1] ?? 0);
   expect(rms, heard).toBeGreaterThan(0.02);
