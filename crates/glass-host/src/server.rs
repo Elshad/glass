@@ -1,11 +1,12 @@
 //! WebTransport session handling plus the HTTP(S) server for the web client.
 
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use axum::Json;
 use axum::http::{HeaderValue, header};
 use axum::routing::{get, post};
@@ -16,6 +17,8 @@ use tokio::sync::{broadcast, mpsc};
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{info, warn};
+use wtransport::config::Ipv6DualStackConfig;
+use wtransport::endpoint::endpoint_side::Server;
 use wtransport::endpoint::IncomingSession;
 use wtransport::tls::Sha256DigestFmt;
 use wtransport::{Endpoint, Identity, RecvStream, SendStream, ServerConfig};
@@ -56,8 +59,9 @@ pub async fn run(
     web_dir: PathBuf,
     // The usual web port, where other machines' hosts are probed.
     http_port: u16,
-    http_listener: std::net::TcpListener,
-    https_listener: Option<std::net::TcpListener>,
+    http_listeners: Vec<std::net::TcpListener>,
+    https_listeners: Vec<std::net::TcpListener>,
+    listen: crate::listen::Listen,
     wt_port: u16,
     wt_host: Option<String>,
     tls: Option<TlsFiles>,
@@ -76,30 +80,14 @@ pub async fn run(
     });
 
     // The usual port, or the next free one: clients learn it from /config.json.
-    let mut bound = None;
-    for port in wt_port..wt_port.saturating_add(crate::PORT_TRIES) {
-        let config = ServerConfig::builder()
-            .with_bind_default(port)
-            .with_identity(identity.clone_identity())
-            .keep_alive_interval(Some(Duration::from_secs(2)))
-            .max_idle_timeout(Some(Duration::from_secs(10)))?
-            .build();
-        match Endpoint::server(config) {
-            Ok(endpoint) => {
-                bound = Some((endpoint, port));
-                break;
-            }
-            Err(e) => warn!("udp/{port} unavailable ({e}); trying the next port"),
-        }
-    }
-    let Some((endpoint, wt_port)) = bound else {
-        anyhow::bail!(
-            "UDP ports {wt_port}–{} are all in use; free one or pass --wt-port",
-            wt_port.saturating_add(crate::PORT_TRIES - 1)
-        );
+    // Every listen address shares that port. The default is one dual-stack socket.
+    let (endpoints, wt_port) = bind_wt(&identity, &listen, wt_port)?;
+    let wt_where = match &listen {
+        crate::listen::Listen::Default => "0.0.0.0 and [::]".to_string(),
+        other => crate::listen::describe(other),
     };
-    info!("WebTransport listening on udp/{wt_port}");
-    crate::remote::watch(wt_port);
+    info!("WebTransport listening on {wt_where} udp/{wt_port}");
+    crate::remote::watch(wt_port, listen.wt_dial());
     crate::fleet::watch();
     // What the computer is playing, for viewers' media controls (while anyone is connected).
     crate::now_playing::watch(shared.events.clone());
@@ -162,47 +150,34 @@ pub async fn run(
             HeaderValue::from_static("no-store"),
         ));
     // Agents from anywhere: only the OAuth and MCP routes, on this computer alone, for
-    // Tailscale Funnel to publish (glass agents public on).
+    // Tailscale Funnel to publish (glass agents public on). This listener is loopback-only
+    // and does not follow --bind.
     crate::oauth::serve_public();
-    let web_port = http_listener.local_addr()?.port();
-    http_listener.set_nonblocking(true)?;
-    tokio::spawn(async move {
-        let result = match tls {
-            Some(t) => {
-                let rustls =
-                    axum_server::tls_rustls::RustlsConfig::from_pem_file(&t.cert, &t.key).await?;
-                if let Some(listener) = https_listener {
-                    let port = listener.local_addr()?.port();
-                    listener.set_nonblocking(true)?;
-                    let server = axum_server::from_tcp_rustls(listener, rustls.clone())?;
-                    let app = app.clone();
-                    info!("web client at https://<host>/ (port {port})");
-                    tokio::spawn(async move {
-                        if let Err(e) = server.serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await {
-                            warn!("port {port}: {e}");
-                        }
-                    });
-                }
-                info!("web client at https://<host>:{web_port}");
-                axum_server::from_tcp_rustls(http_listener, rustls)?
-                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                    .await
-            }
-            None => {
-                info!("web client at http://localhost:{web_port}");
-                axum_server::from_tcp(http_listener)?
-                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                    .await
-            }
-        };
-        if let Err(e) = &result {
-            tracing::error!("web server stopped: {e}");
+    let web_port = http_listeners
+        .first()
+        .context("no web listener")?
+        .local_addr()?
+        .port();
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    if !https_listeners.is_empty() {
+        info!(
+            "web client at https://<host>/ (port {})",
+            https_listeners[0].local_addr()?.port()
+        );
+    }
+    info!("web client at {scheme}://<host>:{web_port}");
+    let rustls = match &tls {
+        Some(t) => {
+            Some(axum_server::tls_rustls::RustlsConfig::from_pem_file(&t.cert, &t.key).await?)
         }
-        anyhow::Ok(result?)
-    });
+        None => None,
+    };
+    spawn_web(https_listeners, app.clone(), rustls.clone());
+    spawn_web(http_listeners, app, rustls);
 
     loop {
-        let incoming = endpoint.accept().await;
+        let (incoming, _, _) =
+            futures_util::future::select_all(endpoints.iter().map(|ep| Box::pin(ep.accept()))).await;
         let shared = shared.clone();
         tokio::spawn(async move {
             if let Err(e) = session(incoming, shared).await {
@@ -210,6 +185,132 @@ pub async fn run(
             }
         });
     }
+}
+
+fn spawn_web(
+    listeners: Vec<std::net::TcpListener>,
+    app: axum::Router,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+) {
+    for listener in listeners {
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        if let Err(e) = listener.set_nonblocking(true) {
+            warn!("port {port}: {e}");
+            continue;
+        }
+        let app = app.clone();
+        let tls = tls.clone();
+        tokio::spawn(async move {
+            let result = serve_one(listener, app, tls).await;
+            if let Err(e) = result {
+                tracing::error!("web server on port {port} stopped: {e}");
+            }
+        });
+    }
+}
+
+async fn serve_one(
+    listener: std::net::TcpListener,
+    app: axum::Router,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+) -> Result<()> {
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+    match tls {
+        Some(cfg) => {
+            axum_server::from_tcp_rustls(listener, cfg)?
+                .serve(service)
+                .await?;
+        }
+        None => {
+            axum_server::from_tcp(listener)?.serve(service).await?;
+        }
+    }
+    Ok(())
+}
+
+enum WtBind {
+    Default,
+    Address(IpAddr),
+}
+
+enum WtBindError {
+    /// The address isn't assigned on this machine; another port won't help.
+    AddrNotAvailable(String),
+    /// Port taken, or another error worth trying the next port for.
+    Unavailable(std::io::Error),
+    Config(anyhow::Error),
+}
+
+fn bind_wt(
+    identity: &Identity,
+    listen: &crate::listen::Listen,
+    first_port: u16,
+) -> Result<(Vec<Endpoint<Server>>, u16)> {
+    let last = first_port.saturating_add(crate::PORT_TRIES - 1);
+    let mut last_err = None;
+    for port in first_port..=last {
+        match bind_wt_endpoints(identity, listen, port) {
+            Ok(endpoints) => return Ok((endpoints, port)),
+            Err(WtBindError::AddrNotAvailable(msg)) => anyhow::bail!("{msg}"),
+            Err(WtBindError::Config(err)) => return Err(err),
+            Err(WtBindError::Unavailable(err)) => {
+                warn!("udp/{port} unavailable ({err}); trying the next port");
+                last_err = Some(err);
+            }
+        }
+    }
+    let why = last_err.map(|e| format!(" ({e})")).unwrap_or_default();
+    anyhow::bail!("UDP ports {first_port}–{last} are all in use{why}; free one or pass --wt-port")
+}
+
+fn bind_wt_endpoints(
+    identity: &Identity,
+    listen: &crate::listen::Listen,
+    port: u16,
+) -> Result<Vec<Endpoint<Server>>, WtBindError> {
+    let specs: Vec<WtBind> = match listen {
+        crate::listen::Listen::Default => vec![WtBind::Default],
+        crate::listen::Listen::Explicit(ips) => ips.iter().copied().map(WtBind::Address).collect(),
+    };
+    let mut endpoints = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let config = wt_server_config(identity, port, &spec)?;
+        match Endpoint::server(config) {
+            Ok(endpoint) => endpoints.push(endpoint),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                return Err(WtBindError::AddrNotAvailable(format!(
+                    "can't listen on udp/{port} ({err}). Check --bind or `glass config bind`."
+                )));
+            }
+            Err(err) => return Err(WtBindError::Unavailable(err)),
+        }
+    }
+    Ok(endpoints)
+}
+
+fn wt_server_config(
+    identity: &Identity,
+    port: u16,
+    spec: &WtBind,
+) -> Result<ServerConfig, WtBindError> {
+    let builder = ServerConfig::builder();
+    let builder = match spec {
+        WtBind::Default => builder.with_bind_default(port),
+        WtBind::Address(IpAddr::V4(ip)) => {
+            builder.with_bind_address(SocketAddr::new(IpAddr::V4(*ip), port))
+        }
+        WtBind::Address(IpAddr::V6(ip)) => builder.with_bind_address_v6(
+            SocketAddrV6::new(*ip, port, 0, 0),
+            // IPv4 has its own socket when it's in the list. Dual-stack would take that port.
+            Ipv6DualStackConfig::Deny,
+        ),
+    };
+    let configured = builder
+        .with_identity(identity.clone_identity())
+        .keep_alive_interval(Some(Duration::from_secs(2)))
+        .max_idle_timeout(Some(Duration::from_secs(10)))
+        .map_err(|err| WtBindError::Config(anyhow::anyhow!("WebTransport idle timeout: {err:?}")))?;
+    Ok(configured.build())
 }
 
 async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
@@ -2098,4 +2199,29 @@ fn unix_now() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}.{:03}", d.as_secs(), d.subsec_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+
+    fn identity() -> Identity {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Identity::self_signed(["localhost"]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn webtransport_binds_the_chosen_address_and_skips_a_taken_port() {
+        let identity = identity();
+        let listen = crate::listen::Listen::Explicit(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        let hold = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let taken = hold.local_addr().unwrap().port();
+        let (endpoints, port) = bind_wt(&identity, &listen, taken).unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert!(port > taken && port < taken.saturating_add(crate::PORT_TRIES), "{port}");
+        assert_eq!(endpoints[0].local_addr().unwrap().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(endpoints[0].local_addr().unwrap().port(), port);
+    }
 }

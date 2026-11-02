@@ -37,6 +37,40 @@ async fn json(args: &[&str]) -> Result<Value> {
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 
+/// This machine's Tailscale addresses (`100.x.x.x` and the tailnet IPv6), for `--bind tailscale`.
+pub async fn self_ips() -> Result<Vec<IpAddr>> {
+    let status = json(&["status", "--json"]).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Tailscale isn't up, so there's no Tailscale address to listen on ({e:#}). Start it with `tailscale up`, or pass an IP address."
+        )
+    })?;
+    self_addresses(&status)
+}
+
+/// `TailscaleIPs` from `tailscale status --json`, when the backend is running.
+pub fn self_addresses(status: &Value) -> Result<Vec<IpAddr>> {
+    let state = status["BackendState"].as_str().unwrap_or("unknown");
+    if state != "Running" {
+        anyhow::bail!("Tailscale isn't up ({state}). Run `tailscale up`, or pass an IP address.");
+    }
+    let Some(list) = status["Self"]["TailscaleIPs"].as_array() else {
+        anyhow::bail!("Tailscale is running but reported no addresses.");
+    };
+    let mut ips = Vec::new();
+    for value in list {
+        let Some(text) = value.as_str() else { continue };
+        let Ok(ip) = text.parse() else { continue };
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    anyhow::ensure!(
+        !ips.is_empty(),
+        "Tailscale is running but reported no addresses."
+    );
+    Ok(ips)
+}
+
 /// The login name of the tailnet user this Mac is signed in as.
 pub async fn self_login() -> Result<String> {
     let status = json(&["status", "--json"]).await?;
@@ -271,6 +305,26 @@ mod tests {
                 .unwrap()
                 .to_canonical()
         ));
+    }
+
+    #[test]
+    fn reads_self_addresses() {
+        let status = serde_json::json!({
+            "BackendState": "Running",
+            "Self": { "TailscaleIPs": ["100.64.0.2", "fd7a:115c:a1e0::12", "100.64.0.2"] }
+        });
+        assert_eq!(
+            self_addresses(&status).unwrap(),
+            vec![
+                "100.64.0.2".parse::<IpAddr>().unwrap(),
+                "fd7a:115c:a1e0::12".parse().unwrap(),
+            ]
+        );
+        let logged_out = serde_json::json!({"BackendState": "NeedsLogin"});
+        let err = self_addresses(&logged_out).unwrap_err().to_string();
+        assert!(err.contains("NeedsLogin"), "{err}");
+        let empty = serde_json::json!({"BackendState": "Running", "Self": {"TailscaleIPs": []}});
+        assert!(self_addresses(&empty).is_err());
     }
 
     #[test]

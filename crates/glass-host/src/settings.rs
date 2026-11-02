@@ -28,6 +28,9 @@ pub struct Settings {
     /// Local ports on this computer (or reachable from it) a signed-in owner device may
     /// open through Glass, e.g. [3000, 8888]. Empty: port forwarding off.
     pub forward_ports: Vec<u16>,
+    /// Addresses to listen on (IPs, or `tailscale`). Empty: `0.0.0.0` for TCP, and
+    /// WebTransport's dual-stack default. Applied the next time the host starts.
+    pub bind: Vec<String>,
     /// Name shown in the viewer instead of the computer's (branding).
     pub name: Option<String>,
     /// Accent colour for the viewer, as #rrggbb (branding).
@@ -166,6 +169,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("lid-awake", "on/off: stay awake with the lid closed while on power (laptops; on a Mac, asks for your password once)"),
     ("agents", "on/off: AI agents on other devices may ask to use this computer (glass agents)"),
     ("forward-ports", "comma-separated ports owner devices may open, e.g. 3000,8888"),
+    (
+        "bind",
+        "listen addresses, comma-separated (or tailscale); default 0.0.0.0; on macOS, port 443 needs the default or 0.0.0.0; applies on restart",
+    ),
     ("name", "name shown in the viewer"),
     ("accent", "viewer accent colour, e.g. #ff8800"),
     ("relay", "self-hosted remote-access server, e.g. https://glass.example.com"),
@@ -250,6 +257,13 @@ impl Settings {
                 .map(|p| p.to_string())
                 .collect::<Vec<_>>()
                 .join(","),
+            "bind" => {
+                if self.bind.is_empty() {
+                    "0.0.0.0".into()
+                } else {
+                    self.bind.join(",")
+                }
+            }
             "name" => self.name.clone().unwrap_or_default(),
             "accent" => self.accent.clone().unwrap_or_default(),
             "relay" => self.relay.clone().unwrap_or_default(),
@@ -305,6 +319,15 @@ impl Settings {
                             .ok_or_else(|| anyhow::anyhow!("{p} isn't a port"))
                     })
                     .collect::<Result<_>>()?
+            }
+            "bind" => {
+                if value.is_empty() {
+                    self.bind.clear();
+                } else {
+                    let parsed = crate::listen::parse_bind([value])?;
+                    anyhow::ensure!(!parsed.is_empty(), "expected an IP address or tailscale");
+                    self.bind = parsed;
+                }
             }
             "name" => {
                 let name: String = value.chars().filter(|c| !c.is_control()).take(40).collect();
@@ -475,6 +498,14 @@ mod tests {
         assert!(s.set("nope", "on").is_err());
         s.set("name", "").unwrap();
         assert_eq!(s.name, None);
+        assert_eq!(s.get("bind").unwrap(), "0.0.0.0");
+        s.set("bind", "Tailscale, 127.0.0.1").unwrap();
+        assert_eq!(s.bind, vec!["tailscale".to_string(), "127.0.0.1".into()]);
+        assert_eq!(s.get("bind").unwrap(), "tailscale,127.0.0.1");
+        assert!(s.set("bind", "nope").is_err());
+        assert!(s.set("bind", "127.0.0.1:8080").is_err());
+        s.set("bind", "").unwrap();
+        assert!(s.bind.is_empty());
         // Unknown and missing fields are fine.
         let old: Settings = serde_json::from_str(r#"{"ask_guests":true,"future":1}"#).unwrap();
         assert!(old.ask_guests && !old.record);

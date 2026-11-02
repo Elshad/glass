@@ -486,7 +486,7 @@ glass uninstall     Stop the background service and remove it from login items
 glass --version
 ```
 
-Host options: `--http-port` (default 8080; if it's taken, the next free port up to 8099), `--https-port` (default 443: also serve there when free, so URLs need no port; 0 turns it off), `--wt-port` (UDP, default 4433; likewise moves to the next free port, which browsers learn automatically), `--fps` (default 60), `--mbps` (default 30), `--scale`, `--cert`/`--key` (custom TLS), `--token-file`, `--web-dir`, `--log-dir`.
+Host options: `--bind` (repeatable, or comma-separated) sets the address for the web ports and WebTransport together. The default is `0.0.0.0` (every IPv4 address; WebTransport also accepts IPv6, as before). `tailscale` listens on this machine's Tailscale addresses and fails if Tailscale isn't running. For example `--bind tailscale --bind 127.0.0.1`, or `--bind 127.0.0.1,100.64.0.2`. The same list is saved with `glass config bind` and applies the next time Glass starts; a `--bind` flag overrides it. On macOS, port 443 needs the default bind (or `0.0.0.0`): an unprivileged process can only bind a port below 1024 on the wildcard address, so a specific address falls back to the web port. `--http-port` (default 8080; if it's taken, the next free port up to 8099, on every chosen address), `--https-port` (default 443: also serve there when free, so URLs need no port; 0 turns it off), `--wt-port` (UDP, default 4433; likewise moves to the next free port, which browsers learn automatically), `--fps` (default 60), `--mbps` (default 30), `--scale`, `--cert`/`--key` (custom TLS), `--token-file`, `--web-dir`, `--log-dir`.
 
 Files:
 
@@ -521,7 +521,7 @@ The same one-liner installs Glass on Linux x86_64. The Linux host uses:
 - **Screen capture:** xdg-desktop-portal ScreenCast over PipeWire. On Hyprland (Omarchy), the share picker asks once which screen to share; Glass saves a restore token so it doesn't ask again.
 - **Encoding:** software H.264 (OpenH264, screen-content mode). Screens larger than 2560×1600 are halved before encoding, to keep the frame rate up. Hardware VA-API encoding is planned.
 - **Input:** a virtual keyboard and absolute pointer through `/dev/uinput`. `glass setup` installs a one-line udev rule (`/etc/udev/rules.d/60-glass-uinput.rules`) giving the logged-in user access; this needs `sudo` once.
-- **Address:** Linux only lets root listen on port 443, so `glass setup` runs `tailscale serve` to forward `https://<machine>.<tailnet>.ts.net/` to Glass. If that isn't possible, use the `:8080` address.
+- **Address:** Linux only lets root listen on port 443, so `glass setup` runs `tailscale serve` to forward `https://<machine>.<tailnet>.ts.net/` to Glass on localhost. If that isn't possible, use the `:8080` address. `--bind` / `glass config bind` chooses which addresses the ports use; include `127.0.0.1` when `tailscale serve` is what publishes port 443, because that forward targets localhost.
 - **Clipboard:** `wl-copy` / `wl-paste` (wl-clipboard).
 - **Audio:** the default output's monitor, through PipeWire. The viewer's microphone appears as a "Glass microphone" input while it's on.
 - **Controllers:** game controllers on the viewing device appear as a virtual Xbox 360 controller through `/dev/uinput`.

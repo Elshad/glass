@@ -17,6 +17,7 @@ const TEXT: &[&str] = &[
     "recordings-dir",
     "relay",
     "forward-ports",
+    "bind",
     "name",
     "accent",
     "oidc-issuer",
@@ -153,6 +154,12 @@ impl GlassApp {
             ),
             self.field("relay", "Your own relay", "A self-hosted server for reaching from anywhere.", cx),
             self.field("forward-ports", "Forwarded ports", "Local web apps your devices may open through Glass.", cx),
+            self.field(
+                "bind",
+                "Listen addresses",
+                "Where Glass accepts connections. Blank (shown as 0.0.0.0) is every IPv4 address. tailscale is this Mac's Tailscale addresses, or list them: 127.0.0.1, 100.64.0.2. On macOS, port 443 needs the default bind or 0.0.0.0. Restart to apply.",
+                cx,
+            ),
         ];
 
         // The same switches as on AI agents, here too so they're easy to find and turn off.
@@ -385,6 +392,7 @@ fn example(key: &str) -> String {
     match key {
         "relay" => "https://glass.example.com".into(),
         "forward-ports" => "3000, 8888".into(),
+        "bind" => "tailscale, 127.0.0.1".into(),
         "name" => "Studio Mac".into(),
         "accent" => "#5cb2ff".into(),
         "recordings-dir" => "~/Movies/Glass".into(),

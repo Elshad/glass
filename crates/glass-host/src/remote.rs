@@ -7,8 +7,9 @@
 //! answer it gives, so a browser knows it reached *this* host even if the introducer were
 //! compromised (the signature covers both sides' DTLS fingerprints).
 //!
-//! Each WebRTC peer is bridged to the ordinary WebTransport server over loopback, so
-//! sessions, sign-in and everything else work exactly as on the tailnet:
+//! Each WebRTC peer is bridged to the ordinary WebTransport server on a local address
+//! (loopback, unless `--bind` doesn't include it), so sessions, sign-in and everything
+//! else work exactly as on the tailnet:
 //! - data channel "d" (unordered, no retransmits) ⇄ datagrams
 //! - a channel per stream: "bi" ⇄ bidirectional stream, "uni" ⇄ unidirectional stream
 //!   (the host opens "uni" channels for streams it starts). A text message "end" finishes
@@ -391,7 +392,8 @@ pub fn state() -> &'static str {
 }
 
 /// Keeps a connection to the introducer while remote access is on.
-pub fn watch(wt_port: u16) {
+/// `dial` is the address of this host's WebTransport socket (loopback when it is bound there).
+pub fn watch(wt_port: u16, dial: IpAddr) {
     tokio::spawn(async move {
         let mut delay = Duration::from_secs(1);
         loop {
@@ -401,7 +403,7 @@ pub fn watch(wt_port: u16) {
                 continue;
             }
             set_state(1);
-            match signal(wt_port).await {
+            match signal(wt_port, dial).await {
                 Ok(()) => delay = Duration::from_secs(1),
                 Err(e) => {
                     set_state(1);
@@ -414,7 +416,7 @@ pub fn watch(wt_port: u16) {
     });
 }
 
-async fn signal(wt_port: u16) -> Result<()> {
+async fn signal(wt_port: u16, dial: IpAddr) -> Result<()> {
     let key = Arc::new(HostKey::load_or_create()?);
     let url = format!(
         "{}/signal/host/{}",
@@ -457,7 +459,7 @@ async fn signal(wt_port: u16) -> Result<()> {
                             candidate_summary(&sdp)
                         );
                         tokio::spawn(async move {
-                            let reply = match answer(&key, &sdp, ip, ice_servers, wt_port).await {
+                            let reply = match answer(&key, &sdp, ip, ice_servers, wt_port, dial).await {
                                 Ok((answer_sdp, sig)) => ToIntroducer::Answer { session, sdp: answer_sdp, sig },
                                 Err(e) => {
                                     warn!("remote peer: {e:#}");
@@ -588,6 +590,7 @@ async fn answer(
     remote_ip: Option<IpAddr>,
     ice_servers: Vec<IceServer>,
     wt_port: u16,
+    dial: IpAddr,
 ) -> Result<(String, String)> {
     let has_turn = !ice_servers.is_empty();
     let mut servers = vec![RTCIceServer {
@@ -676,7 +679,7 @@ async fn answer(
     let sig = key.sign(&signed_payload(offer_sdp, &answer_sdp))?;
 
     tokio::spawn(async move {
-        if let Err(e) = bridge(pc.clone(), channels, state, remote_ip, wt_port, video).await {
+        if let Err(e) = bridge(pc.clone(), channels, state, remote_ip, wt_port, dial, video).await {
             info!("remote peer ended: {e:#}");
         }
         let _ = pc.close().await;
@@ -690,6 +693,7 @@ async fn bridge(
     mut state: tokio::sync::watch::Receiver<RTCPeerConnectionState>,
     remote_ip: Option<IpAddr>,
     wt_port: u16,
+    dial: IpAddr,
     video: Option<(Vec<crate::rtp::VideoOut>, Arc<std::sync::atomic::AtomicU64>)>,
 ) -> Result<()> {
     // Wait for the browser to connect before opening the loopback session.
@@ -720,11 +724,15 @@ async fn bridge(
     let (bridge_id, viewer, _registration) = register_bridge();
     let rtp_video = video.is_some();
     let url = format!(
-        "https://127.0.0.1:{wt_port}/rtc?peer={peer}&b={bridge_id}{}&k={}",
+        "https://{}:{wt_port}/rtc?peer={peer}&b={bridge_id}{}&k={}",
+        crate::listen::host(dial),
         if rtp_video { "&video=rtp" } else { "" },
         bridge_secret()
     );
-    let conn = endpoint.connect(url).await.context("loopback session")?;
+    let conn = endpoint
+        .connect(url)
+        .await
+        .context("local WebTransport session")?;
     match video {
         // Video goes out as RTP; congestion control sets this viewer's bitrate cap.
         Some((outs, target)) => {
@@ -1021,7 +1029,14 @@ mod tests {
         assert_eq!(b64url(b"fo"), "Zm8");
         assert_eq!(b64url(b"foo"), "Zm9v");
         assert_eq!(b64url(&[0xfb, 0xff]), "-_8");
-        for bytes in [&b""[..], b"f", b"fo", b"foo", b"foob", &[0xfb, 0xff, 0x00, 0x10]] {
+        for bytes in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            &[0xfb, 0xff, 0x00, 0x10],
+        ] {
             assert_eq!(b64url_decode(&b64url(bytes)).as_deref(), Some(bytes));
         }
         assert_eq!(b64url_decode("Zm8=").as_deref(), Some(&b"fo"[..]));
