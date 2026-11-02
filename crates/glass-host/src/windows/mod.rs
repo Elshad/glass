@@ -10,6 +10,7 @@ pub mod firewall;
 pub mod front;
 pub mod input;
 pub mod keymap;
+pub mod micdriver;
 pub mod permissions;
 pub mod pipe;
 pub mod policy;

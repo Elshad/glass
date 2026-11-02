@@ -802,6 +802,7 @@ fn main() -> Result<()> {
         match argv.get(1).map(String::as_str) {
             Some(platform::service::SERVICE_ARG) => return platform::service::run_service(),
             Some(platform::secure::HELPER_ARG) => return platform::secure::run_helper(),
+            Some(platform::micdriver::ARG) => return platform::micdriver::cli(&argv[2..]),
             _ => {}
         }
     }

@@ -61,8 +61,8 @@ PCPIN_DESCRIPTOR MicArray1TopoMiniportPins[] =
         MicArray1TopoPinDataRangePointersBridge,                   // DataRanges
         KSPIN_DATAFLOW_IN,                            // DataFlow
         KSPIN_COMMUNICATION_NONE,                     // Communication
-        &KSNODETYPE_MICROPHONE_ARRAY,                 // Category
-        &MICARRAY1_CUSTOM_NAME,                       // Name
+        &KSNODETYPE_MICROPHONE,                       // Category: "Microphone (Glass Microphone)"
+        NULL,                                         // Name
         0                                             // Reserved
       }
     },

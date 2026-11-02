@@ -14,6 +14,10 @@ Abstract:
 #ifndef _VIRTUALAUDIODRIVER_SPEAKERTOPTABLE_H_
 #define _VIRTUALAUDIODRIVER_SPEAKERTOPTABLE_H_
 
+// The feed endpoint's name (MediaCategories, see glassmic.inx): {3248B947-60E5-465C-BDFF-1E89DA366D18}
+DEFINE_GUID(GLASSMIC_FEED_NAME,
+    0x3248b947, 0x60e5, 0x465c, 0xbd, 0xff, 0x1e, 0x89, 0xda, 0x36, 0x6d, 0x18);
+
 //=============================================================================
 static
 KSDATARANGE SpeakerTopoPinDataRangesBridge[] =
@@ -75,8 +79,8 @@ PCPIN_DESCRIPTOR SpeakerTopoMiniportPins[] =
       SpeakerTopoPinDataRangePointersBridge,            // DataRanges
       KSPIN_DATAFLOW_OUT,                               // DataFlow
       KSPIN_COMMUNICATION_NONE,                         // Communication
-      &KSNODETYPE_SPEAKER,                              // Category
-      NULL,                                             // Name
+      &KSNODETYPE_LINE_CONNECTOR,                       // Category: not chosen as the default output
+      &GLASSMIC_FEED_NAME,                              // Name: "Feed (Glass Microphone)", from the INF
       0                                                 // Reserved
     }
   }

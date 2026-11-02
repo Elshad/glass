@@ -57,6 +57,9 @@ HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
 
 HKR,Drivers\wave\wdmaud.drv,Description,,%VIRTUALAUDIODRIVER_SA.DeviceDesc%
 HKR,Drivers\mixer\wdmaud.drv,Description,,%VIRTUALAUDIODRIVER_SA.DeviceDesc%
+; The feed endpoint's name: "Feed (Glass Microphone)".
+HKLM,%MediaCategories%\%GlassMicFeedName.GUID%,Name,,%GlassMicFeedName%
+HKLM,%MediaCategories%\%GlassMicFeedName.GUID%,Display,1,00,00,00,00
 
 ;======================================================
 ; capture interfaces: mic array (internal: front)
@@ -164,6 +167,9 @@ KmdfLibraryVersion = $KMDFVERSION$
 
 ;Non-localizable
 
+MediaCategories="SYSTEM\CurrentControlSet\Control\MediaCategories"
+GlassMicFeedName.GUID="{3248B947-60E5-465C-BDFF-1E89DA366D18}"
+GlassMicFeedName="Feed"
 KSNAME_WaveSpeaker="WaveSpeaker"
 KSNAME_TopologySpeaker="TopologySpeaker"
 

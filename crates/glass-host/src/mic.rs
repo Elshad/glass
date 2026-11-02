@@ -323,6 +323,12 @@ impl Ring {
 /// first, then its A/B/C/D and Hi-Fi siblings, then Virtual Audio Cable's lines (whose two
 /// ends share a name). `wanted` (GLASS_MIC_DEVICE) picks another output by name.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+/// Glass Microphone's feed (our Windows driver): "Feed (Glass Microphone)", or "… (Glass
+/// Microphone)" from an older build of it.
+fn is_glass_feed(name: &str) -> bool {
+    name.ends_with("(Glass Microphone)") && !name.starts_with("Microphone")
+}
+
 fn pick_cable(outputs: &[String], wanted: Option<&str>) -> Option<(usize, String)> {
     let short = |name: &str| name.split(" (").next().unwrap_or(name).trim().to_string();
     let rank = |name: &str| -> Option<u8> {
@@ -330,7 +336,9 @@ fn pick_cable(outputs: &[String], wanted: Option<&str>) -> Option<(usize, String
             return name.contains(w).then_some(0);
         }
         let s = short(name);
-        if s == "CABLE Input" {
+        if is_glass_feed(name) {
+            Some(0)
+        } else if s == "CABLE Input" {
             Some(0)
         } else if s.ends_with("Input") && s.to_lowercase().contains("cable") {
             Some(1)
@@ -342,9 +350,13 @@ fn pick_cable(outputs: &[String], wanted: Option<&str>) -> Option<(usize, String
     };
     let (_, i) = outputs.iter().enumerate().filter_map(|(i, n)| Some((rank(n)?, i))).min()?;
     let name = &outputs[i];
-    let input = match short(name).strip_suffix("Input") {
-        Some(base) => format!("{base}Output"),
-        None => name.clone(),
+    let input = if is_glass_feed(name) {
+        "Microphone (Glass Microphone)".to_string()
+    } else {
+        match short(name).strip_suffix("Input") {
+            Some(base) => format!("{base}Output"),
+            None => name.clone(),
+        }
     };
     Some((i, input))
 }
@@ -731,6 +743,11 @@ mod win {
         let _ = ask;
         if let Some((_, input)) = device() {
             return Ok(format!("The microphone is ready: while a viewer's mic is on, apps here can pick \"{input}\"."));
+        }
+        // Glass Microphone, when this copy of Glass has its driver.
+        if let Some(inf) = crate::platform::micdriver::package() {
+            crate::platform::micdriver::elevated(&["install", &inf.display().to_string()])?;
+            return Ok("Installed Glass Microphone: while a viewer's mic is on, apps here can pick \"Microphone (Glass Microphone)\".".into());
         }
         match open_installer() {
             Ok(()) => Ok("VB-CABLE's installer is open on this computer: click Install Driver, then restart the computer when it asks. After that, turn on the mic in the viewer and pick \"CABLE Output\" as the microphone in your apps.".into()),
