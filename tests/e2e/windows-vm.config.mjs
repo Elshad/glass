@@ -15,8 +15,9 @@ export default defineConfig({
     channel: 'chrome',
     headless: true,
     viewport: { width: 1280, height: 900 },
-    permissions: ['clipboard-read', 'clipboard-write'],
-    launchOptions: { args: ['--autoplay-policy=no-user-gesture-required'] },
+    permissions: ['clipboard-read', 'clipboard-write', 'microphone'],
+    // A fake microphone (a tone) for the viewer's mic.
+    launchOptions: { args: ['--autoplay-policy=no-user-gesture-required', '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'] },
     trace: 'retain-on-failure',
   },
 });

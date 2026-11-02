@@ -325,7 +325,8 @@ impl Ring {
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 /// Glass Microphone's feed (our Windows driver): "Feed (Glass Microphone)", or "… (Glass
 /// Microphone)" from an older build of it.
-fn is_glass_feed(name: &str) -> bool {
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn is_glass_feed(name: &str) -> bool {
     name.ends_with("(Glass Microphone)") && !name.starts_with("Microphone")
 }
 
@@ -339,11 +340,11 @@ fn pick_cable(outputs: &[String], wanted: Option<&str>) -> Option<(usize, String
         if is_glass_feed(name) {
             Some(0)
         } else if s == "CABLE Input" {
-            Some(0)
-        } else if s.ends_with("Input") && s.to_lowercase().contains("cable") {
             Some(1)
-        } else if name.ends_with("(Virtual Audio Cable)") {
+        } else if s.ends_with("Input") && s.to_lowercase().contains("cable") {
             Some(2)
+        } else if name.ends_with("(Virtual Audio Cable)") {
+            Some(3)
         } else {
             None
         }
@@ -1084,6 +1085,9 @@ mod tests {
         assert_eq!(pick_cable(&names(&["Headphones (Input Devices Inc)"]), None), None);
         // GLASS_MIC_DEVICE picks by name.
         assert_eq!(pick_cable(&outputs, Some("CABLE-A")), Some((1, "CABLE-A Output".into())));
+        // Our own driver comes first.
+        let glass = names(&["Speakers (Realtek(R) Audio)", "CABLE Input (VB-Audio Virtual Cable)", "Feed (Glass Microphone)"]);
+        assert_eq!(pick_cable(&glass, None), Some((2, "Microphone (Glass Microphone)".into())));
     }
 
     #[test]

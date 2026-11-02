@@ -188,6 +188,9 @@ fn capture(packets: &AudioPackets, packetizer: &mut Packetizer, failures: &mut u
     let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.context("no sound output")?;
     let id = device_id(&device);
     let name = friendly_name(&device).unwrap_or_else(|| "the default output".into());
+    // Glass Microphone's feed carries viewers' own microphones: sent back, they'd hear
+    // themselves.
+    anyhow::ensure!(!crate::mic::is_glass_feed(&name), "no sound output (only Glass Microphone's feed)");
     let event = event()?;
     // Woken by the engine when it has audio; older Windows refuse that for loopback, and
     // then the wait below is just a 10 ms poll.

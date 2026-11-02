@@ -46,7 +46,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Feature | macOS | Linux | Windows | Notes |
 |---|---|---|---|---|
 | System audio | ✅ | ✅ PipeWire | 🧪 WASAPI loopback | The test VM has no sound device; the viewer says when a computer has no sound output |
-| Viewer's microphone | ✅ Glass Microphone driver | ✅ virtual source | 🧪 | Windows: through VB-CABLE if installed |
+| Viewer's microphone | ✅ Glass Microphone driver | ✅ virtual source | 🧪 Glass Microphone driver | Windows: works in the VM, test-signed (native/glass-mic-windows); needs Microsoft's signature to ship, VB-CABLE until then |
 | Now playing + media controls | ✅ | ✅ playerctl | 🧪 media session API | |
 | Clipboard text | ✅ | ✅ | ✅ | |
 | Clipboard rich text (HTML) | ✅ | ❌ | ✅ CF_HTML | |

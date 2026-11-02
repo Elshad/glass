@@ -2,7 +2,8 @@
 // One host and one page for the whole file; the tests run in order and each leaves the
 // desktop as the next expects (Notepad open and in front). See README.md.
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { crc32, deflateSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -79,7 +80,7 @@ Set-Content '${file}' '' -NoNewline; Start-Process notepad -ArgumentList '${file
 test.beforeAll(async ({ browser }) => {
   token = startHost();
   closeTunnel = await tunnel(PORT);
-  const context = await browser.newContext();
+  const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write', 'microphone'] });
   page = await context.newPage();
   page.on('dialog', (d) => d.accept());
   await open();
@@ -293,6 +294,20 @@ $p.Kill()`,
   await page.keyboard.press('Control+KeyA');
   await page.keyboard.press('Control+KeyC');
   await expect.poll(hostClipboard, { timeout: 10_000 }).toBe(text);
+});
+
+test("a viewer's microphone reaches apps as Glass Microphone", async () => {
+  test.skip(!/Microphone \(Glass Microphone\)/.test(ps("Get-PnpDevice -PresentOnly -Class AudioEndpoint | ForEach-Object FriendlyName")), 'Glass Microphone is not installed');
+  const crate = join(import.meta.dirname, 'micprobe');
+  const exe = join(crate, 'target/x86_64-pc-windows-gnu/release/micprobe.exe');
+  if (!existsSync(exe)) execFileSync('cargo', ['build', '--release', '--target', 'x86_64-pc-windows-gnu'], { cwd: crate, stdio: 'inherit' });
+  put(exe, `${WORK}\\micprobe.exe`);
+  await page.locator('#btn-mic').click();
+  await expect.poll(() => hostLog(), { timeout: 15_000 }).toMatch(/microphone: playing into Feed \(Glass Microphone\)/);
+  const heard = desk(`${WORK}\\micprobe.exe - "Microphone (Glass Microphone)"`, { timeout: 60 });
+  await page.locator('#btn-mic').click();
+  const rms = Number(heard.match(/rms ([\d.]+)/)?.[1] ?? 0);
+  expect(rms, heard).toBeGreaterThan(0.02);
 });
 
 test('policies turn features off', async () => {
