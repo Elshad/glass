@@ -68,17 +68,22 @@ jobs:
 
   linux:
     # PipeWire bindings need PipeWire ≥ 1.0 headers, so build on 24.04 (binary needs glibc ≥ 2.39:
-    # Arch/Omarchy, Fedora 40+, Ubuntu 24.04+).
-    runs-on: ubuntu-24.04
+    # Arch/Omarchy, Fedora 40+, Ubuntu 24.04+). Each architecture builds natively on its own runner.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev libclang-dev pkg-config nasm
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with: { shared-key: release-linux, save-if: "${{ github.ref == 'refs/heads/main' }}" }
+        with: { shared-key: 'release-linux-${{ matrix.arch }}', save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - run: scripts/package.sh linux
       - uses: actions/upload-artifact@v4
-        with: { name: dist-linux, path: dist/ }
+        with: { name: 'dist-linux-${{ matrix.arch }}', path: dist/ }
 
   publish:
     needs: [macos, linux]

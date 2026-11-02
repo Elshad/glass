@@ -4,7 +4,7 @@
 
 - Website: https://glassdesk.dev
 - Install (on the computer to be controlled): `curl -fsSL glassdesk.dev | sh`
-- Hosts: macOS 13+ (Apple Silicon and Intel), and Linux x86_64 on Wayland with glibc 2.39+ (beta; built for Hyprland/Omarchy, should work on GNOME and KDE; e.g. Arch, Fedora 40+, Ubuntu 24.04+).
+- Hosts: macOS 13+ (Apple Silicon and Intel), and Linux (x86_64 or ARM64) on Wayland with glibc 2.39+ (beta; built for Hyprland/Omarchy, should work on GNOME and KDE; e.g. Arch, Fedora 40+, Ubuntu 24.04+).
 - Viewers: any modern browser with WebTransport and WebCodecs: Safari 26.4+ (iPad, iPhone, Mac), Chrome, Chromium, Edge and Firefox, on any OS including Linux.
 - Price: free and open source (MIT): https://github.com/Ntarasiuk/glass
 
@@ -516,7 +516,7 @@ Files:
 
 ## Linux host (beta)
 
-The same one-liner installs Glass on Linux x86_64. The Linux host uses:
+The same one-liner installs Glass on Linux x86_64 and ARM64 (aarch64). The Linux host uses:
 
 - **Screen capture:** xdg-desktop-portal ScreenCast over PipeWire. On Hyprland (Omarchy), the share picker asks once which screen to share; Glass saves a restore token so it doesn't ask again.
 - **Encoding:** software H.264 (OpenH264, screen-content mode). Screens larger than 2560×1600 are halved before encoding, to keep the frame rate up. Hardware VA-API encoding is planned.
@@ -559,7 +559,7 @@ Hyprland keeps its own Super shortcuts. In fullscreen (Ctrl+Shift+F), Chromium's
 
 ## Requirements
 
-- Host: macOS 13 Ventura or newer (Apple Silicon or Intel), or Linux x86_64 with a Wayland compositor that supports the ScreenCast portal, plus PipeWire.
+- Host: macOS 13 Ventura or newer (Apple Silicon or Intel), or Linux (x86_64 or ARM64) with a Wayland compositor that supports the ScreenCast portal, plus PipeWire.
 - Viewer: a browser with WebTransport and WebCodecs, such as Safari 26.4+ on iPadOS/iOS/macOS, or current Chrome, Edge, or Firefox.
 - Remote access: Tailscale on both devices with HTTPS Certificates enabled for the tailnet (free plan works).
 

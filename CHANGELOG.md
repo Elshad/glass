@@ -2,6 +2,12 @@
 
 What changed in each release of Glass. `glass update` (or the Glass app) installs the newest; every build is on [GitHub Releases](https://github.com/Ntarasiuk/glass/releases).
 
+## Unreleased
+
+### Linux on ARM
+
+- Glass now runs on ARM64 Linux (aarch64) as well as x86_64, for example Raspberry Pi 5, Asahi Linux, and ARM laptops and cloud servers. The same one-liner installs it. Thanks [@Elshad](https://github.com/Elshad) for asking ([#101](https://github.com/Ntarasiuk/glass/issues/101)).
+
 ## 0.11.0
 
 November 2, 2026
