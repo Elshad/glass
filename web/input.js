@@ -592,6 +592,13 @@ export function attachInput({
     if (keycode === undefined) return;
 
     if (pasteHeld(e) && code === 'KeyV') {
+      // On Windows and Linux ⌘ is the Windows/Super key, and letting it go alone opens Start
+      // (or the launcher); the paste can get there after it does. A key that does nothing
+      // with it, pressed now, makes it not alone.
+      if (!macHost && e.metaKey) {
+        send(Input.KEY_DOWN, { keycode: MAC_KEYCODES.F20 });
+        send(Input.KEY_UP, { keycode: MAC_KEYCODES.F20 });
+      }
       // Let the browser fire `paste`; the host gets the text and presses Cmd+V itself, so
       // the Mac pastes what's on this device's clipboard. Without a focused text field some
       // browsers never fire it, so fall back to sending ⌘V as a plain keystroke.

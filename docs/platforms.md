@@ -22,7 +22,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Display previews, agent screenshots | ✅ | ✅ | 🧪 | |
 | Rotated displays | ✅ | ✅ (Hyprland) | 🧪 | Windows sends them unrotated today |
 | Displays plugged in later | ✅ | ❌ restart | 🧪 | |
-| Stream one window | ✅ | ❌ | 🧪 | |
+| Stream one window | ✅ | ❌ | ✅ | |
 | Device as an extra display | ✅ virtual display | ❌ | ❌ | Windows needs an IddCx driver |
 | Reshape the desktop to the viewer | ✅ | ❌ | ❌ | |
 
@@ -38,31 +38,31 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Use the lock screen / sign-in screen (while signed in) | ✅ | ? | ✅ SYSTEM helper | Windows: `glass service install` keeps a SYSTEM helper on the input desktop |
 | Control elevated windows, UAC prompts | — | — | ✅ SYSTEM helper | Same service; input passes UIPI through SYSTEM |
 | Send Ctrl+Alt+Del | — | — | ✅ SendSAS | Viewer's More menu. Needs the secure-desktop service (sets the SoftwareSASGeneration policy) |
-| Wake on LAN, restart Glass/computer | ✅ | ✅ | 🧪 | |
+| Wake on LAN, restart Glass/computer | ✅ | ✅ | 🧪 | Windows: restarting Glass works in the VM |
 | Stay awake with the lid closed | ✅ | ✅ | 🧪 power plan lid action | Windows: "Do nothing" on power while it's on, put back after |
 
 ## Sound, clipboard, files
 
 | Feature | macOS | Linux | Windows | Notes |
 |---|---|---|---|---|
-| System audio | ✅ | ✅ PipeWire | 🧪 WASAPI loopback | |
+| System audio | ✅ | ✅ PipeWire | 🧪 WASAPI loopback | The test VM has no sound device; the viewer says when a computer has no sound output |
 | Viewer's microphone | ✅ Glass Microphone driver | ✅ virtual source | 🧪 | Windows: through VB-CABLE if installed |
 | Now playing + media controls | ✅ | ✅ playerctl | 🧪 media session API | |
 | Clipboard text | ✅ | ✅ | ✅ | |
 | Clipboard rich text (HTML) | ✅ | ❌ | ✅ CF_HTML | |
-| Clipboard images | ✅ | ✅ | 🧪 PNG + bitmap | |
-| File transfer, folders | ✅ | ✅ | 🧪 | |
-| File browser | ✅ | ✅ | 🧪 | |
-| Move to Trash | ✅ | ✅ gio | 🧪 Recycle Bin | |
-| File previews | ✅ Quick Look | ❌ | 🧪 shell thumbnails | |
-| Pick files on the host | ✅ | ✅ portal | 🧪 Open dialog | |
+| Clipboard images | ✅ | ✅ | ✅ PNG + bitmap | |
+| File transfer, folders | ✅ | ✅ | ✅ | Windows: folders not yet tried |
+| File browser | ✅ | ✅ | ✅ | |
+| Move to Trash | ✅ | ✅ gio | ✅ Recycle Bin | |
+| File previews | ✅ Quick Look | ❌ | ✅ shell thumbnails | |
+| Pick files on the host | ✅ | ✅ portal | ✅ Open dialog | |
 
 ## People and agents
 
 | Feature | macOS | Linux | Windows | Notes |
 |---|---|---|---|---|
-| Chat, notifications, prompts | ✅ | ✅ | 🧪 toasts, message boxes | |
-| "Someone is viewing" notice | ✅ app | ✅ | 🧪 | |
+| Chat, notifications, prompts | ✅ | ✅ | ✅ toasts, message boxes | Windows: prompts not yet tried |
+| "Someone is viewing" notice | ✅ app | ✅ | ✅ | |
 | Drawings shown on the host | ✅ overlay | ❌ | ❌ | Windows could reuse the privacy overlay trick |
 | Privacy screen | ✅ | ❌ | ✅ capture-excluded overlay | |
 | Quick support (`glass support`, one-liner) | ✅ | ✅ | ✅ `irm glassdesk.dev/help \| iex` | Windows asks about the firewall once per session (Cancel is fine) |
@@ -78,10 +78,10 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Feature | macOS | Linux | Windows | Notes |
 |---|---|---|---|---|
 | One-line install | ✅ install.sh | ✅ install.sh | ✅ install.ps1 | `irm glassdesk.dev \| iex` |
-| Release builds | ✅ universal | ✅ x86_64 | 🧪 x64 + Arm64 zips and MSIs | |
+| Release builds | ✅ universal | ✅ x86_64 | ✅ x64 + Arm64 zips and MSIs | 0.11.0-windows.1 (pre-release); the Arm64 MSI ran in the VM |
 | Signed builds | ✅ stable identity | — | 🧪 Authenticode, timestamped | Windows: Azure Artifact Signing, a .pfx or SignPath (release.yml); unsigned until one is set up |
-| Managed deployment | ❌ | ❌ | 🧪 per-machine MSI, winget manifests | `msiexec /i glass-….msi /qn`; Program Files, starts for every user, firewall rule |
-| Admin policies (locked settings) | ❌ | ❌ | 🧪 Group Policy / Intune (ADMX) | HKLM/HKCU\SOFTWARE\Policies\Glass; packaging/windows/policies |
+| Managed deployment | ❌ | ❌ | ✅ per-machine MSI, 🧪 winget manifests | `msiexec /i glass-….msi /qn`; Program Files, starts for every user, firewall rule |
+| Admin policies (locked settings) | ❌ | ❌ | ✅ Group Policy / Intune (ADMX) | HKLM/HKCU\SOFTWARE\Policies\Glass; packaging/windows/policies |
 | Background service | ✅ LaunchAgent | ✅ systemd user | ✅ glassw at sign-in | |
 | Secure-desktop service (SYSTEM) | — | — | ✅ optional | `glass service install`; keeps a SYSTEM helper in the console session for the lock screen, UAC and Ctrl+Alt+Del. Host stays the only network/auth endpoint |
 | Self-update | ✅ | ✅ | ✅ | Windows MSI installs update with the MSI or winget; a policy can turn updates off |
@@ -92,4 +92,4 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Fleet reports | ✅ | ✅ | 🧪 | |
 | Fleet scripts | ✅ | ✅ | 🧪 .ps1/.cmd/.bat/.exe | |
 | Headless (no monitor) | — | 🚧 | ❌ | |
-| Recording to MP4, port forwarding, links, SSO/LDAP/SCIM, posture, relay, console | ✅ | ✅ | 🧪 | Platform-independent code |
+| Recording to MP4, port forwarding, links, SSO/LDAP/SCIM, posture, relay, console | ✅ | ✅ | 🧪 | Platform-independent code. Windows: recording and one-time links work in the VM |

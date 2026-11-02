@@ -18,6 +18,7 @@ const VK_VOLUME_UP: u16 = 0xAF;
 const VK_NUMLOCK: u16 = 0x90;
 
 pub const LEFT_CTRL: Key = Scan(0x1D, false);
+pub const RIGHT_CTRL: Key = Scan(0x1D, true);
 pub const V: Key = Scan(0x2F, false);
 pub const LEFT_WIN: Key = Scan(0x5B, true);
 pub const RIGHT_WIN: Key = Scan(0x5C, true);

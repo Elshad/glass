@@ -64,11 +64,21 @@ pub struct Injector {
     /// A paste lifted and restored the Windows key (⌘ from a Mac viewer): letting it go now,
     /// with nothing pressed in between, would open Start.
     mask_win: bool,
+    /// When the keys now down went down: each is held a few milliseconds before it's let go.
+    pressed: std::collections::HashMap<Key, std::time::Instant>,
+    /// When a key other than a modifier last went down or up.
+    last_key: Option<std::time::Instant>,
 }
 
 /// An unassigned virtual key, tapped so a Windows key let go doesn't open Start (as
 /// AutoHotkey does).
 const MASK: Key = Key::Vk(0xE8);
+
+/// The shortest a key is held down for.
+const MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// How long a modifier stays down after the last key pressed with it.
+const MODIFIER_TAIL: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// A synthetic pen device.
 #[derive(Clone, Copy)]
@@ -106,6 +116,8 @@ impl Injector {
             at: None,
             routing: false,
             mask_win: false,
+            pressed: std::collections::HashMap::new(),
+            last_key: None,
         };
         this.set_displays(&[display]);
         this
@@ -296,8 +308,10 @@ impl Injector {
             Ev::KeyDown { keycode } | Ev::KeyUp { keycode } => {
                 let down = matches!(ev, Ev::KeyDown { .. });
                 let Some(key) = keymap::to_key(keycode) else {
+                    tracing::debug!("input: no Windows key for {keycode:#x}");
                     return;
                 };
+                tracing::trace!("input: key {keycode:#x} {}", if down { "down" } else { "up" });
                 let win = key == LEFT_WIN || key == RIGHT_WIN;
                 if !down && win && std::mem::take(&mut self.mask_win) {
                     send(&[keyboard(MASK, true), keyboard(MASK, false)]);
@@ -306,8 +320,32 @@ impl Injector {
                 }
                 if down {
                     self.held.insert(key);
+                    self.pressed.insert(key, std::time::Instant::now());
                 } else {
                     self.held.remove(&key);
+                    // A press and release arriving together (bunched up on the network, or
+                    // from a script) can reach the app too fast to type: in the VM, Notepad
+                    // dropped about one key in ten let go within a millisecond.
+                    if let Some(at) = self.pressed.remove(&key) {
+                        let held = at.elapsed();
+                        if held < MIN_HOLD {
+                            std::thread::sleep(MIN_HOLD - held);
+                        }
+                    }
+                    // A modifier stays down a moment after the key it went with: an app
+                    // waking from idle can read the modifiers late, and Ctrl+A let go at
+                    // once typed "a" in Notepad.
+                    if is_modifier(key)
+                        && let Some(at) = self.last_key
+                    {
+                        let since = at.elapsed();
+                        if since < MODIFIER_TAIL {
+                            std::thread::sleep(MODIFIER_TAIL - since);
+                        }
+                    }
+                }
+                if !is_modifier(key) {
+                    self.last_key = Some(std::time::Instant::now());
                 }
                 send(&[keyboard(key, down)]);
                 if is_modifier(key) {
@@ -320,17 +358,27 @@ impl Injector {
     /// Pastes with Ctrl+V. The client triggers this from ⌘V, which arrives here as the
     /// Windows key, so that's lifted for the paste and restored after.
     pub fn paste(&mut self) {
+        tracing::trace!("input: paste (Ctrl+V)");
         let wins: Vec<Key> = [LEFT_WIN, RIGHT_WIN].into_iter().filter(|k| self.held.contains(k)).collect();
         if !wins.is_empty() {
             send(&[keyboard(MASK, true), keyboard(MASK, false)]);
             self.mask_win = true;
         }
         send(&wins.iter().map(|&k| keyboard(k, false)).collect::<Vec<_>>());
-        send(&[keyboard(LEFT_CTRL, true)]);
-        settle();
-        send(&[keyboard(V, true), keyboard(V, false)]);
-        settle();
-        send(&[keyboard(LEFT_CTRL, false)]);
+        // A Ctrl the viewer is holding (Ctrl+V from a PC) stays down: letting it go here
+        // would make the next key typed with it plain.
+        let ctrl_held = self.held.contains(&LEFT_CTRL) || self.held.contains(&keymap::RIGHT_CTRL);
+        if !ctrl_held {
+            send(&[keyboard(LEFT_CTRL, true)]);
+            settle();
+        }
+        send(&[keyboard(V, true)]);
+        std::thread::sleep(MIN_HOLD);
+        send(&[keyboard(V, false)]);
+        if !ctrl_held {
+            std::thread::sleep(MODIFIER_TAIL);
+            send(&[keyboard(LEFT_CTRL, false)]);
+        }
         send(&wins.iter().map(|&k| keyboard(k, true)).collect::<Vec<_>>());
     }
 

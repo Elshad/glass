@@ -468,7 +468,9 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     // task holds the connection, and with it this viewer's place in the list.
     conn.close(0u32.into(), b"session ended");
 
-    if authed.load(Ordering::Relaxed) {
+    // Anything still held, when no one else is giving input: another viewer may be holding
+    // Shift right now (each input stream lets go of its own keys when it ends).
+    if authed.load(Ordering::Relaxed) && INPUT_STREAMS.load(Ordering::Relaxed) == 0 {
         shared.injector.lock().unwrap().release_all();
         crate::gamepad::release_all();
     }
@@ -1849,6 +1851,9 @@ fn record_auth_failure(shared: &Shared, peer: std::net::IpAddr) {
 
 const AUTH_WAIT: Duration = Duration::from_secs(10);
 
+/// Input streams open right now, across viewers.
+static INPUT_STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
     let mut tag = [0u8; 1];
     stream.read_exact(&mut tag).await?;
@@ -1870,8 +1875,12 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
     match tag[0] {
         STREAM_INPUT => {
             info!("{}: input stream open", ctx.conn.remote_address());
+            INPUT_STREAMS.fetch_add(1, Ordering::Relaxed);
             let mut buf = [0u8; INPUT_EVENT_LEN];
             let mut events = 0u64;
+            // What this viewer is holding down, to let go of when it leaves.
+            let mut keys = std::collections::HashSet::new();
+            let mut buttons = std::collections::HashSet::new();
             while stream.read_exact(&mut buf).await.is_ok() {
                 // A view-only link's input is read and dropped.
                 if !perms.input {
@@ -1886,12 +1895,29 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
                         if matches!(ev, InputEvent::MouseDown { .. } | InputEvent::KeyDown { .. } | InputEvent::Scroll { .. }) {
                             crate::computer::human_input();
                         }
+                        match ev {
+                            InputEvent::KeyDown { keycode } => _ = keys.insert(keycode),
+                            InputEvent::KeyUp { keycode } => _ = keys.remove(&keycode),
+                            InputEvent::MouseDown { button } => _ = buttons.insert(button),
+                            InputEvent::MouseUp { button } => _ = buttons.remove(&button),
+                            _ => {}
+                        }
                         ctx.shared.injector.lock().unwrap().handle(ev)
                     }
                     None => continue,
                 }
                 events += 1;
             }
+            {
+                let mut injector = ctx.shared.injector.lock().unwrap();
+                for keycode in keys {
+                    injector.handle(InputEvent::KeyUp { keycode });
+                }
+                for button in buttons {
+                    injector.handle(InputEvent::MouseUp { button });
+                }
+            }
+            INPUT_STREAMS.fetch_sub(1, Ordering::Relaxed);
             info!(
                 "{}: input stream closed after {events} events",
                 ctx.conn.remote_address()
