@@ -130,7 +130,7 @@ const hasReleases = existsSync(join(SITE, 'public/releases/glass-latest-darwin-u
 test('release downloads are served with checksums and counted', { skip: !hasReleases && 'no release built (scripts/package.sh)' }, async () => {
   const before = await statsFor();
   const count = (s, kind) => s.downloads.find((d) => d.kind === kind)?.total ?? 0;
-  for (const platform of ['darwin-universal', 'linux-x86_64']) {
+  for (const platform of ['darwin-universal', 'linux-x86_64', 'linux-aarch64']) {
     const res = await get(`/releases/glass-latest-${platform}.tar.gz`);
     assert.equal(res.status, 200, platform);
     const sum = await (await get(`/releases/glass-latest-${platform}.tar.gz.sha256`)).text();
@@ -139,7 +139,7 @@ test('release downloads are served with checksums and counted', { skip: !hasRele
   await get('/install.sh');
   await new Promise((r) => setTimeout(r, 300));
   const after = await statsFor();
-  assert.equal(count(after, 'release') - count(before, 'release'), 2);
+  assert.equal(count(after, 'release') - count(before, 'release'), 3);
   assert.ok(count(after, 'script') > count(before, 'script'));
 });
 

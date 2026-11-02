@@ -473,7 +473,7 @@ cpSync('../web', 'public/app', { recursive: true });
 // serve an older build than version.json announces (hosts would offer the update forever).
 mkdirSync('public/releases', { recursive: true });
 const dist = '../dist';
-const PLATFORMS = ['darwin-universal', 'linux-x86_64'];
+const PLATFORMS = ['darwin-universal', 'linux-x86_64', 'linux-aarch64'];
 const missing = () => PLATFORMS.some((p) => !existsSync(`${dist}/glass-${version}-${p}.tar.gz`));
 if (missing()) {
   try {

@@ -5,7 +5,7 @@ description: Install, set up, check or troubleshoot Glass (glassdesk.dev), a low
 
 # Glass: set up any machine on the tailnet
 
-Glass streams a computer's screen to a browser and takes mouse, keyboard and touch input back. The host runs on macOS 13+ and on Linux x86_64 (Wayland). Every machine with Glass on the user's tailnet shows up in the client's **Machines** menu, so setting up one more machine is all it takes to control it from anywhere.
+Glass streams a computer's screen to a browser and takes mouse, keyboard and touch input back. The host runs on macOS 13+ and on Linux x86_64 or ARM64 (Wayland). Every machine with Glass on the user's tailnet shows up in the client's **Machines** menu, so setting up one more machine is all it takes to control it from anywhere.
 
 You can do almost everything remotely. Two steps need a person at the target's screen (macOS permission switches, or the Linux share picker); your job is to do the rest and tell the user exactly what to click.
 

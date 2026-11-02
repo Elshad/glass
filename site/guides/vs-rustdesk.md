@@ -16,7 +16,7 @@ order: 12
 |---|---|---|
 | License | MIT | AGPL-3.0 (Server Pro is commercial) |
 | Price | Free | Free; paid self-hosted plans from $11.88/month (billed yearly) |
-| Computers you control | macOS 13+, Linux x86_64 on Wayland (beta) | Windows, macOS, Linux |
+| Computers you control | macOS 13+, Linux (x86_64 or ARM64) on Wayland (beta) | Windows, macOS, Linux |
 | Wayland | Any compositor with the ScreenCast portal (Hyprland, GNOME, KDE, wlroots) | Experimental; no Wayland login screen |
 | What you control it from | Any modern browser, no install | RustDesk apps; a limited web client |
 | Account | None | Self-hosted: none. Public server: the controlling side signs in with Google or GitHub (since July 2026) |
