@@ -1,0 +1,50 @@
+# Glass Microphone for Windows (native/glass-mic-windows): the kernel driver, built for x64
+# and Arm64 with the WDK on GitHub's Windows image and test-signed (WDK test certificate,
+# included). Test-signed drivers load only with test signing on (bcdedit /set testsigning
+# on); releases need Microsoft's signature (see native/glass-mic-windows/README.md).
+name: Glass Microphone (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'native/glass-mic-windows/**'
+      - '.github/workflows/glass-mic-windows.yml'
+  pull_request:
+    paths:
+      - 'native/glass-mic-windows/**'
+      - '.github/workflows/glass-mic-windows.yml'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, ARM64]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: native/glass-mic-windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: WDK
+        run: |
+          $kits = 'C:\Program Files (x86)\Windows Kits\10'
+          Get-ChildItem "$kits\Include" -Directory | Select-Object -ExpandProperty Name
+          if (-not (Get-ChildItem "$kits\Include\*\km" -EA 0)) { throw 'no WDK on this image' }
+      - name: Build
+        run: msbuild VirtualAudioDriver.sln /m /p:Configuration=Release /p:Platform=${{ matrix.platform }}
+      - name: Package
+        run: |
+          $out = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\glassmic"
+          Get-ChildItem -Recurse -Include glassmic.sys, glassmic.inf, glassmic.cat, *.cer |
+            Where-Object { $_.FullName -match '\\${{ matrix.platform }}\\Release\\' } |
+            ForEach-Object { Write-Host $_.FullName; Copy-Item $_.FullName $out -Force }
+          Get-ChildItem $out
+          if (-not (Test-Path "$out\glassmic.sys") -or -not (Test-Path "$out\glassmic.inf")) { throw 'no driver built' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glassmic-${{ matrix.platform }}
+          path: ${{ runner.temp }}/glassmic/
