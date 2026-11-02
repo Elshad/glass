@@ -5,7 +5,7 @@ What each host OS can do, to track what's done and what's left. Viewer-side feat
 
 ✅ works · 🧪 built, not yet run on real hardware · 🚧 being built · ❌ not yet · ? unverified · — doesn't apply
 
-Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Windows 11 Arm VM (UTM, no GPU, Glass as x64 under emulation), driven from a browser.
+Windows is in a stack of PRs (#75 onwards) and GitHub pre-releases (0.11.0-windows.*); a ✅ there means it ran in a Windows 11 Arm VM (UTM, no GPU), driven from a browser: the published x64 (under emulation) and Arm64 builds pass the VM suite (tests/e2e/windows-vm, 18 tests). Nothing has run on a real PC yet.
 
 ## Picture
 
@@ -19,7 +19,8 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | HEVC, sharp text 4:2:2 | ✅ | ❌ | ❌ | |
 | Lossless 4:4:4 still picture | ✅ | ✅ | 🧪 | |
 | Display P3 | ✅ | — | ❌ | |
-| Display previews, agent screenshots | ✅ | ✅ | 🧪 | |
+| Agent screenshots | ✅ | ✅ | ✅ | |
+| Display previews | ✅ | ✅ | 🧪 | Windows: the test VM has one display |
 | Rotated displays | ✅ | ✅ (Hyprland) | 🧪 | Windows sends them unrotated today |
 | Displays plugged in later | ✅ | ❌ restart | 🧪 | |
 | Stream one window | ✅ | ❌ | ✅ | |
@@ -32,7 +33,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 |---|---|---|---|---|
 | Mouse, keyboard, scroll | ✅ CGEvent | ✅ uinput | ✅ SendInput | Windows: keys by scan code |
 | Relative mouse (games) | ✅ | ✅ | 🧪 | |
-| Type any text (agents) | ✅ | ❌ | 🧪 Unicode key events | |
+| Type any text (agents) | ✅ | ❌ | ✅ layout keys, Unicode for the rest | Accents, symbols, CJK |
 | Pen pressure and tilt | ✅ | ❌ | 🧪 synthetic pen | |
 | Game controllers | ❌ | ✅ uinput | 🧪 ViGEmBus | Windows: a virtual Xbox 360 controller when ViGEmBus is installed |
 | Use the lock screen / sign-in screen (while signed in) | ✅ | ? | ✅ SYSTEM helper | Windows: `glass service install` keeps a SYSTEM helper on the input desktop |
@@ -45,8 +46,8 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 
 | Feature | macOS | Linux | Windows | Notes |
 |---|---|---|---|---|
-| System audio | ✅ | ✅ PipeWire | 🧪 WASAPI loopback | The test VM has no sound device; the viewer says when a computer has no sound output |
-| Viewer's microphone | ✅ Glass Microphone driver | ✅ virtual source | 🧪 Glass Microphone driver | Windows: works in the VM, test-signed (native/glass-mic-windows); needs Microsoft's signature to ship, VB-CABLE until then |
+| System audio | ✅ | ✅ PipeWire | ✅ WASAPI loopback | Windows: checked by level, with VB-CABLE as the VM's output; the viewer says when a computer has no sound output |
+| Viewer's microphone | ✅ Glass Microphone driver | ✅ virtual source | ✅ Glass Microphone driver, 🧪 VB-CABLE | Windows: our driver works in the VM, test-signed (native/glass-mic-windows), but needs Microsoft's signature to ship; releases use VB-CABLE until then |
 | Now playing + media controls | ✅ | ✅ playerctl | 🧪 media session API | |
 | Clipboard text | ✅ | ✅ | ✅ | |
 | Clipboard rich text (HTML) | ✅ | ❌ | ✅ CF_HTML | |
@@ -78,7 +79,7 @@ Windows is in a stack of PRs (#75 onwards); a ✅ there means it ran in a Window
 | Feature | macOS | Linux | Windows | Notes |
 |---|---|---|---|---|
 | One-line install | ✅ install.sh | ✅ install.sh | ✅ install.ps1 | `irm glassdesk.dev \| iex` |
-| Release builds | ✅ universal | ✅ x86_64 | ✅ x64 + Arm64 zips and MSIs | 0.11.0-windows.1 (pre-release); the Arm64 MSI ran in the VM |
+| Release builds | ✅ universal | ✅ x86_64 | ✅ x64 + Arm64 zips and MSIs | 0.11.0-windows.3 (pre-release): both pass the VM suite as published |
 | Signed builds | ✅ stable identity | — | 🧪 Authenticode, timestamped | Windows: Azure Artifact Signing, a .pfx or SignPath (release.yml); unsigned until one is set up |
 | Managed deployment | ❌ | ❌ | ✅ per-machine MSI, 🧪 winget manifests | `msiexec /i glass-….msi /qn`; Program Files, starts for every user, firewall rule |
 | Admin policies (locked settings) | ❌ | ❌ | ✅ Group Policy / Intune (ADMX) | HKLM/HKCU\SOFTWARE\Policies\Glass; packaging/windows/policies |
