@@ -2,6 +2,8 @@
 <html lang="en">
 <head>
   <!-- Google tag (gtag.js) -->
+  <!-- Windows visitors see the PowerShell commands (or whichever the switch last chose), before first paint. -->
+  <script>try{var o=localStorage.getItem('glass-os');if(o?o==='win':/Windows/.test(navigator.userAgent))document.documentElement.classList.add('os-win')}catch(e){}</script>
   <script async src="https://www.googletagmanager.com/gtag/js?id=G-LCYDPMQMLD"></script>
   <script>
     window.dataLayer = window.dataLayer || [];
@@ -166,11 +168,15 @@
         <video class="mark" src="/mark.mp4" width="240" height="216" muted playsinline preload="auto" aria-label="Glass"></video>
         <h1>Your computer, in any browser.</h1>
         <p class="lede">Glass is a free, open-source remote desktop for Mac, Linux and Windows: control your computer from an iPad, phone or laptop browser with about 20&nbsp;ms of delay. Nothing to install on the device in your hands.</p>
-        <div class="command lg-glass-surface" data-lg-preset="control" data-copy="curl -fsSL glassdesk.dev | sh">
+        <div class="command lg-glass-surface only-unix" data-lg-preset="control" data-copy="curl -fsSL glassdesk.dev | sh">
           <code><span class="prompt" aria-hidden="true">$</span> curl -fsSL glassdesk.dev | sh</code>
           <button type="button" class="copy">Copy</button>
         </div>
-        <p class="hint">Run it on the computer you want to control. macOS 13+, Linux or Windows (beta; in PowerShell: <code>irm glassdesk.dev/install.ps1 | iex</code>). Free and <a href="https://github.com/Ntarasiuk/glass">open source</a>.</p>
+        <div class="command lg-glass-surface only-win" data-lg-preset="control" data-copy="irm glassdesk.dev | iex">
+          <code><span class="prompt" aria-hidden="true">&gt;</span> irm glassdesk.dev | iex</code>
+          <button type="button" class="copy">Copy</button>
+        </div>
+        <p class="hint"><span class="only-unix">In Terminal on the computer you want to control: macOS 13+ or Linux.</span><span class="only-win">In PowerShell on the computer you want to control: Windows 10 or 11 (beta).</span> <button type="button" class="os-switch"><span class="only-unix">On Windows?</span><span class="only-win">On a Mac or Linux?</span></button> Free and <a href="https://github.com/Ntarasiuk/glass">open source</a>.</p>
         <ul class="works" aria-label="Works with">
           <li class="lg-glass-surface" data-lg-preset="control"><span>Works with</span><!-- Apple logo: Simple Icons (CC0). --><svg class="apple" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/></svg><b>macOS</b></li>
           <!-- Omarchy wordmark: logo.svg from github.com/basecamp/omarchy (MIT), recoloured to currentColor. -->
@@ -240,7 +246,8 @@
             <svg class="ico" viewBox="0 0 224 90" aria-hidden="true"><use class="dg" href="#g-monitor" x="2" y="0" width="104" height="87"/><use class="dg" href="#g-monitor" x="118" y="0" width="104" height="87"/></svg>
             <h4>Install Glass</h4>
             <p>Mac, Linux or <a href="/docs#windows-host-beta">Windows</a>. <code>glass setup</code> starts it in the background and asks for the two macOS permissions.</p>
-            <code class="cmd">curl -fsSL glassdesk.dev | sh</code>
+            <code class="cmd only-unix">curl -fsSL glassdesk.dev | sh</code>
+            <code class="cmd only-win">irm glassdesk.dev | iex</code>
             <svg class="arr" viewBox="0 0 60 20" aria-hidden="true"><path class="flow" d="M2 10h54" marker-end="url(#ah)"/></svg>
           </section>
           <section class="lane mid">
@@ -272,8 +279,12 @@
           <svg viewBox="0 0 40 24"><path d="M2 12h32m-8-8 8 8-8 8" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <div class="pane"><em>glassdesk.dev/help</em><b class="ok">You're helping</b><span>They approved. Stop sharing ends it.</span></div>
         </div>
-        <div class="command lg-glass-surface" data-lg-preset="control" data-copy="curl -fsSL glassdesk.dev/help | sh">
+        <div class="command lg-glass-surface only-unix" data-lg-preset="control" data-copy="curl -fsSL glassdesk.dev/help | sh">
           <code><span class="prompt" aria-hidden="true">$</span> curl -fsSL glassdesk.dev/help | sh</code>
+          <button type="button" class="copy">Copy</button>
+        </div>
+        <div class="command lg-glass-surface only-win" data-lg-preset="control" data-copy="irm glassdesk.dev/help | iex">
+          <code><span class="prompt" aria-hidden="true">&gt;</span> irm glassdesk.dev/help | iex</code>
           <button type="button" class="copy">Copy</button>
         </div>
         <p class="after">They run that; you enter the code at <a href="/help">glassdesk.dev/help</a>. <a href="/docs#help-someone-quick-support">Details</a></p>

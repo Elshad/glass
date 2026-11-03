@@ -18,6 +18,14 @@ for (const block of document.querySelectorAll('.command')) {
   });
 }
 
+// Mac/Linux or Windows commands: the switch flips them and remembers the choice.
+for (const button of document.querySelectorAll('.os-switch')) {
+  button.addEventListener('click', () => {
+    const win = document.documentElement.classList.toggle('os-win');
+    try { localStorage.setItem('glass-os', win ? 'win' : 'unix'); } catch {}
+  });
+}
+
 const form = document.getElementById('feedback-form');
 if (form) {
   const status = document.getElementById('fb-status');
