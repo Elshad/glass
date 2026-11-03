@@ -84,7 +84,7 @@ And the viewer is just a web page. No app to install, no account to create.
 - **Agent-ready setup.** Ask Claude Code to "set up Glass on my Mac mini" and it does it over SSH ([skill](#set-up-with-an-ai-agent)).
 
 ### The Mac app, the console and the command line
-- **A real Mac app.** Glass.app does everything the CLI does in a native, GPU-drawn window: setup in a few clicks, who's connected and chat, links with QR codes, machines, history, AI agents, settings and teams, and a one-click update.
+- **A real desktop app.** Glass.app on a Mac, and Glass in the Start menu on Windows, does everything the CLI does in a native, GPU-drawn window: setup in a few clicks, who's connected and chat, links with QR codes, machines, history, AI agents, settings and teams, and a one-click update.
 - **A console.** `https://<computer>/admin/`: who's connected, requests to allow, links, devices, history, settings, access rules, and an address book of your machines.
 - **Beyond the desktop.** Stream a single app's window, a resizable full-screen terminal in the viewer, local web ports (`/fwd/3000/`) from your tailnet, and recording to MP4.
 

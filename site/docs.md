@@ -46,7 +46,7 @@ Features:
 - **Keyboards per machine.** ⌘↔Ctrl, PC-keyboard and ⌘/⌥ swaps are remembered for each computer; an optional shortcut bar puts Mac shortcuts one tap away.
 - **Power.** Wake a sleeping machine (Wake-on-LAN), restart Glass or the whole computer and reconnect.
 - **AI agents, supervised.** `glass mcp` lets Claude Code, Claude Desktop, Cursor or any MCP client use the computer (and your other computers running Glass) while you watch each step, pause or stop it, and approve anything risky, from the viewer, the Mac app or a notification. On a Mac it can also read an app's window as text (`snapshot`) and press buttons or fill in fields by reference (`press`, `set_value`), without moving your pointer.
-- **The Glass app (macOS).** A native window for everything the command line does: setup, who's connected, links with QR codes, machines, history, AI agents, settings and teams. In Applications, Spotlight and the menu bar (**Open Glass…**).
+- **The Glass app (macOS and Windows).** A native window for everything the command line does: setup, who's connected, links with QR codes, machines, history, AI agents, settings and teams. On a Mac in Applications, Spotlight and the menu bar (**Open Glass…**); on Windows in the Start menu and the tray icon.
 - **A console.** `https://<computer>/admin/`: who's connected, requests to allow, links with QR codes, devices, history, settings, access rules and an address book of your machines.
 - **For teams.** Single sign-on (any OpenID Connect provider), LDAP, SCIM provisioning, access rules per email, domain or group, and device posture checks.
 - **Self-hostable relay.** Run the remote-access introducer and TURN relay yourself.
@@ -68,9 +68,9 @@ The installer:
 
 Running the same command again updates Glass in place (it says which version it updated from), restarts the background service, and skips the setup guide if Glass is already set up. Settings and macOS permissions carry over.
 
-## The Glass app (macOS)
+## The Glass app (macOS and Windows)
 
-Open **Glass** from Applications or Spotlight, or choose **Open Glass…** from the menu bar icon. It does everything the `glass` command does, in a window:
+Open **Glass** from Applications or Spotlight, or choose **Open Glass…** from the menu bar icon. On Windows, open **Glass** from the Start menu or the tray icon. It does everything the `glass` command does, in a window:
 
 - **Home:** whether Glass is ready, the address to open with a QR code to scan, anything that needs fixing (a permission, Tailscale), and the switches used most.
 - **Connected:** who's viewing (end any session), connection requests to allow or deny, the chat with viewers (both sides, and reply), the privacy screen.
