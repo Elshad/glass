@@ -185,50 +185,84 @@ pub fn remove_rule_quietly(exe: &Path) -> bool {
     glass_named(exe) == Some(false)
 }
 
+/// Every rule named Glass for `exe`, whatever its profile. `None` if the firewall can't be listed.
+fn glass_rules(exe: &Path) -> Option<Vec<Rule>> {
+    Some(rules()?.into_iter().filter(|r| r.name.trim().eq_ignore_ascii_case("Glass") && same_program(&r.program, exe)).collect())
+}
+
 /// Any rule named Glass for `exe`, enabled or not. `None` if the firewall can't be listed.
 fn glass_named(exe: &Path) -> Option<bool> {
-    Some(rules()?.iter().any(|r| r.name.trim().eq_ignore_ascii_case("Glass") && same_program(&r.program, exe)))
+    Some(!glass_rules(exe)?.is_empty())
 }
 
 /// Hidden argument: relaunch this program elevated and run [`apply_from_arg`].
 pub const APPLY_ARG: &str = "--apply-firewall-rule";
 
-/// `Start-Process -Verb RunAs` of `exe` with [`APPLY_ARG`]. The path is one PowerShell
-/// literal, so spaces, `$` and `%` stay in the path. The child runs [`replace_rule`].
-fn elevate_launch(exe: &Path) -> String {
+/// The only words [`parse_remote_arg`] accepts. The parent classified these; the child does not.
+fn remote_arg(remote: Remote) -> &'static str {
+    match remote {
+        Remote::Tailscale => "tailscale",
+        Remote::Loopback => "loopback",
+        Remote::Any => "any",
+    }
+}
+
+/// `Some` only for [`remote_arg`]. Anything else, including a different case, is refused.
+pub fn parse_remote_arg(arg: &str) -> Option<Remote> {
+    match arg {
+        "tailscale" => Some(Remote::Tailscale),
+        "loopback" => Some(Remote::Loopback),
+        "any" => Some(Remote::Any),
+        _ => None,
+    }
+}
+
+/// `Start-Process -Verb RunAs` of `exe` with [`APPLY_ARG`] and [`remote_arg`]. The path is
+/// one PowerShell literal, so spaces, `$` and `%` stay in the path. The child runs [`replace_rule`].
+fn elevate_launch(exe: &Path, remote: Remote) -> String {
+    let list = [APPLY_ARG, remote_arg(remote)].map(super::ps_string).join(",");
     format!(
-        "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
+        "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath {} -ArgumentList {list} -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
         super::ps_string(&exe.display().to_string()),
-        super::ps_string(APPLY_ARG),
     )
 }
 
-/// Replaces the rule as administrator. Windows asks once. Already elevated: do it here.
+/// Replaces the rule as administrator. Windows asks once. The child is told `remote`;
+/// it does not read settings. Already elevated: do it here.
 pub fn add_rule_elevated(exe: &Path) -> bool {
+    let Ok(remote) = saved_remote() else { return false };
     if super::service::is_elevated() {
-        return add_rule_quietly(exe);
+        return replace_rule(exe, remote);
     }
-    super::powershell(&elevate_launch(exe)).status().is_ok_and(|s| s.success())
+    super::powershell(&elevate_launch(exe, remote)).status().is_ok_and(|s| s.success())
 }
 
-/// Entry for [`APPLY_ARG`]. True only when this program's own rule matches the saved bind.
-pub fn apply_from_arg() -> bool {
-    std::env::current_exe().ok().is_some_and(|exe| super::service::is_elevated() && add_rule_quietly(&exe))
+/// Entry for [`APPLY_ARG`] plus one [`parse_remote_arg`] word. The program is this executable.
+/// True only when its Glass rule then matches that word. Never reads settings.
+pub fn apply_from_arg(rest: &[String]) -> bool {
+    let [remote] = rest else { return false };
+    let Some(remote) = parse_remote_arg(remote) else { return false };
+    super::service::is_elevated() && std::env::current_exe().ok().is_some_and(|exe| replace_rule(&exe, remote))
 }
 
-/// Remote addresses of enabled private inbound allows named Glass for `exe`.
-fn glass_remotes(exe: &Path) -> Option<Vec<String>> {
-    let private = NET_FW_PROFILE2_PRIVATE.0;
-    Some(rules()?.into_iter().filter(|r| r.enabled && r.inbound && r.allow && r.profiles & private != 0 && r.name.trim().eq_ignore_ascii_case("Glass") && same_program(&r.program, exe)).map(|r| r.remote).collect())
+/// Whether the Glass rules for one program are exactly what `remote` asks for.
+/// Loopback means no rule of that name. Otherwise exactly one enabled inbound allow,
+/// on the private profile only, with that address set.
+fn rules_match(found: &[Rule], remote: Remote) -> bool {
+    if remote == Remote::Loopback {
+        return found.is_empty();
+    }
+    let [rule] = found else { return false };
+    rule.enabled
+        && rule.inbound
+        && rule.allow
+        && rule.profiles == NET_FW_PROFILE2_PRIVATE.0
+        && firewall_bind::stored_matches(remote, Some(rule.remote.as_str()))
 }
 
 /// Whether Glass's own rule for `exe` already matches `remote`.
 pub fn in_sync(exe: &Path, remote: Remote) -> Option<bool> {
-    let found = glass_remotes(exe)?;
-    Some(match remote {
-        Remote::Loopback => found.is_empty(),
-        Remote::Any | Remote::Tailscale => found.len() == 1 && firewall_bind::stored_matches(remote, found.first().map(String::as_str)),
-    })
+    Some(rules_match(&glass_rules(exe)?, remote))
 }
 
 /// What to say after `bind` changes. Nothing when the rule already matches and we are not elevated.
@@ -305,12 +339,51 @@ mod tests {
 
     #[test]
     fn elevate_relaunches_this_program_with_the_path_literal() {
-        let spaces = elevate_launch(Path::new(r"C:\Program Files\Glass\glass.exe"));
+        let spaces = elevate_launch(Path::new(r"C:\Program Files\Glass\glass.exe"), Remote::Tailscale);
         assert!(spaces.contains(r"-FilePath 'C:\Program Files\Glass\glass.exe'"), "{spaces}");
-        assert!(spaces.contains("-ArgumentList '--apply-firewall-rule'"), "{spaces}");
-        let odd = elevate_launch(Path::new(r"C:\Glass$Bin\%ProgramFiles%\glass.exe"));
+        assert!(spaces.contains("-ArgumentList '--apply-firewall-rule','tailscale'"), "{spaces}");
+        let odd = elevate_launch(Path::new(r"C:\Glass$Bin\%ProgramFiles%\glass.exe"), Remote::Any);
         assert!(odd.contains(r"-FilePath 'C:\Glass$Bin\%ProgramFiles%\glass.exe'"), "{odd}");
-        assert!(!odd.contains("cmd.exe") && !odd.contains("netsh"), "{odd}");
+        assert!(odd.contains("-ArgumentList '--apply-firewall-rule','any'"), "{odd}");
+        assert!(!odd.contains("cmd.exe") && !odd.contains("netsh") && !odd.contains("APPDATA"), "{odd}");
+    }
+
+    #[test]
+    fn remote_argument_rejects_unknown_values() {
+        assert_eq!(parse_remote_arg("tailscale"), Some(Remote::Tailscale));
+        assert_eq!(parse_remote_arg("loopback"), Some(Remote::Loopback));
+        assert_eq!(parse_remote_arg("any"), Some(Remote::Any));
+        for bad in ["", "Any", "Tailscale", "LOOPBACK", "all", "*", "any ", "tailscale,any"] {
+            assert_eq!(parse_remote_arg(bad), None, "{bad}");
+            assert!(!apply_from_arg(&[bad.to_string()]));
+        }
+        assert!(!apply_from_arg(&[]));
+        assert!(!apply_from_arg(&["any".into(), "tailscale".into()]));
+    }
+
+    #[test]
+    fn in_sync_rejects_extra_rules_and_wider_profiles() {
+        let private = NET_FW_PROFILE2_PRIVATE.0;
+        let public = windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_PROFILE2_PUBLIC.0;
+        let mut good = rule(r"C:\Glass\glass.exe", true, private);
+        good.name = "Glass".into();
+        good.remote = "*".into();
+        assert!(rules_match(&[good.clone()], Remote::Any));
+        let mut public_only = good.clone();
+        public_only.profiles = public;
+        assert!(!rules_match(&[good.clone(), public_only.clone()], Remote::Any), "an extra public rule still counts");
+        let mut wider = good.clone();
+        wider.profiles = private | public;
+        assert!(!rules_match(&[wider], Remote::Any), "private plus public is not private");
+        assert!(!rules_match(&[public_only], Remote::Loopback), "a public rule is still a Glass rule");
+        assert!(rules_match(&[], Remote::Loopback));
+        let mut off = good.clone();
+        off.enabled = false;
+        assert!(!rules_match(&[off], Remote::Any));
+        good.remote = format!("{TAILSCALE_V4},{TAILSCALE_V6}");
+        assert!(rules_match(&[good.clone()], Remote::Tailscale));
+        good.remote = TAILSCALE_V4.into();
+        assert!(!rules_match(&[good], Remote::Tailscale));
     }
 
     /// Creates the Tailscale rule for this executable and reads back exactly both ranges.
@@ -330,14 +403,15 @@ mod tests {
         }
         let _cleanup = Cleanup(exe.clone());
         assert!(replace_rule(&exe, Remote::Any), "create the wide rule");
-        let wide = glass_remotes(&exe).expect("list the wide rule");
+        let wide = glass_rules(&exe).expect("list the wide rule");
         assert_eq!(wide.len(), 1, "wide rules: {wide:?}");
-        assert!(firewall_bind::stored_matches(Remote::Any, wide.first().map(String::as_str)), "wide remote was {}", wide[0]);
+        assert!(firewall_bind::stored_matches(Remote::Any, wide.first().map(|r| r.remote.as_str())), "wide remote was {}", wide[0].remote);
         assert!(replace_rule(&exe, Remote::Tailscale), "replace the wide rule");
-        let found = glass_remotes(&exe).expect("list firewall rules");
+        let found = glass_rules(&exe).expect("list firewall rules");
         assert_eq!(found.len(), 1, "rules: {found:?}");
-        assert_eq!(firewall_bind::normalized_remotes(&found[0]), vec![TAILSCALE_V4.to_string(), TAILSCALE_V6.to_string()], "remote addresses were {}", found[0]);
+        assert_eq!(found[0].profiles, NET_FW_PROFILE2_PRIVATE.0, "profile was {}", found[0].profiles);
+        assert_eq!(firewall_bind::normalized_remotes(&found[0].remote), vec![TAILSCALE_V4.to_string(), TAILSCALE_V6.to_string()], "remote addresses were {}", found[0].remote);
         assert!(replace_rule(&exe, Remote::Loopback), "remove the rule");
-        assert!(glass_remotes(&exe).expect("list firewall rules").is_empty());
+        assert!(glass_rules(&exe).expect("list firewall rules").is_empty());
     }
 }
