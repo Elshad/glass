@@ -5,14 +5,14 @@
   Built by scripts/package.ps1 with WiX Toolset 5 (wix build -arch x64|arm64 -d Version=…
   -d Stage=… -d Icon=…). Installs to Program Files\Glass with the zip's layout, starts glassw
   for each user who signs in (the HKLM Run key), adds the Start menu shortcut, puts glass on
-  the PATH and lets Glass through Windows Defender Firewall on private networks, as
-  `glass setup` would. The host finds this copy through HKLM\SOFTWARE\Glass InstallDir
+  the PATH. The package does not add a firewall exception; `glass setup` adds the
+  rule from the saved bind, so an upgrade does not install one for every address.
+  The host finds this copy through HKLM\SOFTWARE\Glass InstallDir
   (src/windows/agent.rs). Settings stay in each user's profile and survive uninstalling.
 
   The UpgradeCode never changes: each new MSI replaces the one before (MajorUpgrade).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package Name="Glass" Manufacturer="Glass" Version="$(var.Version)"
            UpgradeCode="83EBD5C2-954D-4113-A3C1-4797653E5386" Scope="perMachine" Compressed="yes">
@@ -34,10 +34,7 @@
       <Directory Id="INSTALLFOLDER" Name="Glass">
         <Directory Id="BinFolder" Name="bin">
           <Component Id="GlassExe">
-            <File Id="GlassExe" Source="$(var.Stage)\bin\glass.exe" KeyPath="yes">
-              <!-- The rule `glass setup` adds: private networks (home, work, Tailscale) only. -->
-              <fw:FirewallException Id="GlassFirewall" Name="Glass" Profile="private" Scope="any" IgnoreFailure="yes" />
-            </File>
+            <File Id="GlassExe" Source="$(var.Stage)\bin\glass.exe" KeyPath="yes" />
             <Environment Id="GlassPath" Name="PATH" Value="[BinFolder]" Part="last" Action="set" System="yes" />
           </Component>
           <Component Id="GlasswExe">

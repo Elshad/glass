@@ -26,6 +26,7 @@ mod keys;
 mod ldap;
 mod lid;
 mod listen;
+mod firewall_bind;
 mod lossless;
 #[cfg(not(target_os = "macos"))]
 mod mailbox;
@@ -584,6 +585,12 @@ fn config_cli(key: Option<&str>, value: Option<&str>) -> Result<()> {
             s.set(k, v)?;
             settings::save(&s)?;
             println!("{k} = {}", s.get(k)?);
+            #[cfg(windows)]
+            if k == "bind"
+                && let Some(note) = platform::firewall::bind_change_note()
+            {
+                println!("{note}");
+            }
             // A generated token is shown once, to paste into the identity provider.
             if k == "scim-token" && v == "new"
                 && let Some(t) = settings::scim_token()

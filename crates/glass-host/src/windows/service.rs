@@ -88,7 +88,7 @@ fn install() -> Result<()> {
     let bin = format!("\"{}\" {SERVICE_ARG}", exe.display());
     // The sign-in host runs this copy: it needs its own firewall rule (private networks,
     // like glass setup's), as SYSTEM can't answer Windows' prompt.
-    if super::firewall::inbound(&exe) != Some(super::firewall::Inbound::Allowed) && !super::firewall::add_rule_quietly(&exe) {
+    if !super::firewall::add_rule_quietly(&exe) {
         println!("Couldn't let the sign-in screen's Glass through Windows Firewall; viewers may not reach it.");
     }
     // The sign-in screen after a restart (signin.rs): this user's token and access rules.

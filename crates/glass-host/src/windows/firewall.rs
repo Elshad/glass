@@ -13,6 +13,9 @@ use windows::Win32::System::Ole::IEnumVARIANT;
 use windows::Win32::System::Variant::{VARIANT, VT_DISPATCH, VariantClear};
 use windows::core::{HSTRING, Interface};
 
+pub use crate::firewall_bind::Remote;
+use crate::firewall_bind::{self, TAILSCALE_V4, TAILSCALE_V6};
+
 /// What the inbound rules say about a program on private networks.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Inbound {
@@ -32,6 +35,8 @@ pub struct Rule {
     pub inbound: bool,
     pub allow: bool,
     pub profiles: i32,
+    pub name: String,
+    pub remote: String,
 }
 
 /// Decides from the rules for `exe`; `same` says whether a rule's program is it.
@@ -95,6 +100,8 @@ fn rules() -> Option<Vec<Rule>> {
                     inbound: rule.Direction().is_ok_and(|d| d == NET_FW_RULE_DIR_IN),
                     allow: rule.Action().is_ok_and(|a| a == NET_FW_ACTION_ALLOW),
                     profiles: rule.Profiles().unwrap_or(0),
+                    name: rule.Name().map(|s| s.to_string()).unwrap_or_default(),
+                    remote: rule.RemoteAddresses().map(|s| s.to_string()).unwrap_or_default(),
                 });
             }
             Some(out)
@@ -107,45 +114,135 @@ pub fn inbound(exe: &Path) -> Option<Inbound> {
     Some(decide(&rules()?, |p| same_program(p, exe)))
 }
 
-/// netsh's arguments for a rule letting `exe` accept connections on private networks
-/// (home, work, and Tailscale, which marks its network private), not public ones.
-pub fn add_rule_args(exe: &Path) -> String {
-    format!(
-        "advfirewall firewall add rule name=\"Glass\" dir=in action=allow program=\"{}\" enable=yes profile=private",
-        crate::browse::shell_path(&exe.to_string_lossy())
-    )
+/// The saved listen address. A missing file is the default (any remote address).
+/// Anything unreadable is `Err`: the caller must not add a wide rule.
+pub fn saved_remote() -> Result<Remote, ()> {
+    let bytes = match std::fs::read(crate::settings::path()) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Remote::Any),
+        Err(_) => return Err(()),
+    };
+    let settings: crate::settings::Settings = serde_json::from_slice(&bytes).map_err(|_| ())?;
+    firewall_bind::remote_for_bind(&settings.bind)
 }
 
-/// Adds the rule without asking: works only when already running as administrator.
-pub fn add_rule_quietly(exe: &Path) -> bool {
+fn program(exe: &Path) -> String {
+    crate::browse::shell_path(&exe.to_string_lossy())
+}
+
+/// netsh arguments that delete the rule named Glass for `exe`.
+pub fn delete_rule_args(exe: &Path) -> String {
+    format!("advfirewall firewall delete rule name=\"Glass\" program=\"{}\"", program(exe))
+}
+
+/// netsh arguments for Glass's allow, or `None` when loopback needs no allow.
+pub fn add_rule_args(exe: &Path, remote: Remote) -> Option<String> {
+    let base = format!(
+        "advfirewall firewall add rule name=\"Glass\" dir=in action=allow program=\"{}\" enable=yes profile=private",
+        program(exe)
+    );
+    match remote {
+        Remote::Loopback => None,
+        Remote::Any => Some(base),
+        Remote::Tailscale => Some(format!("{base} remoteip=\"{TAILSCALE_V4},{TAILSCALE_V6}\" edge=no")),
+    }
+}
+
+fn netsh(args: &str) -> bool {
     use std::os::windows::process::CommandExt;
     let mut cmd = std::process::Command::new("netsh");
-    cmd.raw_arg(add_rule_args(exe)).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.raw_arg(args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     super::no_window(&mut cmd);
     cmd.status().is_ok_and(|s| s.success())
+}
+
+/// Deletes Glass's rule for `exe`, then adds the one `remote` asks for. Already admin.
+fn replace_rule(exe: &Path, remote: Remote) -> bool {
+    let _ = netsh(&delete_rule_args(exe));
+    match add_rule_args(exe, remote) {
+        Some(add) => netsh(&add),
+        None => true,
+    }
+}
+
+/// Replaces Glass's rule from the saved bind. `false` leaves any existing rule as it is.
+pub fn add_rule_quietly(exe: &Path) -> bool {
+    match saved_remote() {
+        Ok(remote) => replace_rule(exe, remote),
+        Err(()) => false,
+    }
 }
 
 /// Removes Glass's rule for `exe` (as administrator).
 pub fn remove_rule_quietly(exe: &Path) -> bool {
-    use std::os::windows::process::CommandExt;
-    let mut cmd = std::process::Command::new("netsh");
-    cmd.raw_arg(format!(
-        "advfirewall firewall delete rule name=\"Glass\" program=\"{}\"",
-        crate::browse::shell_path(&exe.to_string_lossy())
-    ))
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
-    super::no_window(&mut cmd);
-    cmd.status().is_ok_and(|s| s.success())
+    netsh(&delete_rule_args(exe))
 }
 
-/// Adds the rule as administrator: Windows shows its approval prompt once.
+/// Replaces the rule as administrator. Windows asks once. A missing rule does not stop the add.
 pub fn add_rule_elevated(exe: &Path) -> bool {
+    let Ok(remote) = saved_remote() else { return false };
+    let delete = format!("netsh {}", delete_rule_args(exe));
+    let command = match add_rule_args(exe, remote) {
+        Some(add) => format!("{delete}; netsh {add}; exit $LASTEXITCODE"),
+        None => format!("{delete}; exit 0"),
+    };
     let script = format!(
-        "$ErrorActionPreference = 'Stop'; $p = Start-Process -FilePath netsh -ArgumentList {} -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
-        super::ps_string(&add_rule_args(exe))
+        "$ErrorActionPreference = 'Stop'; $p = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command',{} -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
+        super::ps_string(&command)
     );
     super::powershell(&script).status().is_ok_and(|s| s.success())
+}
+
+/// Remote addresses of enabled private inbound allows named Glass for `exe`.
+fn glass_remotes(exe: &Path) -> Option<Vec<String>> {
+    let private = NET_FW_PROFILE2_PRIVATE.0;
+    Some(rules()?.into_iter().filter(|r| r.enabled && r.inbound && r.allow && r.profiles & private != 0 && r.name.trim().eq_ignore_ascii_case("Glass") && same_program(&r.program, exe)).map(|r| r.remote).collect())
+}
+
+/// Whether Glass's own rule for `exe` already matches `remote`.
+pub fn in_sync(exe: &Path, remote: Remote) -> Option<bool> {
+    let found = glass_remotes(exe)?;
+    Some(match remote {
+        Remote::Loopback => found.is_empty(),
+        Remote::Any | Remote::Tailscale => found.len() == 1 && firewall_bind::stored_matches(remote, found.first().map(String::as_str)),
+    })
+}
+
+/// What to say after `bind` changes. Nothing when the rule already matches and we are not elevated.
+pub fn bind_change_note() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let remote = match saved_remote() {
+        Ok(remote) => remote,
+        Err(()) => return Some("Couldn't read the saved listen address, so the firewall rule was left unchanged.".into()),
+    };
+    if super::service::is_elevated() {
+        return Some(if replace_rule(&exe, remote) {
+            match remote {
+                Remote::Tailscale => format!("The firewall rule now allows only {TAILSCALE_V4} and {TAILSCALE_V6}."),
+                Remote::Loopback => "The inbound firewall rule was removed; Glass only listens on this computer.".into(),
+                Remote::Any => "The firewall rule allows connections on private networks.".into(),
+            }
+        } else {
+            "Couldn't update the Windows Firewall rule.".into()
+        });
+    }
+    if in_sync(&exe, remote) == Some(true) {
+        return None;
+    }
+    Some(match remote {
+        Remote::Tailscale => format!("The firewall rule was not changed. Run `glass setup` to allow only {TAILSCALE_V4} and {TAILSCALE_V6}."),
+        Remote::Loopback => "The firewall rule was not changed. Run `glass setup` to remove the inbound allow.".into(),
+        Remote::Any => "The firewall rule was not changed. Run `glass setup` to allow Glass on private networks.".into(),
+    })
+}
+
+/// The setup line once the rule matches `remote`.
+pub fn ready_sentence(remote: Remote) -> &'static str {
+    match remote {
+        Remote::Any => "Glass can accept connections on private networks",
+        Remote::Tailscale => "Glass accepts connections from Tailscale only",
+        Remote::Loopback => "Glass only listens on this computer, so it has no inbound firewall rule",
+    }
 }
 
 #[cfg(test)]
@@ -153,7 +250,7 @@ mod tests {
     use super::*;
 
     fn rule(program: &str, allow: bool, profiles: i32) -> Rule {
-        Rule { program: program.into(), enabled: true, inbound: true, allow, profiles }
+        Rule { program: program.into(), enabled: true, inbound: true, allow, profiles, name: String::new(), remote: String::new() }
     }
 
     #[test]
@@ -172,9 +269,38 @@ mod tests {
 
     #[test]
     fn the_rule_names_the_program_plainly() {
+        let exe = Path::new(r"\\?\C:\Program Files\Glass\glass.exe");
         assert_eq!(
-            add_rule_args(Path::new(r"\\?\C:\Program Files\Glass\glass.exe")),
-            "advfirewall firewall add rule name=\"Glass\" dir=in action=allow program=\"C:\\Program Files\\Glass\\glass.exe\" enable=yes profile=private"
+            add_rule_args(exe, Remote::Any).as_deref(),
+            Some("advfirewall firewall add rule name=\"Glass\" dir=in action=allow program=\"C:\\Program Files\\Glass\\glass.exe\" enable=yes profile=private")
         );
+        let tailscale = add_rule_args(exe, Remote::Tailscale).unwrap();
+        assert!(tailscale.contains("remoteip=\"100.64.0.0/10,fd7a:115c:a1e0::/48\""));
+        assert!(tailscale.ends_with("edge=no"));
+        assert!(add_rule_args(exe, Remote::Loopback).is_none());
+    }
+
+    /// Creates the Tailscale rule for this executable and reads back exactly both ranges.
+    /// Skipped unless Windows CI sets GLASS_FIREWALL_INTEGRATION=1.
+    #[test]
+    fn windows_tailscale_rule_is_exactly_both_ranges() {
+        if std::env::var("GLASS_FIREWALL_INTEGRATION").ok().as_deref() != Some("1") {
+            return;
+        }
+        assert!(super::super::service::is_elevated(), "Windows CI must run elevated");
+        let exe = std::env::current_exe().unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = replace_rule(&self.0, Remote::Loopback);
+            }
+        }
+        let _cleanup = Cleanup(exe.clone());
+        assert!(replace_rule(&exe, Remote::Tailscale), "create the tailscale rule");
+        let found = glass_remotes(&exe).expect("list firewall rules");
+        assert_eq!(found.len(), 1, "rules: {found:?}");
+        assert_eq!(firewall_bind::normalized_remotes(&found[0]), vec![TAILSCALE_V4.to_string(), TAILSCALE_V6.to_string()], "remote addresses were {}", found[0]);
+        assert!(replace_rule(&exe, Remote::Loopback), "remove the rule");
+        assert!(glass_remotes(&exe).expect("list firewall rules").is_empty());
     }
 }

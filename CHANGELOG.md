@@ -47,6 +47,8 @@ November 4, 2026
 ### For developers
 
 - `bench/` measures frame rate and end-to-end latency on a test host (no screen capture) through LAN and slow shaped links, to catch regressions. See `bench/README.md`.
+- Viewers whose browser can't take WebRTC video (a Tesla's, for one) on a slow or relayed connection get a steadier picture: Glass keeps about a tenth of a second of video waiting and lowers the bitrate to what the link carries, instead of queuing most of a second and dropping frames in bursts.
+- On Windows, the Glass firewall rule follows `glass config bind`. `tailscale` allows only 100.64.0.0/10 and fd7a:115c:a1e0::/48. A loopback-only bind removes the rule. The default listen address is unchanged: private networks, any remote address. `glass setup` and `glass service install` apply it. An elevated `glass config bind` applies it; otherwise Glass says to run `glass setup`. The MSI no longer installs a rule for every remote address.
 
 ## 0.13.1
 
