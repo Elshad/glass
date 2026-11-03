@@ -2,6 +2,8 @@
 //! your own tailnet connect without a token.
 
 use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -71,16 +73,98 @@ pub fn self_addresses(status: &Value) -> Result<Vec<IpAddr>> {
     Ok(ips)
 }
 
-/// The login name of the tailnet user this Mac is signed in as.
-pub async fn self_login() -> Result<String> {
-    let status = json(&["status", "--json"]).await?;
-    let uid = status["Self"]["UserID"]
-        .as_u64()
-        .context("no Self.UserID")?;
+fn login_from_status(status: &Value) -> Result<String> {
+    let uid = status["Self"]["UserID"].as_u64().context("no Self.UserID")?;
     status["User"][uid.to_string()]["LoginName"]
         .as_str()
         .map(str::to_owned)
         .context("no login name for self")
+}
+
+/// The login name of the tailnet user this Mac is signed in as.
+pub async fn self_login() -> Result<String> {
+    login_from_status(&json(&["status", "--json"]).await?)
+}
+
+/// One `tailscale status` for a sign-in. The child is killed if it outlives `limit`.
+async fn self_login_within(limit: Duration) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut cmd = tokio::process::Command::new(cli());
+    #[cfg(windows)]
+    crate::platform::no_window_tokio(&mut cmd);
+    let mut child = cmd.args(["status", "--json"]).kill_on_drop(true)
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
+        .spawn()?;
+    let mut stdout = child.stdout.take().unwrap();
+    let read = async move {
+        let mut out = Vec::new();
+        stdout.read_to_end(&mut out).await.map(|_| out)
+    };
+    let out = match tokio::time::timeout(limit, read).await {
+        Ok(Ok(out)) => out,
+        _ => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            anyhow::bail!("timed out");
+        }
+    };
+    anyhow::ensure!(child.wait().await?.success(), "tailscale status failed");
+    login_from_status(&serde_json::from_slice(&out)?)
+}
+
+enum How {
+    Live,
+    Fixed,
+    #[cfg(test)]
+    Script(Mutex<std::collections::VecDeque<Option<String>>>),
+}
+
+#[derive(Clone)]
+pub struct TailnetOwner {
+    login: Arc<Mutex<Option<String>>>,
+    how: Arc<How>,
+}
+
+impl TailnetOwner {
+    fn new(login: Option<String>, how: How) -> Self {
+        Self { login: Arc::new(Mutex::new(login)), how: Arc::new(how) }
+    }
+
+    pub fn unknown() -> Self {
+        Self::new(None, How::Live)
+    }
+
+    pub fn fixed(login: Option<String>) -> Self {
+        Self::new(login, How::Fixed)
+    }
+
+    pub fn store(&self, login: String) {
+        *self.login.lock().unwrap() = Some(login);
+    }
+
+    /// The cached login, or one attempt while it is still unknown.
+    pub async fn get_or_resolve(&self) -> Option<String> {
+        if let Some(login) = self.login.lock().unwrap().clone() {
+            return Some(login);
+        }
+        let found = match &*self.how {
+            How::Fixed => return None,
+            How::Live => self_login_within(Duration::from_secs(2)).await.ok(),
+            #[cfg(test)]
+            How::Script(answers) => answers.lock().unwrap().pop_front().flatten(),
+        }?;
+        let mut slot = self.login.lock().unwrap();
+        if slot.is_none() {
+            tracing::info!("tailnet devices owned by {found} connect without a token");
+            *slot = Some(found);
+        }
+        slot.clone()
+    }
+
+    #[cfg(test)]
+    fn scripted(answers: Vec<Option<String>>) -> Self {
+        Self::new(None, How::Script(Mutex::new(answers.into())))
+    }
 }
 
 /// Whether `tailscale serve` already forwards HTTPS on 443 to Glass on `port` (how Linux
@@ -243,7 +327,7 @@ pub async fn ensure_cert(
     Some((cert, key))
 }
 
-fn is_tailscale_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_tailscale_ip(ip: IpAddr) -> bool {
     match ip {
         // 100.64.0.0/10 (CGNAT range Tailscale assigns from)
         IpAddr::V4(v4) => v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64,
@@ -357,5 +441,13 @@ mod tests {
         assert!(serve_status_proxies_to(&on, 8080));
         assert!(!serve_status_proxies_to(&on, 9090));
         assert!(!serve_status_proxies_to(&serde_json::json!({}), 8080));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_owner_is_cached_once_tailscale_answers() {
+        let owner = TailnetOwner::scripted(vec![None, Some("ada@example.com".into()), Some("bea@example.com".into())]);
+        assert_eq!(owner.get_or_resolve().await, None, "not ready yet");
+        assert_eq!(owner.get_or_resolve().await.as_deref(), Some("ada@example.com"));
+        assert_eq!(owner.get_or_resolve().await.as_deref(), Some("ada@example.com"), "kept, like a startup success");
     }
 }

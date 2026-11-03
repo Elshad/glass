@@ -43,8 +43,8 @@ pub struct Shared {
     /// Failed sign-ins per address, for brute-force protection.
     pub auth_failures:
         Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
-    /// Tailnet login of this Mac's owner; their devices skip the token.
-    pub tailnet_owner: Option<String>,
+    /// Tailnet login of this computer's owner. Filled in later if Tailscale wasn't up yet.
+    pub tailnet_owner: tailscale::TailnetOwner,
     pub audio: AudioPackets,
     pub rate: Mutex<crate::rate::RateControl>,
 }
@@ -569,18 +569,22 @@ async fn control(
     {
         auth = Some(Auth::Token);
     }
-    if auth.is_none()
-        && hello_ok
-        // Over WebRTC the address is public, never a tailnet device's.
-        && ctx.relayed.is_none()
-        && let Some(login) = tailscale::identity(peer).await
-    {
-        if shared.tailnet_owner.as_deref() == Some(login.as_str()) {
-            auth = Some(Auth::Tailnet);
-        } else if let Some(scope) = tailnet_guest_scope(&login) {
-            // Someone else on the tailnet: the access rules name them, or the owner lets the
-            // whole tailnet in (tailnet-members).
-            auth = Some(Auth::TailnetGuest { login, scope });
+    // Over WebRTC the address is public, never a tailnet device's.
+    let mut tailnet_pending = false;
+    if auth.is_none() && hello_ok && ctx.relayed.is_none() && tailscale::is_tailscale_ip(peer) {
+        let owner = shared.tailnet_owner.get_or_resolve().await;
+        if let Some(login) = tailscale::identity(peer).await {
+            if owner.as_deref() == Some(login.as_str()) {
+                auth = Some(Auth::Tailnet);
+            } else if let Some(scope) = tailnet_guest_scope(&login) {
+                // Someone else on the tailnet: the access rules name them, or the owner lets the
+                // whole tailnet in (tailnet-members).
+                auth = Some(Auth::TailnetGuest { login, scope });
+            } else if owner.is_none() {
+                tailnet_pending = true;
+            }
+        } else if owner.is_none() {
+            tailnet_pending = true;
         }
     }
     // A policy can turn guest links (or, in its own host, quick support) off: new links and
@@ -632,6 +636,13 @@ async fn control(
         }
     }
     let Some(auth) = auth else {
+        // Tailscale still starting is not a bad token; the page reconnects.
+        if tailnet_pending && !link_failed {
+            info!("{peer}: tailscale isn't ready; reconnecting");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            ctx.conn.close(1u32.into(), b"tailscale unavailable");
+            return Ok(());
+        }
         record_auth_failure(shared, peer);
         warn!("{peer}: rejected (bad or missing token)");
         refused(&device, if link_failed { "used or expired link" } else { "no valid token" });
