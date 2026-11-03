@@ -86,7 +86,8 @@ pub async fn self_login() -> Result<String> {
     login_from_status(&json(&["status", "--json"]).await?)
 }
 
-/// One `tailscale status` for a sign-in. The child is killed if it outlives `limit`.
+/// One `tailscale status` for a sign-in. One deadline covers reading stdout and waiting
+/// for the child: a process that closes stdout and stays alive is killed and reaped.
 async fn self_login_within(limit: Duration) -> Result<String> {
     use tokio::io::AsyncReadExt;
     let mut cmd = tokio::process::Command::new(cli());
@@ -96,20 +97,25 @@ async fn self_login_within(limit: Duration) -> Result<String> {
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
         .spawn()?;
     let mut stdout = child.stdout.take().unwrap();
-    let read = async move {
-        let mut out = Vec::new();
-        stdout.read_to_end(&mut out).await.map(|_| out)
-    };
-    let out = match tokio::time::timeout(limit, read).await {
-        Ok(Ok(out)) => out,
-        _ => {
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut out = Vec::new();
+    let read = tokio::time::timeout_at(deadline, stdout.read_to_end(&mut out)).await;
+    drop(stdout);
+    if !matches!(read, Ok(Ok(_))) {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        anyhow::bail!("timed out");
+    }
+    match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) if status.success() => login_from_status(&serde_json::from_slice(&out)?),
+        Err(_) => {
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             anyhow::bail!("timed out");
         }
-    };
-    anyhow::ensure!(child.wait().await?.success(), "tailscale status failed");
-    login_from_status(&serde_json::from_slice(&out)?)
+        Ok(Ok(_)) => anyhow::bail!("tailscale status failed"),
+        Ok(Err(e)) => Err(e.into()),
+    }
 }
 
 enum How {
@@ -119,15 +125,29 @@ enum How {
     Script(Mutex<std::collections::VecDeque<Option<String>>>),
 }
 
+/// How long to wait after a miss before another `tailscale status`.
+const RETRY_AFTER: Duration = Duration::from_secs(3);
+
 #[derive(Clone)]
 pub struct TailnetOwner {
     login: Arc<Mutex<Option<String>>>,
+    /// Earliest time another lookup may run after a miss.
+    retry_at: Arc<Mutex<std::time::Instant>>,
+    retry_after: Duration,
+    /// One lookup at a time. Waiters take the result, or the cooldown, instead of spawning.
+    gate: Arc<tokio::sync::Mutex<()>>,
     how: Arc<How>,
 }
 
 impl TailnetOwner {
     fn new(login: Option<String>, how: How) -> Self {
-        Self { login: Arc::new(Mutex::new(login)), how: Arc::new(how) }
+        Self {
+            login: Arc::new(Mutex::new(login)),
+            retry_at: Arc::new(Mutex::new(std::time::Instant::now())),
+            retry_after: RETRY_AFTER,
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            how: Arc::new(how),
+        }
     }
 
     pub fn unknown() -> Self {
@@ -142,17 +162,35 @@ impl TailnetOwner {
         *self.login.lock().unwrap() = Some(login);
     }
 
-    /// The cached login, or one attempt while it is still unknown.
-    pub async fn get_or_resolve(&self) -> Option<String> {
+    /// The cached login, or one shared attempt while it is still unknown.
+    /// A peer off the tailnet cannot be the owner, so it never starts a lookup.
+    pub async fn get_or_resolve(&self, peer: IpAddr) -> Option<String> {
         if let Some(login) = self.login.lock().unwrap().clone() {
             return Some(login);
+        }
+        if matches!(&*self.how, How::Fixed) || !is_tailscale_ip(peer.to_canonical()) {
+            return None;
+        }
+        if std::time::Instant::now() < *self.retry_at.lock().unwrap() {
+            return None;
+        }
+        let _flight = self.gate.lock().await;
+        if let Some(login) = self.login.lock().unwrap().clone() {
+            return Some(login);
+        }
+        if std::time::Instant::now() < *self.retry_at.lock().unwrap() {
+            return None;
         }
         let found = match &*self.how {
             How::Fixed => return None,
             How::Live => self_login_within(Duration::from_secs(2)).await.ok(),
             #[cfg(test)]
             How::Script(answers) => answers.lock().unwrap().pop_front().flatten(),
-        }?;
+        };
+        let Some(found) = found else {
+            *self.retry_at.lock().unwrap() = std::time::Instant::now() + self.retry_after;
+            return None;
+        };
         let mut slot = self.login.lock().unwrap();
         if slot.is_none() {
             tracing::info!("tailnet devices owned by {found} connect without a token");
@@ -162,8 +200,15 @@ impl TailnetOwner {
     }
 
     #[cfg(test)]
-    fn scripted(answers: Vec<Option<String>>) -> Self {
-        Self::new(None, How::Script(Mutex::new(answers.into())))
+    fn scripted(answers: Vec<Option<String>>, retry_after: Duration) -> Self {
+        let mut owner = Self::new(None, How::Script(Mutex::new(answers.into())));
+        owner.retry_after = retry_after;
+        owner
+    }
+
+    #[cfg(test)]
+    fn expire(&self) {
+        *self.retry_at.lock().unwrap() = std::time::Instant::now();
     }
 }
 
@@ -445,9 +490,32 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_owner_is_cached_once_tailscale_answers() {
-        let owner = TailnetOwner::scripted(vec![None, Some("ada@example.com".into()), Some("bea@example.com".into())]);
-        assert_eq!(owner.get_or_resolve().await, None, "not ready yet");
-        assert_eq!(owner.get_or_resolve().await.as_deref(), Some("ada@example.com"));
-        assert_eq!(owner.get_or_resolve().await.as_deref(), Some("ada@example.com"), "kept, like a startup success");
+        let ts: IpAddr = "100.64.0.1".parse().unwrap();
+        let lan: IpAddr = "192.168.1.20".parse().unwrap();
+        let owner = TailnetOwner::scripted(
+            vec![None, Some("ada@example.com".into()), Some("bea@example.com".into())],
+            Duration::ZERO,
+        );
+        assert_eq!(owner.get_or_resolve(lan).await, None, "a lan address never asks tailscale");
+        assert_eq!(owner.get_or_resolve(ts).await, None, "not ready yet");
+        assert_eq!(owner.get_or_resolve(ts).await.as_deref(), Some("ada@example.com"));
+        assert_eq!(
+            owner.get_or_resolve(ts).await.as_deref(),
+            Some("ada@example.com"),
+            "kept, like a startup success"
+        );
+
+        let owner = TailnetOwner::scripted(
+            vec![None, Some("ada@example.com".into()), Some("bea@example.com".into())],
+            Duration::from_secs(60),
+        );
+        assert_eq!(owner.get_or_resolve(lan).await, None);
+        let a = owner.clone();
+        let b = owner.clone();
+        let (x, y) = tokio::join!(a.get_or_resolve(ts), b.get_or_resolve(ts));
+        assert_eq!((x, y), (None, None), "one lookup in flight, then the cooldown");
+        owner.expire();
+        assert_eq!(owner.get_or_resolve(ts).await.as_deref(), Some("ada@example.com"));
+        assert_eq!(owner.get_or_resolve(ts).await.as_deref(), Some("ada@example.com"), "bea is never read");
     }
 }

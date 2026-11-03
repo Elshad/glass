@@ -571,8 +571,14 @@ async fn control(
     }
     // Over WebRTC the address is public, never a tailnet device's.
     let mut tailnet_pending = false;
-    if auth.is_none() && hello_ok && ctx.relayed.is_none() && tailscale::is_tailscale_ip(peer) {
-        let owner = shared.tailnet_owner.get_or_resolve().await;
+    // Test mode pretends every direct viewer is on the tailnet (loopback has no tailnet IP).
+    // A relayed address stays excluded: over WebRTC it is public.
+    if auth.is_none()
+        && hello_ok
+        && ctx.relayed.is_none()
+        && (crate::testmode::enabled() || tailscale::is_tailscale_ip(peer))
+    {
+        let owner = shared.tailnet_owner.get_or_resolve(peer).await;
         if let Some(login) = tailscale::identity(peer).await {
             if owner.as_deref() == Some(login.as_str()) {
                 auth = Some(Auth::Tailnet);
