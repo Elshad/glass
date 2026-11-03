@@ -19,6 +19,15 @@ echo
 bold "Glass: your computer, in any browser"
 echo
 
+# On Windows (Git Bash, MSYS2, Cygwin, or WSL, whose Linux can't see the Windows desktop),
+# point at the Windows installer instead.
+windows() { fail "This is $1 on Windows. To control this PC, run this in PowerShell instead:  irm glassdesk.dev | iex"; }
+case "$(uname -s)" in
+  MINGW*|MSYS*) windows "Git Bash" ;;
+  CYGWIN*) windows "Cygwin" ;;
+  Linux) if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then windows "WSL"; fi ;;
+esac
+
 case "$(uname -s)-$(uname -m)" in
   Darwin-*)
     major=$(sw_vers -productVersion | cut -d. -f1)
@@ -32,7 +41,7 @@ case "$(uname -s)-$(uname -m)" in
     TARBALL="glass-latest-linux-$arch.tar.gz"
     ;;
   Linux-*) fail "Glass on Linux supports x86_64 and ARM64 (aarch64); this machine is $(uname -m)." ;;
-  *) fail "Glass runs on macOS and Linux. Install it on the computer you want to control." ;;
+  *) fail "Glass runs on macOS, Linux and Windows (in PowerShell: irm glassdesk.dev | iex). Install it on the computer you want to control." ;;
 esac
 
 tmp=$(mktemp -d)
