@@ -108,6 +108,7 @@ header.site nav a:hover, footer.site a:hover { color: var(--text); }
 .works b { font-weight: 600; letter-spacing: -0.01em; }
 .works .apple { width: 15px; height: 15px; margin-top: -2px; }
 .works .omarchy { height: 12px; width: auto; }
+.works .windows { width: 13px; height: 13px; margin-top: -1px; }
 
 /* Single-column hero */
 .hero-solo { grid-template-columns: 1fr; justify-items: center; text-align: center; padding-bottom: clamp(40px, 6vw, 72px); }
