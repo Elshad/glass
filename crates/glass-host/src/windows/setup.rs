@@ -39,7 +39,7 @@ fn service_step() -> Result<()> {
         log::warning("Skipped. Install it later with: glass service install")?;
         return Ok(());
     }
-    match super::service::cli("install") {
+    match super::service::cli("install", false) {
         Ok(()) if matches!(super::service::status(), Ok(Some(_))) => {
             log::success("The secure-desktop service is installed")?;
         }

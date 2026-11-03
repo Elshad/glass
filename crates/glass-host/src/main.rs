@@ -379,6 +379,9 @@ enum Command {
     Service {
         #[arg(value_parser = ["install", "uninstall", "status"], default_value = "status")]
         action: String,
+        /// MSI full uninstall only: also remove the installed program's firewall rule.
+        #[arg(long, hide = true)]
+        remove_host_rule: bool,
     },
     /// Wake a machine with Wake-on-LAN, by a MAC address or a tailnet name seen before.
     Wake { target: String },
@@ -819,6 +822,7 @@ fn main() -> Result<()> {
         let argv: Vec<String> = std::env::args().collect();
         match argv.get(1).map(String::as_str) {
             Some(platform::service::SERVICE_ARG) => return platform::service::run_service(),
+            Some(platform::firewall::APPLY_ARG) => std::process::exit(if platform::firewall::apply_from_arg() { 0 } else { 1 }),
             Some(platform::secure::HELPER_ARG) => return platform::secure::run_helper(),
             Some(platform::micdriver::ARG) => return platform::micdriver::cli(&argv[2..]),
             _ => {}
@@ -1097,7 +1101,7 @@ async fn async_main(args: Args) -> Result<()> {
             Ok(())
         }
         #[cfg(windows)]
-        Some(Command::Service { action }) => platform::service::cli(action),
+        Some(Command::Service { action, remove_host_rule }) => platform::service::cli(action, *remove_host_rule),
         Some(Command::Remote { action }) => remote_cli(action),
         Some(Command::Account { action, json }) => account_cli(action, *json),
         Some(Command::Fleet { action, arg, json }) => fleet_cli(action, arg.as_deref(), *json),

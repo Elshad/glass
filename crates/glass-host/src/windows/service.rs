@@ -24,11 +24,11 @@ pub const SERVICE_ARG: &str = "--glass-service";
 const SERVICE_NAME: &str = "GlassSecureDesktop";
 const DISPLAY_NAME: &str = "Glass Secure Desktop";
 
-/// `glass service <install|uninstall|status>`.
-pub fn cli(action: &str) -> Result<()> {
+/// `glass service <install|uninstall|status>`. `remove_host_rule` is the MSI's full uninstall.
+pub fn cli(action: &str, remove_host_rule: bool) -> Result<()> {
     match action {
         "install" => install(),
-        "uninstall" => uninstall(),
+        "uninstall" => uninstall(remove_host_rule),
         "status" => {
             match status()? {
                 Some(true) => println!("The Glass secure-desktop service is installed and running."),
@@ -82,7 +82,7 @@ unsafe fn close_service_handle(h: *mut core::ffi::c_void) -> bool {
 fn install() -> Result<()> {
     if !is_elevated() {
         // One UAC prompt, like the firewall step (see windows::firewall).
-        return elevate("install");
+        return elevate(&["install"]);
     }
     let exe = protected_copy()?;
     let bin = format!("\"{}\" {SERVICE_ARG}", exe.display());
@@ -269,11 +269,14 @@ fn installed_program() -> Option<std::path::PathBuf> {
         .then_some(installed)
 }
 
-fn uninstall() -> Result<()> {
+fn uninstall(remove_host_rule: bool) -> Result<()> {
     if !is_elevated() {
-        return elevate("uninstall");
+        return elevate(if remove_host_rule { &["uninstall", "--remove-host-rule"] } else { &["uninstall"] });
     }
-    if let Some(exe) = installed_program()
+    // Only a full MSI uninstall asks for this. `glass service uninstall` leaves the
+    // desktop host's rule alone, because the app stays installed.
+    if remove_host_rule
+        && let Some(exe) = installed_program()
         && !super::firewall::remove_rule_quietly(&exe)
     {
         println!("Couldn't remove the Glass firewall rule for {}.", exe.display());
@@ -342,10 +345,11 @@ fn set_sas_policy(on: bool) -> Result<()> {
 }
 
 /// Re-runs `glass service <action>` as administrator (one UAC prompt), like the firewall step.
-fn elevate(action: &str) -> Result<()> {
+fn elevate(extra: &[&str]) -> Result<()> {
     let exe = std::env::current_exe()?;
+    let list = std::iter::once("service").chain(extra.iter().copied()).map(super::ps_string).collect::<Vec<_>>().join(",");
     let script = format!(
-        "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath {} -ArgumentList 'service','{action}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
+        "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath {} -ArgumentList {list} -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
         super::ps_string(&exe.display().to_string())
     );
     let ok = super::powershell(&script).status().is_ok_and(|s| s.success());
