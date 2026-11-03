@@ -256,9 +256,27 @@ unsafe fn restart_on_failure(svc: windows::Win32::System::Services::SC_HANDLE) {
     let _ = unsafe { ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, Some((&raw const config).cast())) };
 }
 
+/// The MSI program (`Program Files\Glass\bin\glass.exe`). Its firewall rule used to
+/// leave with the WiX exception; uninstall removes it even when no service exists.
+fn installed_program() -> Option<std::path::PathBuf> {
+    if let Some(dir) = super::agent::machine_dir() {
+        return Some(dir.join(r"bin\glass.exe"));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let installed = std::path::PathBuf::from(std::env::var_os("ProgramFiles")?).join(r"Glass\bin\glass.exe");
+    crate::browse::shell_path(&exe.to_string_lossy())
+        .eq_ignore_ascii_case(&crate::browse::shell_path(&installed.to_string_lossy()))
+        .then_some(installed)
+}
+
 fn uninstall() -> Result<()> {
     if !is_elevated() {
         return elevate("uninstall");
+    }
+    if let Some(exe) = installed_program()
+        && !super::firewall::remove_rule_quietly(&exe)
+    {
+        println!("Couldn't remove the Glass firewall rule for {}.", exe.display());
     }
     use windows::Win32::System::Services::{
         ControlService, DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS,
@@ -284,7 +302,7 @@ fn uninstall() -> Result<()> {
     }
     let _ = set_sas_policy(false);
     let _ = std::fs::remove_dir_all(signin_dir());
-    // The copy's own rule (an MSI install's rule belongs to the MSI).
+    // The per-user service copy's rule. An MSI install's rule is removed above.
     if super::agent::machine_dir().is_none()
         && let Some(pf) = std::env::var_os("ProgramFiles")
     {

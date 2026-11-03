@@ -94,8 +94,7 @@ fn firewall_step() -> Result<()> {
     if firewall::in_sync(&exe, remote) == Some(true) {
         log::success(firewall::ready_sentence(remote))?;
     } else {
-        let cmd = firewall::add_rule_args(&exe, remote).unwrap_or_else(|| firewall::delete_rule_args(&exe));
-        log::warning(format!("The rule wasn't updated. As administrator, run:\n  netsh {cmd}"))?;
+        log::warning("The firewall rule wasn't updated. Run `glass setup` again; it removes the old Glass rule before adding the new one.")?;
     }
     Ok(())
 }
@@ -111,18 +110,11 @@ pub fn prepare_unattended() -> Vec<crate::setup::Need> {
         ),
         Ok(remote) if firewall::in_sync(&exe, remote) == Some(true) => None,
         Ok(remote) if firewall::add_rule_quietly(&exe) && firewall::in_sync(&exe, remote) == Some(true) => None,
-        Ok(remote) => {
-            let cmd = firewall::add_rule_args(&exe, remote).unwrap_or_else(|| firewall::delete_rule_args(&exe));
-            Some(match remote {
-                Remote::Tailscale => format!(
-                    "Limit Glass's firewall rule to Tailscale (100.64.0.0/10 and fd7a:115c:a1e0::/48): run `glass setup`, or as administrator: netsh {cmd}"
-                ),
-                Remote::Loopback => format!("Remove Glass's inbound firewall rule (it only listens on this computer). As administrator: netsh {cmd}"),
-                Remote::Any => format!(
-                    "Allow Glass through Windows Defender Firewall on private networks: run `glass setup` on the computer (asks for administrator approval once), or as administrator: netsh {cmd}"
-                ),
-            })
-        }
+        Ok(remote) => Some(match remote {
+            Remote::Tailscale => "Limit Glass's firewall rule to Tailscale (100.64.0.0/10 and fd7a:115c:a1e0::/48). Run `glass setup`; it removes the old Glass rule before adding the Tailscale one.".into(),
+            Remote::Loopback => "Remove Glass's inbound firewall rule (it only listens on this computer). Run `glass setup`.".into(),
+            Remote::Any => "Allow Glass through Windows Defender Firewall on private networks. Run `glass setup` (asks for administrator approval once); it removes any old Glass rule first.".into(),
+        }),
     };
     if let Some(action) = action {
         needs.push(crate::setup::Need { step: "firewall", action, on_screen: false });

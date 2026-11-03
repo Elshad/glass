@@ -157,12 +157,17 @@ fn netsh(args: &str) -> bool {
 }
 
 /// Deletes Glass's rule for `exe`, then adds the one `remote` asks for. Already admin.
+/// A missing rule counts as deleted. Success is the firewall then matching `remote`.
 fn replace_rule(exe: &Path, remote: Remote) -> bool {
-    let _ = netsh(&delete_rule_args(exe));
-    match add_rule_args(exe, remote) {
-        Some(add) => netsh(&add),
-        None => true,
+    if !remove_rule_quietly(exe) {
+        return false;
     }
+    if let Some(add) = add_rule_args(exe, remote)
+        && !netsh(&add)
+    {
+        return false;
+    }
+    in_sync(exe, remote) == Some(true)
 }
 
 /// Replaces Glass's rule from the saved bind. `false` leaves any existing rule as it is.
@@ -173,24 +178,63 @@ pub fn add_rule_quietly(exe: &Path) -> bool {
     }
 }
 
-/// Removes Glass's rule for `exe` (as administrator).
+/// Removes Glass's rule for `exe`. `true` when no rule of that name remains for it,
+/// including when there was nothing to delete.
 pub fn remove_rule_quietly(exe: &Path) -> bool {
-    netsh(&delete_rule_args(exe))
+    let _ = netsh(&delete_rule_args(exe));
+    glass_named(exe) == Some(false)
 }
 
-/// Replaces the rule as administrator. Windows asks once. A missing rule does not stop the add.
+/// Any rule named Glass for `exe`, enabled or not. `None` if the firewall can't be listed.
+fn glass_named(exe: &Path) -> Option<bool> {
+    Some(rules()?.iter().any(|r| r.name.trim().eq_ignore_ascii_case("Glass") && same_program(&r.program, exe)))
+}
+
+/// One netsh command line. The program path is a PowerShell single-quoted literal, so
+/// spaces and `$` stay in the path, then cmd runs the same quoted line `netsh` already takes.
+fn netsh_ps(args_before_path: &str, prog: &str, args_after_path: &str) -> String {
+    format!("cmd.exe /d /s /c ('netsh {args_before_path} program=\"' + {prog} + '\"{args_after_path}')")
+}
+
+/// The elevated script: delete, stop if that rule is still there, then add.
+fn replace_script(exe: &Path, remote: Remote) -> String {
+    let prog = super::ps_string(&program(exe));
+    let delete = netsh_ps(r#"advfirewall firewall delete rule name="Glass""#, &prog, "");
+    let show = "cmd.exe /d /c \"netsh advfirewall firewall show rule name=Glass verbose\" | Out-String";
+    let gone = format!("$shown = {show}; if ($LASTEXITCODE -ne 0 -and $shown -notmatch 'No rules match') {{ exit 1 }}; if ($shown -match [regex]::Escape({prog})) {{ exit 1 }}");
+    let add = match remote {
+        Remote::Loopback => String::new(),
+        Remote::Any => netsh_ps(r#"advfirewall firewall add rule name="Glass" dir=in action=allow"#, &prog, " enable=yes profile=private"),
+        Remote::Tailscale => netsh_ps(
+            r#"advfirewall firewall add rule name="Glass" dir=in action=allow"#,
+            &prog,
+            &format!(" enable=yes profile=private remoteip=\"{TAILSCALE_V4},{TAILSCALE_V6}\" edge=no"),
+        ),
+    };
+    let after = if add.is_empty() {
+        String::new()
+    } else {
+        format!("{add}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; $shown = {show}; if ($LASTEXITCODE -ne 0 -or $shown -notmatch [regex]::Escape({prog})) {{ exit 1 }}; ")
+    };
+    format!("$ErrorActionPreference = 'Continue'; {delete} | Out-Null; {gone}; {after}exit 0")
+}
+
+/// Replaces the rule as administrator. Windows asks once. The script refuses to add
+/// while the old rule is still present, and exits 0 only after that check.
 pub fn add_rule_elevated(exe: &Path) -> bool {
     let Ok(remote) = saved_remote() else { return false };
-    let delete = format!("netsh {}", delete_rule_args(exe));
-    let command = match add_rule_args(exe, remote) {
-        Some(add) => format!("{delete}; netsh {add}; exit $LASTEXITCODE"),
-        None => format!("{delete}; exit 0"),
-    };
-    let script = format!(
-        "$ErrorActionPreference = 'Stop'; $p = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command',{} -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
-        super::ps_string(&command)
+    run_elevated(&replace_script(exe, remote))
+}
+
+/// Runs `script` as administrator via `-EncodedCommand` (UTF-16LE), like `remove::elevated`.
+fn run_elevated(script: &str) -> bool {
+    use base64::Engine;
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let run = format!(
+        "$p = Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{encoded}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode"
     );
-    super::powershell(&script).status().is_ok_and(|s| s.success())
+    super::powershell(&run).status().is_ok_and(|s| s.success())
 }
 
 /// Remote addresses of enabled private inbound allows named Glass for `exe`.
@@ -280,6 +324,18 @@ mod tests {
         assert!(add_rule_args(exe, Remote::Loopback).is_none());
     }
 
+    #[test]
+    fn elevated_script_keeps_spaces_and_dollars_inside_the_path() {
+        let spaces = replace_script(Path::new(r"C:\Program Files\Glass\glass.exe"), Remote::Tailscale);
+        let quoted = "program=\"' + 'C:\\Program Files\\Glass\\glass.exe' + '\"";
+        assert!(spaces.matches(quoted).count() >= 2, "{spaces}");
+        let dollar = replace_script(Path::new(r"C:\Glass$Bin\glass.exe"), Remote::Loopback);
+        let literal = "program=\"' + 'C:\\Glass$Bin\\glass.exe' + '\"";
+        assert!(dollar.contains(literal), "{dollar}");
+        let checked = dollar.find("[regex]::Escape('C:\\Glass$Bin\\glass.exe')").expect(&dollar);
+        assert!(checked < dollar.rfind("exit 0").expect(&dollar), "{dollar}");
+    }
+
     /// Creates the Tailscale rule for this executable and reads back exactly both ranges.
     /// Skipped unless Windows CI sets GLASS_FIREWALL_INTEGRATION=1.
     #[test]
@@ -296,7 +352,11 @@ mod tests {
             }
         }
         let _cleanup = Cleanup(exe.clone());
-        assert!(replace_rule(&exe, Remote::Tailscale), "create the tailscale rule");
+        assert!(replace_rule(&exe, Remote::Any), "create the wide rule");
+        let wide = glass_remotes(&exe).expect("list the wide rule");
+        assert_eq!(wide.len(), 1, "wide rules: {wide:?}");
+        assert!(firewall_bind::stored_matches(Remote::Any, wide.first().map(String::as_str)), "wide remote was {}", wide[0]);
+        assert!(replace_rule(&exe, Remote::Tailscale), "replace the wide rule");
         let found = glass_remotes(&exe).expect("list firewall rules");
         assert_eq!(found.len(), 1, "rules: {found:?}");
         assert_eq!(firewall_bind::normalized_remotes(&found[0]), vec![TAILSCALE_V4.to_string(), TAILSCALE_V6.to_string()], "remote addresses were {}", found[0]);
