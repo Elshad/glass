@@ -21,6 +21,7 @@ That installs it for your user, no administrator needed. For installing on every
 - With `glass service install`: the lock screen, UAC prompts, elevated windows and Ctrl+Alt+Del, and **signing in from the viewer after a restart**, with the same page going from the sign-in screen to your desktop.
 - AI agents: screenshots, clicks, keys and typing any text.
 - The viewer's microphone through VB-CABLE (Glass opens its installer).
+- Updating (`glass update`, or the install command again) also updates the secure-desktop service, with one Windows permission prompt, so the lock screen keeps working.
 
 It's a beta: tested on Windows 11 in a VM, not yet widely on real PCs, and the programs aren't code-signed yet, so SmartScreen may warn before the installer runs. [Report problems](https://github.com/Ntarasiuk/glass/issues).
 
