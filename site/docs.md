@@ -537,7 +537,7 @@ Keys arrive as typed on Linux hosts: ⌘ on an Apple keyboard is Super. Paste fr
 
 While the session is locked (logind's lock hint, or a locker such as hyprlock or swaylock running), keys aren't shown to viewers or logged. **Stay awake with the lid closed** works on Linux laptops too; see [A locked screen, or a closed lid](#a-locked-screen-or-a-closed-lid).
 
-## Windows host (preview)
+## Windows host (beta)
 
 On Windows 10 or 11 (x64 or Arm), run in PowerShell:
 
@@ -573,7 +573,7 @@ Hyprland keeps its own Super shortcuts. In fullscreen (Ctrl+Shift+F), Chromium's
 - All traffic is encrypted (TLS 1.3 via QUIC/HTTPS).
 - With Tailscale, traffic stays on your private tailnet and goes directly between devices when possible.
 - Access control: a device is let in if Tailscale reports it belongs to the same user as the Mac, if it presents the access token, or (as a guest) if its Tailscale user is named by an access rule or `tailnet-members` is on. Glass sends nothing to a session (video, audio, clipboard, input) until it is authenticated. Links, single sign-on, LDAP, access rules, posture checks and passkeys can narrow that further; see above.
-- Glass runs as your user (a LaunchAgent on macOS, a systemd user service on Linux, a sign-in entry on Windows), never as root. On Windows you can opt into the Glass Secure Desktop service, whose SYSTEM helper only serves your own Glass (see [Windows host](#windows-host-preview)). The one exception you can opt into: **Stay awake with the lid closed** on a Mac installs a sudoers rule that lets it turn sleep off and on (`pmset -a disablesleep 0|1`), nothing else.
+- Glass runs as your user (a LaunchAgent on macOS, a systemd user service on Linux, a sign-in entry on Windows), never as root. On Windows you can opt into the Glass Secure Desktop service, whose SYSTEM helper only serves your own Glass (see [Windows host](#windows-host-beta)). The one exception you can opt into: **Stay awake with the lid closed** on a Mac installs a sudoers rule that lets it turn sleep off and on (`pmset -a disablesleep 0|1`), nothing else.
 - Keys pressed into a password field, or anywhere while a Linux session is locked, aren't shown to viewers or logged.
 - The file browser is for the computer's owner only (not links or guests), sees only the home folder (no `..`, no symlinks out), and moves to the Trash rather than deleting.
 - Fleet (opt-in) sends a computer's details to your glassdesk.dev account and lets that account ask for a fixed set of actions, each signed by your passkey and checked by the computer itself. See [Glass Fleet](#glass-fleet-new) for what's sent and what can and can't happen.
@@ -629,7 +629,7 @@ Free code signing provided by [SignPath.io](https://about.signpath.io), certific
 
 **Does it work on Linux?** Yes, as a viewer in any modern browser, and as a host on Wayland (beta).
 
-**Does it work on Windows?** As a viewer, yes, in any modern browser. As a host, in preview: see [Windows host](#windows-host-preview).
+**Does it work on Windows?** As a viewer, yes, in any modern browser. As a host, in beta: see [Windows host](#windows-host-beta).
 
 **Does it stream audio?** Yes, the host's system audio, toggled per device.
 

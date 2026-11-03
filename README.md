@@ -215,7 +215,7 @@ Found a security issue? Please open a [private security advisory](https://github
 
 **Do I need an app on the iPad?** No, just Safari. Tailscale is optional when you use `glass link --anywhere`.
 
-**Can Windows be the host?** Not yet. Windows works as a viewer in any modern browser.
+**Can Windows be the host?** Yes, in beta: Windows 10 or 11, x64 or Arm. In PowerShell, `irm glassdesk.dev/install.ps1 | iex`. See [Windows host](https://glassdesk.dev/docs#windows-host-beta).
 
 **Can I control a locked Mac?** Yes, type your password at the lock screen. After a reboot, FileVault still needs one local login.
 
