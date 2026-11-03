@@ -173,9 +173,22 @@ fn replace_rule(exe: &Path, remote: Remote) -> bool {
 /// Replaces Glass's rule from the saved bind. `false` leaves any existing rule as it is.
 pub fn add_rule_quietly(exe: &Path) -> bool {
     match saved_remote() {
-        Ok(remote) => replace_rule(exe, remote),
+        Ok(remote) => apply_known(exe, remote),
         Err(()) => false,
     }
+}
+
+/// Replaces Glass's rule for `exe` with `remote` and stores that word for the installer.
+/// Does not read settings. The store is HKLM, so only an elevated caller succeeds at it.
+pub fn apply_known(exe: &Path, remote: Remote) -> bool {
+    if !replace_rule(exe, remote) {
+        log_scope("Couldn't update the Glass firewall rule.");
+        return false;
+    }
+    if !store_scope(remote) {
+        log_scope("The firewall rule was updated, but its scope was not saved for the next upgrade.");
+    }
+    true
 }
 
 /// Removes Glass's rule for `exe`. `true` when no rule of that name remains for it,
@@ -199,12 +212,36 @@ fn glass_named(exe: &Path) -> Option<bool> {
 pub const APPLY_ARG: &str = "--apply-firewall-rule";
 
 /// The only words [`parse_remote_arg`] accepts. The parent classified these; the child does not.
-fn remote_arg(remote: Remote) -> &'static str {
+pub fn remote_arg(remote: Remote) -> &'static str {
     match remote {
         Remote::Tailscale => "tailscale",
         Remote::Loopback => "loopback",
         Remote::Any => "any",
     }
+}
+
+/// Read the machine scope instead of classifying again. The installer passes this.
+pub const FROM_SAVED_SCOPE: &str = "--from-saved-scope";
+
+/// What a machine-scope value means. Missing, blank, or unknown is the rule an older
+/// MSI installed: private profile, any remote address. Never a settings-file read.
+pub fn scope_from_saved(stored: Option<&str>) -> Remote {
+    stored.map(str::trim).filter(|s| !s.is_empty()).and_then(parse_remote_arg).unwrap_or(Remote::Any)
+}
+
+/// The scope `--apply-firewall-rule` was given. `None` rejects the command.
+pub fn scope_for_apply(rest: &[&str], saved: Option<&str>) -> Option<Remote> {
+    match rest {
+        [flag] if *flag == FROM_SAVED_SCOPE => Some(scope_from_saved(saved)),
+        [word] => parse_remote_arg(word),
+        _ => None,
+    }
+}
+
+/// Scope for an elevated `glass service install`. A passed word wins. Otherwise a valid
+/// machine-scope word. Missing or unknown leaves the rule alone (it does not become any).
+pub fn scope_for_service(passed: Option<&str>, persisted: Option<&str>) -> Option<Remote> {
+    passed.and_then(|s| parse_remote_arg(s.trim())).or_else(|| persisted.and_then(|s| parse_remote_arg(s.trim())))
 }
 
 /// `Some` only for [`remote_arg`]. Anything else, including a different case, is refused.
@@ -232,17 +269,70 @@ fn elevate_launch(exe: &Path, remote: Remote) -> String {
 pub fn add_rule_elevated(exe: &Path) -> bool {
     let Ok(remote) = saved_remote() else { return false };
     if super::service::is_elevated() {
-        return replace_rule(exe, remote);
+        return apply_known(exe, remote);
     }
     super::powershell(&elevate_launch(exe, remote)).status().is_ok_and(|s| s.success())
 }
 
-/// Entry for [`APPLY_ARG`] plus one [`parse_remote_arg`] word. The program is this executable.
-/// True only when its Glass rule then matches that word. Never reads settings.
+/// Entry for [`APPLY_ARG`] plus one word, or [`FROM_SAVED_SCOPE`]. The program is this
+/// executable. Never reads settings.
 pub fn apply_from_arg(rest: &[String]) -> bool {
-    let [remote] = rest else { return false };
-    let Some(remote) = parse_remote_arg(remote) else { return false };
-    super::service::is_elevated() && std::env::current_exe().ok().is_some_and(|exe| replace_rule(&exe, remote))
+    if !super::service::is_elevated() {
+        return false;
+    }
+    let saved = machine_scope();
+    let words: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let Some(remote) = scope_for_apply(&words, saved.as_deref()) else { return false };
+    if words == [FROM_SAVED_SCOPE] && saved.as_deref().and_then(|s| parse_remote_arg(s.trim())).is_none() {
+        let detail = saved.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        log_scope(&match detail {
+            None => "No saved firewall scope; restoring the private-network rule the older installer added.".into(),
+            Some(word) => format!("Saved firewall scope {word:?} is not usable; restoring the private-network rule the older installer added."),
+        });
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        log_scope("Couldn't find this program to update its firewall rule.");
+        return false;
+    };
+    apply_known(&exe, remote)
+}
+
+const SCOPE_KEY: &str = r"SOFTWARE\Glass";
+const SCOPE_VALUE: &str = "FirewallScope";
+
+pub fn machine_scope() -> Option<String> {
+    let value = super::registry_string(SCOPE_KEY, SCOPE_VALUE)?;
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn store_scope(remote: Remote) -> bool {
+    let wide: Vec<u16> = remote_arg(remote).encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated UTF-16 word and its size in bytes. Creates the key.
+    unsafe {
+        windows::Win32::System::Registry::RegSetKeyValueW(
+            windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+            &windows::core::HSTRING::from(SCOPE_KEY),
+            &windows::core::HSTRING::from(SCOPE_VALUE),
+            windows::Win32::System::Registry::REG_SZ.0,
+            Some(wide.as_ptr().cast()),
+            (wide.len() * 2) as u32,
+        )
+        .is_ok()
+    }
+}
+
+fn log_scope(msg: &str) {
+    println!("{msg}");
+    let dir = std::env::var_os("ProgramData").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
+    let path = dir.join(r"Glass\firewall.log");
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let mut line = msg.to_string();
+    line.push_str("\r\n");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 /// Whether the Glass rules for one program are exactly what `remote` asks for.
@@ -273,7 +363,7 @@ pub fn bind_change_note() -> Option<String> {
         Err(()) => return Some("Couldn't read the saved listen address, so the firewall rule was left unchanged.".into()),
     };
     if super::service::is_elevated() {
-        return Some(if replace_rule(&exe, remote) {
+        return Some(if apply_known(&exe, remote) {
             match remote {
                 Remote::Tailscale => format!("The firewall rule now allows only {TAILSCALE_V4} and {TAILSCALE_V6}."),
                 Remote::Loopback => "The inbound firewall rule was removed; Glass only listens on this computer.".into(),
@@ -359,6 +449,29 @@ mod tests {
         }
         assert!(!apply_from_arg(&[]));
         assert!(!apply_from_arg(&["any".into(), "tailscale".into()]));
+    }
+
+    #[test]
+    fn saved_scope_and_service_args_do_not_read_a_profile() {
+        assert_eq!(scope_from_saved(None), Remote::Any);
+        assert_eq!(scope_from_saved(Some("")), Remote::Any);
+        assert_eq!(scope_from_saved(Some("  ")), Remote::Any);
+        assert_eq!(scope_from_saved(Some("Any")), Remote::Any);
+        assert_eq!(scope_from_saved(Some("wider")), Remote::Any);
+        assert_eq!(scope_from_saved(Some(" tailscale ")), Remote::Tailscale);
+        assert_eq!(scope_from_saved(Some("loopback")), Remote::Loopback);
+        assert_eq!(scope_for_apply(&["--from-saved-scope"], None), Some(Remote::Any));
+        assert_eq!(scope_for_apply(&["--from-saved-scope"], Some("nope")), Some(Remote::Any));
+        assert_eq!(scope_for_apply(&["--from-saved-scope"], Some("tailscale")), Some(Remote::Tailscale));
+        assert_eq!(scope_for_apply(&["tailscale"], Some("any")), Some(Remote::Tailscale));
+        assert_eq!(scope_for_apply(&["nope"], None), None);
+        assert_eq!(scope_for_apply(&["any", "tailscale"], None), None);
+        assert_eq!(scope_for_apply(&[], Some("tailscale")), None);
+        assert_eq!(scope_for_service(Some("tailscale"), Some("any")), Some(Remote::Tailscale));
+        assert_eq!(scope_for_service(None, Some("loopback")), Some(Remote::Loopback));
+        assert_eq!(scope_for_service(None, None), None);
+        assert_eq!(scope_for_service(None, Some("missing-file")), None);
+        assert_eq!(scope_for_service(Some("ANY"), Some("tailscale")), Some(Remote::Tailscale));
     }
 
     #[test]

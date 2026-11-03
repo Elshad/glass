@@ -25,9 +25,11 @@ const SERVICE_NAME: &str = "GlassSecureDesktop";
 const DISPLAY_NAME: &str = "Glass Secure Desktop";
 
 /// `glass service <install|uninstall|status>`. `remove_host_rule` is the MSI's full uninstall.
-pub fn cli(action: &str, remove_host_rule: bool) -> Result<()> {
+/// `firewall_scope` is the word classified before elevation; the elevated process does not
+/// read settings.
+pub fn cli(action: &str, remove_host_rule: bool, firewall_scope: Option<&str>) -> Result<()> {
     match action {
-        "install" => install(),
+        "install" => install(firewall_scope),
         "uninstall" => uninstall(remove_host_rule),
         "status" => {
             match status()? {
@@ -79,17 +81,30 @@ unsafe fn close_service_handle(h: *mut core::ffi::c_void) -> bool {
     unsafe { windows::Win32::System::Services::CloseServiceHandle(windows::Win32::System::Services::SC_HANDLE(h)).is_ok() }
 }
 
-fn install() -> Result<()> {
+fn install(firewall_scope: Option<&str>) -> Result<()> {
     if !is_elevated() {
-        // One UAC prompt, like the firewall step (see windows::firewall).
-        return elevate(&["install"]);
+        // Classify here, then pass the word. The elevated process must not read settings:
+        // a credential prompt runs as the approving administrator, whose profile is empty.
+        return match super::firewall::saved_remote() {
+            Ok(remote) => elevate(&["install", "--firewall-scope", super::firewall::remote_arg(remote)]),
+            Err(()) => {
+                if super::firewall::scope_for_service(None, super::firewall::machine_scope().as_deref()).is_none() {
+                    println!("Couldn't read the saved listen address, so no firewall rule was added.");
+                }
+                elevate(&["install"])
+            }
+        };
     }
     let exe = protected_copy()?;
     let bin = format!("\"{}\" {SERVICE_ARG}", exe.display());
-    // The sign-in host runs this copy: it needs its own firewall rule (private networks,
-    // like glass setup's), as SYSTEM can't answer Windows' prompt.
-    if !super::firewall::add_rule_quietly(&exe) {
-        println!("Couldn't let the sign-in screen's Glass through Windows Firewall; viewers may not reach it.");
+    // The sign-in host runs this copy. The scope is the word we were given, or the one
+    // already stored for the installer. Neither path reads the elevated account's settings.
+    match super::firewall::scope_for_service(firewall_scope, super::firewall::machine_scope().as_deref()) {
+        Some(remote) if !super::firewall::apply_known(&exe, remote) => {
+            println!("Couldn't let the sign-in screen's Glass through Windows Firewall; viewers may not reach it.");
+        }
+        Some(_) => {}
+        None => println!("No firewall scope was given, so the sign-in screen's rule was left unchanged."),
     }
     // The sign-in screen after a restart (signin.rs): this user's token and access rules.
     match copy_signin_settings() {

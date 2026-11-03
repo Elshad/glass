@@ -382,6 +382,9 @@ enum Command {
         /// MSI full uninstall only: also remove the installed program's firewall rule.
         #[arg(long, hide = true)]
         remove_host_rule: bool,
+        /// Classified before elevation. The elevated install does not read settings.
+        #[arg(long, hide = true, value_parser = ["tailscale", "loopback", "any"])]
+        firewall_scope: Option<String>,
     },
     /// Wake a machine with Wake-on-LAN, by a MAC address or a tailnet name seen before.
     Wake { target: String },
@@ -1101,7 +1104,9 @@ async fn async_main(args: Args) -> Result<()> {
             Ok(())
         }
         #[cfg(windows)]
-        Some(Command::Service { action, remove_host_rule }) => platform::service::cli(action, *remove_host_rule),
+        Some(Command::Service { action, remove_host_rule, firewall_scope }) => {
+            platform::service::cli(action, *remove_host_rule, firewall_scope.as_deref())
+        }
         Some(Command::Remote { action }) => remote_cli(action),
         Some(Command::Account { action, json }) => account_cli(action, *json),
         Some(Command::Fleet { action, arg, json }) => fleet_cli(action, arg.as_deref(), *json),
