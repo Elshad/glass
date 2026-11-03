@@ -1315,8 +1315,8 @@ async fn run_host(args: Args) -> Result<()> {
             video,
             Box::new(testmode::FakeInput),
             Arc::new(testmode::FakeClipboard),
-            // Who owns the computer on Tailscale, when a test says (see tailscale::identity).
-            std::env::var("GLASS_TEST_TAILNET_OWNER").ok(),
+            // Who owns the computer on Tailscale, when a test says. Never polls Tailscale.
+            tailscale::TailnetOwner::fixed(std::env::var("GLASS_TEST_TAILNET_OWNER").ok()),
             None,
         )
     } else {
@@ -1369,16 +1369,15 @@ async fn run_host(args: Args) -> Result<()> {
         if !signin::active() {
             clipboard::watch(events.clone());
         }
-        let tailnet_owner = match tailscale::self_login().await {
+        // A miss (Tailscale not up yet) is resolved on the next connection, then kept.
+        let tailnet_owner = tailscale::TailnetOwner::unknown();
+        match tailscale::self_login().await {
             Ok(login) => {
                 info!("tailnet devices owned by {login} connect without a token");
-                Some(login)
+                tailnet_owner.store(login);
             }
-            Err(e) => {
-                info!("tailscale unavailable ({e:#}); token required for all clients");
-                None
-            }
-        };
+            Err(e) => info!("tailscale unavailable ({e:#}); will check again on connection"),
+        }
         (
             video,
             Box::new(input::Injector::new(display.id)),
