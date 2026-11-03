@@ -579,6 +579,12 @@ async fn control(
         && (crate::testmode::enabled() || tailscale::is_tailscale_ip(peer))
     {
         let owner = shared.tailnet_owner.get_or_resolve(peer).await;
+        // Nothing presented, and only while Tailscale may still be starting. A wrong token,
+        // a link, `--test` (no owner to wait for), or a later connection is `unauthorized`.
+        let retry = owner.is_none()
+            && token.is_none()
+            && link.is_none()
+            && shared.tailnet_owner.retry_unknown();
         if let Some(login) = tailscale::identity(peer).await {
             if owner.as_deref() == Some(login.as_str()) {
                 auth = Some(Auth::Tailnet);
@@ -586,10 +592,10 @@ async fn control(
                 // Someone else on the tailnet: the access rules name them, or the owner lets the
                 // whole tailnet in (tailnet-members).
                 auth = Some(Auth::TailnetGuest { login, scope });
-            } else if owner.is_none() {
+            } else if retry {
                 tailnet_pending = true;
             }
-        } else if owner.is_none() {
+        } else if retry {
             tailnet_pending = true;
         }
     }

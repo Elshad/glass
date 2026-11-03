@@ -127,6 +127,8 @@ enum How {
 
 /// How long to wait after a miss before another `tailscale status`.
 const RETRY_AFTER: Duration = Duration::from_secs(3);
+/// How long after startup a viewer with no token and no link may reconnect while Tailscale is down.
+const STARTUP_GRACE: Duration = Duration::from_secs(90);
 
 #[derive(Clone)]
 pub struct TailnetOwner {
@@ -134,6 +136,8 @@ pub struct TailnetOwner {
     /// Earliest time another lookup may run after a miss.
     retry_at: Arc<Mutex<std::time::Instant>>,
     retry_after: Duration,
+    /// When this host began. The reconnect window is measured from here.
+    started: std::time::Instant,
     /// One lookup at a time. Waiters take the result, or the cooldown, instead of spawning.
     gate: Arc<tokio::sync::Mutex<()>>,
     how: Arc<How>,
@@ -145,9 +149,15 @@ impl TailnetOwner {
             login: Arc::new(Mutex::new(login)),
             retry_at: Arc::new(Mutex::new(std::time::Instant::now())),
             retry_after: RETRY_AFTER,
+            started: std::time::Instant::now(),
             gate: Arc::new(tokio::sync::Mutex::new(())),
             how: Arc::new(how),
         }
+    }
+
+    /// Live owner, still inside the startup window. `--test` is fixed and never retries.
+    pub fn retry_unknown(&self) -> bool {
+        matches!(&*self.how, How::Live) && self.started.elapsed() < STARTUP_GRACE
     }
 
     pub fn unknown() -> Self {
@@ -517,5 +527,15 @@ mod tests {
         owner.expire();
         assert_eq!(owner.get_or_resolve(ts).await.as_deref(), Some("ada@example.com"));
         assert_eq!(owner.get_or_resolve(ts).await.as_deref(), Some("ada@example.com"), "bea is never read");
+    }
+
+    #[test]
+    fn a_missing_owner_retries_only_just_after_startup() {
+        let live = TailnetOwner::unknown();
+        assert!(live.retry_unknown());
+        let mut later = live.clone();
+        later.started -= STARTUP_GRACE;
+        assert!(!later.retry_unknown());
+        assert!(!TailnetOwner::fixed(None).retry_unknown());
     }
 }
