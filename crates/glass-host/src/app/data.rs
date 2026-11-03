@@ -37,6 +37,8 @@ pub struct Snapshot {
     pub notify: Vec<NotifyDevice>,
     /// The device viewers' microphones play into (Glass Microphone or BlackHole), if installed.
     pub mic: Option<String>,
+    /// What an administrator manages (shown, but not editable).
+    pub policy: crate::policy::Policy,
 }
 
 #[derive(Clone, PartialEq)]
@@ -143,6 +145,7 @@ pub fn gather() -> Snapshot {
         log: connlog::recent(200).into_iter().rev().collect(),
         token: std::fs::read_to_string(crate::default_token_file()).unwrap_or_default().trim().to_string(),
         mic: crate::mic::device_name(),
+        policy: crate::policy::load(),
         notify: crate::push::list()
             .into_iter()
             .map(|s| NotifyDevice {

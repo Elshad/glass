@@ -88,11 +88,14 @@ pub async fn run(
     };
     info!("WebTransport listening on {wt_where} udp/{wt_port}");
     crate::remote::watch(wt_port, listen.wt_dial());
-    crate::fleet::watch();
-    // What the computer is playing, for viewers' media controls (while anyone is connected).
-    crate::now_playing::watch(shared.events.clone());
-    // A mic left on when the host last stopped left BlackHole as the default input.
-    crate::mic::recover();
+    // Fleet's scripts and the microphone belong to a signed-in user, not the sign-in screen.
+    if !crate::signin::active() {
+        crate::fleet::watch();
+        // What the computer is playing, for viewers' media controls (while anyone is connected).
+        crate::now_playing::watch(shared.events.clone());
+        // A mic left on when the host last stopped left BlackHole as the default input.
+        crate::mic::recover();
+    }
 
     let cert_hash = cert_hash.map(|h| serde_json::from_str::<Vec<u8>>(&h).unwrap());
     let version_dir = web_dir.clone();
@@ -118,18 +121,26 @@ pub async fn run(
     let machines_cache: MachinesCache = Arc::new(tokio::sync::Mutex::new(None));
     let manifest_cache = machines_cache.clone();
     let manifest_dir = web_dir.clone();
+    // The sign-in host (SYSTEM) serves the viewer and nothing else: forwarded ports, the
+    // admin console, single sign-on, agents and file links would all act as SYSTEM.
+    let extras = if crate::signin::active() {
+        axum::Router::new()
+    } else {
+        axum::Router::new()
+            .merge(crate::forward::routes())
+            .merge(crate::oidc::routes())
+            .merge(crate::admin::routes())
+            .merge(crate::ldap::routes())
+            .merge(crate::scim::routes())
+            .merge(crate::acl::routes())
+            .merge(crate::computer::routes())
+            .merge(crate::oauth::routes())
+            .merge(crate::push::routes())
+            .merge(crate::browse::routes())
+    };
     let app = axum::Router::new()
         .merge(extra_routes.unwrap_or_default())
-        .merge(crate::forward::routes())
-        .merge(crate::oidc::routes())
-        .merge(crate::admin::routes())
-        .merge(crate::ldap::routes())
-        .merge(crate::scim::routes())
-        .merge(crate::acl::routes())
-        .merge(crate::computer::routes())
-        .merge(crate::oauth::routes())
-        .merge(crate::push::routes())
-        .merge(crate::browse::routes())
+        .merge(extras)
         .route("/config.json", get(client_config))
         .route(
             "/manifest.webmanifest",
@@ -152,7 +163,9 @@ pub async fn run(
     // Agents from anywhere: only the OAuth and MCP routes, on this computer alone, for
     // Tailscale Funnel to publish (glass agents public on). This listener is loopback-only
     // and does not follow --bind.
-    crate::oauth::serve_public();
+    if !crate::signin::active() {
+        crate::oauth::serve_public();
+    }
     let web_port = http_listeners
         .first()
         .context("no web listener")?
@@ -468,7 +481,9 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     // task holds the connection, and with it this viewer's place in the list.
     conn.close(0u32.into(), b"session ended");
 
-    if authed.load(Ordering::Relaxed) {
+    // Anything still held, when no one else is giving input: another viewer may be holding
+    // Shift right now (each input stream lets go of its own keys when it ends).
+    if authed.load(Ordering::Relaxed) && INPUT_STREAMS.load(Ordering::Relaxed) == 0 {
         shared.injector.lock().unwrap().release_all();
         crate::gamepad::release_all();
     }
@@ -558,10 +573,33 @@ async fn control(
         && hello_ok
         // Over WebRTC the address is public, never a tailnet device's.
         && ctx.relayed.is_none()
-        && let Some(owner) = &shared.tailnet_owner
-        && tailscale::is_trusted(peer, owner).await
+        && let Some(login) = tailscale::identity(peer).await
     {
-        auth = Some(Auth::Tailnet);
+        if shared.tailnet_owner.as_deref() == Some(login.as_str()) {
+            auth = Some(Auth::Tailnet);
+        } else if let Some(scope) = tailnet_guest_scope(&login) {
+            // Someone else on the tailnet: the access rules name them, or the owner lets the
+            // whole tailnet in (tailnet-members).
+            auth = Some(Auth::TailnetGuest { login, scope });
+        }
+    }
+    // A policy can turn guest links (or, in its own host, quick support) off: new links and
+    // devices already let in by one are refused.
+    let policy = crate::policy::load();
+    if auth.is_none()
+        && !policy.allows(if crate::support::is_host() { "support" } else { "links" })
+        && (link.is_some()
+            || pass
+                .as_deref()
+                .and_then(|p| crate::access::check_pass(&access_file, p))
+                .is_some_and(|v| v.from_link))
+    {
+        refused(&device, "guest links are off by policy");
+        let msg = "Guest links are turned off on this computer by its organization.".into();
+        control::write_json(&mut send, &ServerMsg::Denied { msg }).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ctx.conn.close(1u32.into(), b"links off");
+        return Ok(());
     }
     if auth.is_none()
         && let Some(p) = &pass
@@ -660,19 +698,33 @@ async fn control(
             return Ok(());
         }
     }
-    let perms = match &auth {
-        Auth::Guest { scope, .. } => control::Perms::guest(scope),
+    let mut perms = match &auth {
+        Auth::Guest { scope, .. } | Auth::TailnetGuest { scope, .. } => control::Perms::guest(scope),
         _ => control::Perms::owner(),
     };
+    // Files and the clipboard can be off for everyone, by policy.
+    perms.files &= policy.allows("files");
+    perms.clipboard &= policy.allows("clipboard");
+    let terminal = crate::terminal::SUPPORTED && policy.allows("terminal");
+    // The sign-in host runs as SYSTEM: its owner-only features would be the whole computer.
+    // Everyone gets the screen and input there, and nothing else.
+    let signin = crate::signin::active();
+    let asked = !perms.owner;
+    if signin {
+        perms.owner = false;
+        perms.files = false;
+        perms.clipboard = false;
+    }
+    let terminal = terminal && !signin;
     let guest = !perms.owner;
-    if matches!(auth, Auth::Tailnet)
+    if matches!(auth, Auth::Tailnet | Auth::TailnetGuest { .. })
         && let Some(name) = tailscale::device_name(peer).await
     {
         device = format!("{name} ({device})");
     }
     let how = match &auth {
         Auth::Token => crate::viewers::How::Token,
-        Auth::Tailnet => crate::viewers::How::Tailnet,
+        Auth::Tailnet | Auth::TailnetGuest { .. } => crate::viewers::How::Tailnet,
         Auth::Guest { .. } => crate::viewers::How::Guest,
     };
     let session_id = crate::viewers::next_id();
@@ -686,6 +738,7 @@ async fn control(
     };
     let scope_detail = match &auth {
         Auth::Guest { scope, .. } => scope.describe(),
+        Auth::TailnetGuest { login, scope } => format!("{login}, {}", scope.describe()),
         _ => String::new(),
     };
 
@@ -702,8 +755,9 @@ async fn control(
 
     // Ask before connecting: the person at the computer allows (or denies) this viewer.
     let settings = crate::settings::load();
-    let scope_asks = matches!(&auth, Auth::Guest { scope, .. } if scope.ask);
-    if settings.ask_everyone || (guest && (settings.ask_guests || scope_asks)) {
+    let scope_asks = matches!(&auth, Auth::Guest { scope, .. } | Auth::TailnetGuest { scope, .. } if scope.ask);
+    // (Nobody is at the sign-in screen to ask.)
+    if !signin && (settings.ask_everyone || (asked && (settings.ask_guests || scope_asks))) {
         let msg = "Waiting for the person at this computer to let you in…".into();
         control::write_json(&mut send, &ServerMsg::Waiting { msg }).await?;
         let mut who = viewer.describe();
@@ -729,6 +783,9 @@ async fn control(
     match &auth {
         Auth::Token => info!("{peer}: authenticated via token"),
         Auth::Tailnet => info!("{peer}: authenticated via tailnet identity"),
+        Auth::TailnetGuest { login, scope } => {
+            info!("{peer}: authenticated via tailnet identity {login}, a guest ({})", scope.describe())
+        }
         Auth::Guest {
             expires,
             new,
@@ -838,7 +895,7 @@ async fn control(
         mic: crate::mic::supported(),
         mic_install: perms.owner && !crate::mic::supported(),
         windows: shared.video.supports_windows(),
-        terminal: crate::terminal::SUPPORTED,
+        terminal,
         restart: true,
         record: crate::recording::supported(),
         hevc: shared.video.supports_hevc(),
@@ -853,6 +910,7 @@ async fn control(
         push: crate::push::public_key(),
         browse: perms.owner && perms.files,
         extend: cfg!(target_os = "macos") || crate::testmode::enabled(),
+        fit: cfg!(target_os = "macos") || crate::testmode::enabled(),
         support: crate::support::is_host(),
     };
     // Someone other than the owner is in: worth a notification on the owner's devices.
@@ -1074,6 +1132,12 @@ async fn control(
             ClientMsg::Audio { on } => {
                 ctx.audio_on.store(on, Ordering::Relaxed);
                 info!("{peer}: audio {}", if on { "on" } else { "off" });
+                #[cfg(windows)]
+                if on && crate::platform::audio::unavailable().is_some() {
+                    let _ = ctx.ctl_tx.send(ServerMsg::Notice {
+                        msg: "No sound to share: this computer has no sound output right now.".into(),
+                    });
+                }
             }
             ClientMsg::FilesList { .. }
             | ClientMsg::FilesFetch { .. }
@@ -1194,6 +1258,15 @@ async fn control(
                 }
                 Err(e) => refuse(&format!("Couldn't wake {dns}: {e:#}")),
             },
+            ClientMsg::Sas if !perms.input => refuse("This link is view only."),
+            ClientMsg::Sas => {
+                #[cfg(windows)]
+                if !crate::platform::secure::send_sas() {
+                    refuse("Ctrl+Alt+Del needs the Glass secure-desktop service. Install it with `glass service install`.");
+                }
+                #[cfg(not(windows))]
+                refuse("Ctrl+Alt+Del is only available on Windows.");
+            }
             ClientMsg::Agent { .. } | ClientMsg::AgentAnswer { .. } if guest => refuse(OWNER_ONLY),
             ClientMsg::Agent { op } => crate::computer::control(&op),
             ClientMsg::AgentAnswer { id, ok, note } => {
@@ -1292,6 +1365,7 @@ async fn control(
                 info!("{peer}: microphone {}", if on { "on" } else { "off" });
             }
             ClientMsg::Term(_) if guest => refuse(OWNER_ONLY),
+            ClientMsg::Term(_) if !terminal => refuse("The terminal is turned off on this computer by its organization."),
             ClientMsg::Term(msg) => {
                 if let Err(e) = term.handle(msg, ctx.ctl_tx.clone()) {
                     refuse(&format!("{e:#}"));
@@ -1536,7 +1610,7 @@ async fn fit(ctx: &SessionCtx, _session: u64, size: Option<[u32; 2]>) -> Result<
         return Ok(());
     }
     if size.is_some() {
-        let msg = "Fitting the desktop to this device isn't available on Linux yet.".into();
+        let msg = "Fitting the desktop to this device is only available on a Mac for now.".into();
         let _ = ctx.ctl_tx.send(ServerMsg::Error { msg });
     }
     Ok(())
@@ -1770,6 +1844,11 @@ async fn set_layout(ctx: &SessionCtx, layout: Layout) -> Result<()> {
 enum Auth {
     Token,
     Tailnet,
+    /// Someone else's tailnet device, let in by the access rules or `tailnet-members`.
+    TailnetGuest {
+        login: String,
+        scope: crate::access::Scope,
+    },
     /// Via a magic link: `new` when the link was opened just now (the pass is sent back).
     Guest {
         pass: String,
@@ -1778,6 +1857,15 @@ enum Auth {
         scope: crate::access::Scope,
         passkey: Option<crate::access::Passkey>,
     },
+}
+
+/// What someone else on the tailnet (`login`) may do: the access rules' first match, else a
+/// guest's default if the owner lets the whole tailnet in; `None`: they need the token.
+fn tailnet_guest_scope(login: &str) -> Option<crate::access::Scope> {
+    if let Some((scope, _)) = crate::acl::decide(&crate::acl::effective(), login, &[]) {
+        return Some(scope);
+    }
+    crate::settings::load().tailnet_members.then(crate::access::Scope::default)
 }
 
 /// How often a guest session re-checks that its pass is still valid.
@@ -1810,6 +1898,9 @@ fn record_auth_failure(shared: &Shared, peer: std::net::IpAddr) {
 
 const AUTH_WAIT: Duration = Duration::from_secs(10);
 
+/// Input streams open right now, across viewers.
+static INPUT_STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
     let mut tag = [0u8; 1];
     stream.read_exact(&mut tag).await?;
@@ -1831,8 +1922,12 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
     match tag[0] {
         STREAM_INPUT => {
             info!("{}: input stream open", ctx.conn.remote_address());
+            INPUT_STREAMS.fetch_add(1, Ordering::Relaxed);
             let mut buf = [0u8; INPUT_EVENT_LEN];
             let mut events = 0u64;
+            // What this viewer is holding down, to let go of when it leaves.
+            let mut keys = std::collections::HashSet::new();
+            let mut buttons = std::collections::HashSet::new();
             while stream.read_exact(&mut buf).await.is_ok() {
                 // A view-only link's input is read and dropped.
                 if !perms.input {
@@ -1847,12 +1942,29 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
                         if matches!(ev, InputEvent::MouseDown { .. } | InputEvent::KeyDown { .. } | InputEvent::Scroll { .. }) {
                             crate::computer::human_input();
                         }
+                        match ev {
+                            InputEvent::KeyDown { keycode } => _ = keys.insert(keycode),
+                            InputEvent::KeyUp { keycode } => _ = keys.remove(&keycode),
+                            InputEvent::MouseDown { button } => _ = buttons.insert(button),
+                            InputEvent::MouseUp { button } => _ = buttons.remove(&button),
+                            _ => {}
+                        }
                         ctx.shared.injector.lock().unwrap().handle(ev)
                     }
                     None => continue,
                 }
                 events += 1;
             }
+            {
+                let mut injector = ctx.shared.injector.lock().unwrap();
+                for keycode in keys {
+                    injector.handle(InputEvent::KeyUp { keycode });
+                }
+                for button in buttons {
+                    injector.handle(InputEvent::MouseUp { button });
+                }
+            }
+            INPUT_STREAMS.fetch_sub(1, Ordering::Relaxed);
             info!(
                 "{}: input stream closed after {events} events",
                 ctx.conn.remote_address()

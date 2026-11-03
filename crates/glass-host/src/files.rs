@@ -152,8 +152,27 @@ async fn pick_native() -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Shows the standard Open dialog on the host's screen.
+#[cfg(windows)]
+async fn pick_native() -> Result<Vec<PathBuf>> {
+    // Owned by an invisible topmost window: a dialog from a background process otherwise
+    // opens behind whatever is in front, where the viewer can't see it.
+    let script = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; \
+        $o = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false; Opacity = 0; StartPosition = 'CenterScreen' }; $o.Show(); $o.Activate(); \
+        $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Title = 'Send to the viewer (Glass)'; $d.Multiselect = $true; \
+        if ($d.ShowDialog($o) -eq [System.Windows.Forms.DialogResult]::OK) { $d.FileNames }; $o.Close()";
+    let cmd = crate::platform::powershell(script);
+    let output = tokio::process::Command::from(cmd).output().await?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect())
+}
+
 /// `file:///home/me/My%20File.txt` → `/home/me/My File.txt`.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let encoded = uri.strip_prefix("file://")?;
     let bytes = encoded.as_bytes();
@@ -188,6 +207,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn decodes_file_uris() {
         assert_eq!(
             file_uri_to_path("file:///home/me/My%20File.txt"),

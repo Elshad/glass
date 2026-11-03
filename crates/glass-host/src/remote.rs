@@ -154,11 +154,13 @@ pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 // ---- On/off ----
 
 /// Remote access is opt-in: `glass link --anywhere` turns it on, `glass remote off` off.
+/// A policy can decide instead.
 pub fn enabled() -> bool {
-    dir().join("enabled").exists()
+    crate::policy::load().flag("remote").unwrap_or_else(|| dir().join("enabled").exists())
 }
 
 pub fn set_enabled(on: bool) -> Result<()> {
+    crate::policy::load().check("remote", if on { "on" } else { "off" })?;
     let flag = dir().join("enabled");
     if on {
         std::fs::create_dir_all(dir())?;

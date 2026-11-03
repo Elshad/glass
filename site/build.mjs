@@ -80,7 +80,7 @@ function footer(modified, { wrap = true } = {}) {
   const compare = guides.map((g) => `<a href="${g.path}">${esc(g.label)}</a>`).join('');
   return `<footer class="site${wrap ? ' wrap' : ''}">
     <span>Glass is a free, open-source remote desktop for Mac and Linux (MIT). Updated <time datetime="${modified}">${human(modified)}</time>.</span>
-    <nav aria-label="Footer"><a href="/features">Features</a><a href="/docs">Documentation</a><a href="/changelog">Changelog</a><a href="/guides">Guides</a><a href="/help">Quick support</a><a href="/features#feedback">Feedback</a><a href="https://github.com/Ntarasiuk/glass">Star on GitHub</a><a href="/docs.md">docs.md</a><a href="/llms.txt">llms.txt</a><a href="/install.sh">install.sh</a></nav>
+    <nav aria-label="Footer"><a href="/features">Features</a><a href="/docs">Documentation</a><a href="/changelog">Changelog</a><a href="/guides">Guides</a><a href="/help">Quick support</a><a href="/docs#code-signing-policy">Code signing policy</a><a href="/features#feedback">Feedback</a><a href="https://github.com/Ntarasiuk/glass">Star on GitHub</a><a href="/docs.md">docs.md</a><a href="/llms.txt">llms.txt</a><a href="/install.sh">install.sh</a></nav>
     <nav aria-label="Guides and comparisons">${compare}</nav>
   </footer>`;
 }
@@ -99,6 +99,9 @@ function finish(html, modified) {
 
 // Hosts check this to offer updates.
 const version = readFileSync('../Cargo.toml', 'utf8').match(/^version = "(.+)"/m)[1];
+// A pre-release (0.11.0-windows.1) is never offered to installed computers: the site only
+// ever carries a real release.
+if (version.includes('-')) throw new Error(`Cargo.toml is at pre-release ${version}: the site only serves releases (build it from main)`);
 writeFileSync('public/version.json', JSON.stringify({ version }) + '\n');
 
 // The agent skill, so `curl … /skill.md` installs it.
@@ -123,7 +126,7 @@ Features:
 - Control: touch, trackpad, mouse and keyboard (⌘ shortcuts on iPad, per-machine keyboard profiles, a shortcut bar), trackpad mode on phones (a laptop-style pointer the zoomed view follows; the toolbar folds into menus), Apple Pencil pressure and tilt as Mac tablet input, pointer lock for games, game controllers (Linux), Wake-on-LAN, restart Glass or the computer, unlock from the lock screen (a closed laptop on power too, with \`glass config lid-awake on\`).
 - Between devices: your microphone on the computer (Mac: Glass Microphone, our own audio driver, \`glass mic install\`; Linux: PipeWire/PulseAudio), system audio (the browser's media controls and lock screen show and control what the computer is playing), clipboard with rich text and images both ways, files and folders both ways, an owner-only file browser (browse, preview, upload into any folder, rename, Trash), share to the computer from other apps.
 - On every device: just a browser; installable app (badge, per-machine shortcuts, share target, picture in picture, window controls overlay, opens offline); notifications even with Glass closed (Web Push, end-to-end encrypted; answer connection requests and agent questions from the notification).
-- Helping someone: quick support (\`curl -fsSL glassdesk.dev/help | sh\` on their computer shows a code you type at glassdesk.dev/help; nothing stays installed), one-time links and links with limits (view-only, no files, no clipboard, time limits, ask first, passkey required), chat, drawing on the screen, a privacy screen, \`glass link --anywhere\` over WebRTC.
+- Helping someone: quick support (\`curl -fsSL glassdesk.dev/help | sh\` on their computer, or \`irm glassdesk.dev/help | iex\` on Windows, shows a code you type at glassdesk.dev/help; nothing stays installed), one-time links and links with limits (view-only, no files, no clipboard, time limits, ask first, passkey required), chat, drawing on the screen, a privacy screen, \`glass link --anywhere\` over WebRTC.
 - AI agents: an MCP server (\`glass mcp\`) that lets agents use any of your computers running Glass while you watch, pause, stop and approve them; added to Claude Code, Claude Desktop or Cursor in one click. On a Mac, \`snapshot\` reads an app's window as text (Accessibility) with a ref on each element, and \`press\` and \`set_value\` act on those refs without moving the pointer. Agents from anywhere: Glass is an MCP server over HTTP with OAuth (MCP authorization spec; works as a Vercel Connect connector) at https://<computer>/mcp, published with Tailscale Funnel by \`glass agents public on\`; one-tap approval by number matching, scoped grants enforced on the host, rotating refresh tokens, a hash-chained audit log, \`glass agents\` to list and revoke.
 - Apps and admin: a native Mac app (Glass.app) for setup and everything the CLI does, an owner console at \`/admin/\`, single-window streaming, a terminal, forwarded web ports, session recording.
 - Teams and security: single sign-on (OpenID Connect), LDAP, SCIM, access rules, device posture checks, a self-hostable relay.
@@ -474,6 +477,10 @@ cpSync('../web', 'public/app', { recursive: true });
 mkdirSync('public/releases', { recursive: true });
 const dist = '../dist';
 const PLATFORMS = ['darwin-universal', 'linux-x86_64', 'linux-aarch64'];
+// Windows ships zips (the installer's), and MSIs for managed installs; optional until
+// releases include them.
+const WINDOWS = ['windows-x86_64', 'windows-arm64'];
+const archives = (p) => (p.startsWith('windows-') ? ['zip', 'msi'] : ['tar.gz']);
 const missing = () => PLATFORMS.some((p) => !existsSync(`${dist}/glass-${version}-${p}.tar.gz`));
 if (missing()) {
   try {
@@ -495,15 +502,17 @@ if (existsSync(dist)) {
   }
 }
 // The installer verifies each platform's "latest" tarball against this checksum.
-for (const p of PLATFORMS) {
-  const release = `${dist}/glass-${version}-${p}.tar.gz`;
-  const f = `glass-latest-${p}.tar.gz`;
-  if (!existsSync(release)) continue;
-  if (small(release)) copyFileSync(release, `public/releases/${f}`);
-  else rmSync(`public/releases/${f}`, { force: true });
-  // Hash the file itself: with several versions around, any lookup by name can pick a stale one.
-  const sum = createHash('sha256').update(readFileSync(release)).digest('hex');
-  writeFileSync(`public/releases/${f}.sha256`, `${sum}  ${f}\n`);
+for (const p of [...PLATFORMS, ...WINDOWS]) {
+  for (const ext of archives(p)) {
+    const release = `${dist}/glass-${version}-${p}.${ext}`;
+    const f = `glass-latest-${p}.${ext}`;
+    if (!existsSync(release)) continue;
+    if (small(release)) copyFileSync(release, `public/releases/${f}`);
+    else rmSync(`public/releases/${f}`, { force: true });
+    // Hash the file itself: with several versions around, any lookup by name can pick a stale one.
+    const sum = createHash('sha256').update(readFileSync(release)).digest('hex');
+    writeFileSync(`public/releases/${f}.sha256`, `${sum}  ${f}\n`);
+  }
 }
 
 console.log('built: index.html, features/, help/, computers/, guides/, vs/, changelog/, changelog.md, skill.md, llms.txt, llms-full.txt, docs.md, docs/index.html, index.md, sitemap.xml, app/, releases/');

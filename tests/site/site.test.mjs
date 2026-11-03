@@ -178,6 +178,27 @@ test('a tarball too big for the site redirects to the GitHub release', async () 
   const pinned = await get('/releases/glass-9.9.9-linux-x86_64.tar.gz');
   assert.equal(pinned.headers.get('location'), 'https://github.com/Ntarasiuk/glass/releases/download/v9.9.9/glass-9.9.9-linux-x86_64.tar.gz');
   assert.equal((await get('/releases/nope.tar.gz')).status, 404);
+  const windows = await get('/releases/glass-9.9.9-windows-arm64.zip');
+  assert.equal(windows.headers.get('location'), 'https://github.com/Ntarasiuk/glass/releases/download/v9.9.9/glass-9.9.9-windows-arm64.zip');
+  const msi = await get('/releases/glass-latest-windows-x86_64.msi');
+  assert.equal(msi.status, 302);
+  assert.equal(msi.headers.get('location'), `https://github.com/Ntarasiuk/glass/releases/download/v${version}/glass-${version}-windows-x86_64.msi`);
+});
+
+test('PowerShell gets Windows quick support at /help', async () => {
+  for (const res of [await get('/help.ps1'), await get('/help', 'Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.26100; en-US) PowerShell/7.5.0')]) {
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /Glass quick support for Windows/);
+  }
+});
+
+test('PowerShell gets the Windows installer', async () => {
+  for (const res of [await get('/install.ps1'), await get('/', 'Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.26100; en-US) PowerShell/7.5.0'), await get('/', 'Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.1')]) {
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /^text\/plain/);
+    assert.match(await res.text(), /Glass installer for Windows/);
+  }
+  assert.doesNotMatch(await (await get('/', 'Mozilla/5.0 (Windows NT 10.0) Chrome/130')).text(), /Glass installer for Windows/);
 });
 
 // ---- Quick support ----

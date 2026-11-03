@@ -1,0 +1,71 @@
+# Glass Microphone for Windows (native/glass-mic-windows): the kernel driver, built for x64
+# and Arm64 with the WDK on GitHub's Windows image and test-signed (WDK test certificate,
+# included). Test-signed drivers load only with test signing on (bcdedit /set testsigning
+# on); releases need Microsoft's signature (see native/glass-mic-windows/README.md).
+name: Glass Microphone (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'native/glass-mic-windows/**'
+      - '.github/workflows/glass-mic-windows.yml'
+  pull_request:
+    paths:
+      - 'native/glass-mic-windows/**'
+      - '.github/workflows/glass-mic-windows.yml'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, ARM64]
+    # windows-2022 has the WDK (and its Visual Studio extension); windows-latest (2025) has not.
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: native/glass-mic-windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: WDK
+        run: |
+          $kits = 'C:\Program Files (x86)\Windows Kits\10\bin'
+          $find = { param($name) Get-ChildItem $kits -Recurse -Filter $name -EA 0 | Where-Object { $_.FullName -match '\\x(86|64)\\' } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName }
+          $inf2cat = & $find 'Inf2Cat.exe'; $signtool = & $find 'signtool.exe'; $infverif = & $find 'InfVerif.dll'
+          "Inf2Cat: $inf2cat"; "signtool: $signtool"; "InfVerif: $infverif"
+          if (-not $inf2cat -or -not $signtool) { throw 'no WDK tools on this image' }
+          "INF2CAT=$inf2cat" >> $env:GITHUB_ENV
+          "SIGNTOOL=$signtool" >> $env:GITHUB_ENV
+          # The image's INF check looks for x86\InfVerif.dll below each x86 tools folder.
+          if ($infverif) {
+            Get-ChildItem $kits -Directory -Recurse -Filter x86 -EA 0 | ForEach-Object {
+              New-Item -ItemType Directory -Force "$($_.FullName)\x86" | Out-Null
+              Copy-Item $infverif "$($_.FullName)\x86\" -Force -EA 0
+            }
+          }
+      # Signed below, with a test certificate. The API check can't run its Arm64 helper on
+      # an x64 runner.
+      - name: Build
+        run: msbuild VirtualAudioDriver.sln /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} /p:SignMode=Off /p:ApiValidator_Enable=false
+      - name: Package and test-sign
+        run: |
+          $out = New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\glassmic"
+          $built = "Source\Main\${{ matrix.platform }}\Release"
+          Get-ChildItem $built
+          Copy-Item "$built\glassmic.sys", "$built\glassmic.inf" $out
+          $os = if ('${{ matrix.platform }}' -eq 'ARM64') { '10_RS3_ARM64' } else { '10_X64' }
+          & $env:INF2CAT /driver:$out /os:$os /uselocaltime
+          if ($LASTEXITCODE -ne 0) { throw 'Inf2Cat failed' }
+          # A throwaway test certificate: trusted only where its .cer is installed (the test VM).
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Glass Microphone (test)' -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(2)
+          Export-Certificate -Cert $cert -FilePath "$out\glassmic-test.cer" | Out-Null
+          & $env:SIGNTOOL sign /fd sha256 /sha1 $cert.Thumbprint /s My "$out\glassmic.sys" "$out\glassmic.cat"
+          if ($LASTEXITCODE -ne 0) { throw 'signtool failed' }
+          Get-ChildItem $out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glassmic-${{ matrix.platform }}
+          path: ${{ runner.temp }}/glassmic/

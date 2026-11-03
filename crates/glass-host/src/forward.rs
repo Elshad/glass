@@ -87,8 +87,9 @@ pub(crate) async fn is_owner(peer: IpAddr, headers: &HeaderMap) -> bool {
     {
         return true;
     }
+    // The owner's own devices only: forwarded ports aren't for guests.
     match crate::server::shared().and_then(|s| s.tailnet_owner.clone()) {
-        Some(owner) => crate::tailscale::is_trusted(peer, &owner).await,
+        Some(owner) => crate::tailscale::identity(peer).await.is_some_and(|login| login == owner),
         None => false,
     }
 }

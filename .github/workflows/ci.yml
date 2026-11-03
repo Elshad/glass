@@ -26,6 +26,8 @@ jobs:
               - 'crates/**'
               - 'web/**'
               - 'tests/unit/**'
+              - 'packaging/**'
+              - 'scripts/winget.mjs'
               - 'Cargo.*'
               - '.github/workflows/**'
             site:
@@ -48,6 +50,13 @@ jobs:
     if: needs.changes.outputs.host == 'true'
     uses: ./.github/workflows/host.yml
     with: { os: ubuntu-latest }
+
+  windows:
+    name: Windows
+    needs: changes
+    if: needs.changes.outputs.host == 'true'
+    uses: ./.github/workflows/host.yml
+    with: { os: windows-latest }
 
   site:
     needs: changes

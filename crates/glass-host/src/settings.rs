@@ -13,6 +13,9 @@ pub struct Settings {
     pub ask_guests: bool,
     /// Ask before anyone connects, the owner's own devices included.
     pub ask_everyone: bool,
+    /// Let anyone on this computer's tailnet in without the token (as a guest), not just
+    /// the owner's own devices and the people the access rules name.
+    pub tailnet_members: bool,
     /// Record every session to a video file in `recordings_dir`.
     pub record: bool,
     /// Where recordings go (default ~/Movies/Glass or ~/Videos/Glass).
@@ -140,20 +143,45 @@ pub fn path() -> PathBuf {
     crate::config_dir().join("settings.json")
 }
 
+/// The settings in force: the owner's, with any policies (`policy`) over them.
 pub fn load() -> Settings {
+    with_policy(load_file(), &crate::policy::load())
+}
+
+fn with_policy(mut s: Settings, policy: &crate::policy::Policy) -> Settings {
+    for (key, value) in policy.settings() {
+        let _ = s.assign(key, value);
+    }
+    s
+}
+
+/// What to store: `s`, but with the owner's own values (`file`) for what `policy` sets.
+fn without_policy(mut s: Settings, file: &Settings, policy: &crate::policy::Policy) -> Result<Settings> {
+    for (key, _) in policy.settings() {
+        s.assign(key, &file.get(key)?)?;
+    }
+    Ok(s)
+}
+
+/// The owner's settings, as stored.
+fn load_file() -> Settings {
     std::fs::read(path())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
+/// Stores `s`, keeping the owner's own value of anything a policy sets, for when the
+/// policy goes.
 pub fn save(s: &Settings) -> Result<()> {
+    let policy = crate::policy::load();
+    let s = if policy.is_empty() { s.clone() } else { without_policy(s.clone(), &load_file(), &policy)? };
     let p = path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(s)?)?;
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&s)?)?;
     std::fs::rename(&tmp, &p)?;
     Ok(())
 }
@@ -162,11 +190,19 @@ pub fn save(s: &Settings) -> Result<()> {
 pub const KEYS: &[(&str, &str)] = &[
     ("ask-guests", "on/off: ask before a guest (magic link) connects"),
     ("ask-everyone", "on/off: ask before anyone connects"),
+    ("tailnet-members", "on/off: anyone on this tailnet connects without the token, as a guest"),
     ("record", "on/off: record every session"),
     ("recordings-dir", "folder for recordings"),
     ("privacy", "on/off: blank this screen and block local input while viewed"),
     ("hevc", "on/off: use HEVC when every viewer supports it"),
-    ("lid-awake", "on/off: stay awake with the lid closed while on power (laptops; on a Mac, asks for your password once)"),
+    (
+        "lid-awake",
+        if cfg!(windows) {
+            "on/off: stay awake with the lid closed while on power (laptops: closing the lid does nothing while plugged in)"
+        } else {
+            "on/off: stay awake with the lid closed while on power (laptops; on a Mac, asks for your password once)"
+        },
+    ),
     ("agents", "on/off: AI agents on other devices may ask to use this computer (glass agents)"),
     ("forward-ports", "comma-separated ports owner devices may open, e.g. 3000,8888"),
     (
@@ -244,6 +280,7 @@ impl Settings {
         Ok(match key {
             "ask-guests" => show_bool(self.ask_guests),
             "ask-everyone" => show_bool(self.ask_everyone),
+            "tailnet-members" => show_bool(self.tailnet_members),
             "record" => show_bool(self.record),
             "recordings-dir" => recordings_dir(self).display().to_string(),
             "privacy" => show_bool(self.privacy),
@@ -288,12 +325,19 @@ impl Settings {
         })
     }
 
-    /// Sets `key` from its text form; an empty value resets optional ones.
+    /// Sets `key` from its text form; an empty value resets optional ones. A setting a
+    /// policy manages can't be changed.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        crate::policy::load().check(key, value)?;
+        self.assign(key, value)
+    }
+
+    fn assign(&mut self, key: &str, value: &str) -> Result<()> {
         let value = value.trim();
         match key {
             "ask-guests" => self.ask_guests = on_off(value)?,
             "ask-everyone" => self.ask_everyone = on_off(value)?,
+            "tailnet-members" => self.tailnet_members = on_off(value)?,
             "record" => self.record = on_off(value)?,
             "recordings-dir" => {
                 self.recordings_dir = (!value.is_empty()).then(|| PathBuf::from(value))
@@ -304,6 +348,8 @@ impl Settings {
                 let on = on_off(value)?;
                 if on && !self.lid_awake {
                     crate::lid::allow()?;
+                } else if !on && self.lid_awake {
+                    crate::lid::release()?;
                 }
                 self.lid_awake = on;
             }
@@ -447,9 +493,8 @@ impl Settings {
             }
             "scim-token" => {
                 let token = if value == "new" {
-                    use std::io::Read;
                     let mut bytes = [0u8; 24];
-                    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+                    crate::control::getrandom(&mut bytes)?;
                     bytes.iter().map(|b| format!("{b:02x}")).collect()
                 } else {
                     anyhow::ensure!(
@@ -509,6 +554,26 @@ mod tests {
         // Unknown and missing fields are fine.
         let old: Settings = serde_json::from_str(r#"{"ask_guests":true,"future":1}"#).unwrap();
         assert!(old.ask_guests && !old.record);
+    }
+
+    #[test]
+    fn policies_show_over_the_owners_settings_but_are_not_stored() {
+        use crate::policy::{Policy, Raw};
+        let machine = |n: &str| match n {
+            "AskGuests" => Some(Raw::Number(1)),
+            "Relay" => Some(Raw::Text("https://glass.example.com".into())),
+            _ => None,
+        };
+        let policy = Policy::merge(&[&machine]);
+        let file = Settings { name: Some("Studio".into()), ..Default::default() };
+        let mut shown = with_policy(file.clone(), &policy);
+        assert!(shown.ask_guests);
+        assert_eq!(shown.relay.as_deref(), Some("https://glass.example.com"));
+        // The owner changes something else; the policy's values aren't written.
+        shown.assign("privacy", "on").unwrap();
+        let stored = without_policy(shown, &file, &policy).unwrap();
+        assert!(stored.privacy && !stored.ask_guests && stored.relay.is_none());
+        assert_eq!(stored.name.as_deref(), Some("Studio"));
     }
 
     #[test]

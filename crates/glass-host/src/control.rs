@@ -60,6 +60,9 @@ pub enum ClientMsg {
     ListWindows,
     /// Previews of every display (answered with `thumbs`, only the ones that changed).
     Thumbs,
+    /// Send Ctrl+Alt+Del (Windows secure attention sequence). Needs the Glass secure-desktop
+    /// service; a no-op elsewhere. Input permission required.
+    Sas,
     /// The owner steering an agent: `pause`, `resume`, `stop`, `allow`.
     Agent { op: String },
     /// The owner's answer to an agent's question (`agentAsk`).
@@ -341,6 +344,8 @@ pub struct Features {
     pub browse: bool,
     /// The viewer can become a second display ("Use as a second display").
     pub extend: bool,
+    /// The host's desktop can be reshaped to the viewer's screen ("Fit this device", macOS).
+    pub fit: bool,
     /// A quick-support session (`glass support`): the viewer is someone helping.
     pub support: bool,
 }
@@ -448,10 +453,12 @@ pub fn save_token(path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
-fn getrandom(buf: &mut [u8]) -> Result<()> {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")?.read_exact(buf)?;
-    Ok(())
+/// Fills `buf` from the system's secure random source (any OS).
+pub fn getrandom(buf: &mut [u8]) -> Result<()> {
+    use ring::rand::SecureRandom;
+    ring::rand::SystemRandom::new()
+        .fill(buf)
+        .map_err(|_| anyhow::anyhow!("no system randomness"))
 }
 
 /// Constant-time comparison so the token can't be guessed byte by byte from timing.

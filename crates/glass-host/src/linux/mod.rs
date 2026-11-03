@@ -76,3 +76,9 @@ pub fn has_command(name: &str) -> bool {
         .status()
         .is_ok_and(|s| s.success())
 }
+
+/// Whether process `pid` is still running.
+pub fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}

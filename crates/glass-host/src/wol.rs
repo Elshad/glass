@@ -64,6 +64,14 @@ pub fn wake(mac: [u8; 6]) -> Result<()> {
 }
 
 /// The broadcast address of each IPv4 network this computer is on (up, not loopback).
+/// Windows sends only the limited broadcast (255.255.255.255), which reaches the local
+/// network of each interface.
+#[cfg(windows)]
+fn broadcast_addrs() -> Vec<Ipv4Addr> {
+    Vec::new()
+}
+
+#[cfg(unix)]
 fn broadcast_addrs() -> Vec<Ipv4Addr> {
     let mut out = Vec::new();
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -133,6 +141,18 @@ pub fn own_macs() -> Vec<String> {
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
         parse_hardware_ports(&out)
+    }
+    #[cfg(windows)]
+    {
+        // Physical adapters only (no Hyper-V switches, VPNs or Tailscale), as 00-15-5D-…
+        crate::platform::powershell("Get-NetAdapter -Physical | ForEach-Object { $_.MacAddress }")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| parse_mac(l).is_some())
+            .map(|l| l.trim().replace('-', ":"))
+            .collect()
     }
 }
 

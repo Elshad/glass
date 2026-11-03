@@ -18,7 +18,7 @@ The person who owns it can watch you live and pause or stop you at any time.\n\
 computers running Glass, and every tool takes `machine` to work on one of them.\n\
 - Start with `screenshot`. Coordinates for click, move, drag and scroll are in the pixels of the \
 latest screenshot of that display.\n\
-- On a Mac, `snapshot` reads an app's window as text, with a ref on each element you can act on; \
+- On a Mac or a Windows PC, `snapshot` reads an app's window as text, with a ref on each element you can act on; \
 `press` and `set_value` act on a ref without moving the pointer. Prefer them for ordinary app \
 windows, and screenshot and click for what a snapshot doesn't show (canvases, games, video).\n\
 - After acting, check the result: pass `screenshot_after: true`, or call `wait_for_change` then `screenshot`.\n\
@@ -216,8 +216,8 @@ pub(crate) fn tools() -> Value {
           "inputSchema": schema(json!({ "text": { "type": "string" }, "screenshot_after": after }), &["text"]) },
         { "name": "press_keys", "description": "Presses a key or shortcut, e.g. \"return\", \"cmd+s\", \"cmd+shift+4\", \"ctrl+c\", \"tab\", \"escape\", \"left\", \"f5\". On Linux, use ctrl where macOS uses cmd.",
           "inputSchema": schema(json!({ "keys": { "type": "string" }, "screenshot_after": after }), &["keys"]) },
-        { "name": "snapshot", "description": "Reads an app's window as text: each element's role, name and value, with a ref (like @k3f9:e12) on each one press or set_value can act on. Cheaper and more exact than a screenshot for ordinary app windows; canvases, games, video and some custom-drawn apps don't show up, so use screenshot for those. Chrome and Electron apps show a page's content only while its window is visible: if you get just the window frame, bring it to the front first. The app in front unless you name one. macOS only.",
-          "inputSchema": schema(json!({ "app": { "type": "string", "description": "The app's name or bundle id, e.g. \"Mail\" or \"com.apple.mail\"; the app in front if left out." },
+        { "name": "snapshot", "description": "Reads an app's window as text: each element's role, name and value, with a ref (like @k3f9:e12) on each one press or set_value can act on. Cheaper and more exact than a screenshot for ordinary app windows; canvases, games, video and some custom-drawn apps don't show up, so use screenshot for those. Chrome and Electron apps show a page's content only while its window is visible: if you get just the window frame, bring it to the front first. The app in front unless you name one. macOS and Windows.",
+          "inputSchema": schema(json!({ "app": { "type": "string", "description": "The app's name or bundle id, e.g. \"Mail\" or \"com.apple.mail\" (on Windows, its name or executable, e.g. \"notepad\"); the app in front if left out." },
             "all_windows": { "type": "boolean", "description": "Every window of the app, not just its focused one." },
             "max_lines": { "type": "integer", "minimum": 20, "maximum": 2000, "description": "Default 400." } }), &[]) },
         { "name": "press", "description": "Presses an element from a snapshot (a button, link, checkbox, tab, menu item, row…) through Accessibility, without moving the pointer, even in a window behind others. A ref is good only while its window stays the same: if it changed, nothing is pressed and it says so; take a new snapshot.",

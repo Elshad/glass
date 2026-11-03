@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SignPath artifact configuration for the Windows release (release.yml, "Sign (SignPath)").
+     Paste it into the SignPath project as its default artifact configuration. The artifact
+     is dist/ for one architecture: the zip and the MSI, with the unsigned programs in both.
+     SignPath signs glass.exe and glassw.exe inside each, then the MSI itself. The version
+     comes from Cargo.toml, and each program's version resource (crates/glass-host/build.rs)
+     has to match it. -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <zip-file path="glass-*-windows-*.zip">
+      <directory path="glass/bin">
+        <pe-file path="glass.exe" product-name="Glass" product-version="${version}">
+          <authenticode-sign />
+        </pe-file>
+        <pe-file path="glassw.exe" product-name="Glass" product-version="${version}">
+          <authenticode-sign />
+        </pe-file>
+      </directory>
+    </zip-file>
+    <msi-file path="glass-*-windows-*.msi">
+      <pe-file-set product-name="Glass" product-version="${version}">
+        <include path="**/glass.exe" />
+        <include path="**/glassw.exe" />
+        <for-each>
+          <authenticode-sign />
+        </for-each>
+      </pe-file-set>
+      <authenticode-sign />
+    </msi-file>
+  </zip-file>
+</artifact-configuration>

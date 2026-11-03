@@ -393,13 +393,14 @@ const ui = createUI({
   onUploadFiles: uploadFiles,
   onRequestFiles: () => {
     control({ t: 'pickFiles' });
-    ui.toast({ text: 'Choose files in the dialog on your Mac' });
+    ui.toast({ text: 'Choose files in the dialog on the computer' });
   },
   onAudio: toggleAudio,
   onMic: toggleMic,
   onFullscreen: toggleFullscreen,
   onToggleStats: toggleStats,
   onPrivacy: (on) => control({ t: 'privacy', on }),
+  onSas: () => control({ t: 'sas' }),
   onRestart: (glass) => {
     restarting = glass ? 'Glass' : 'computer';
     control({ t: 'restart', glass });
@@ -679,6 +680,7 @@ const videoSizes = [];
 let status = 'connecting…';
 let codec = '';
 let statsCount = 0;
+let loggedPeak = 0; // the highest audioPeak since stats were last logged
 let targetMbps;
 let displays = [];
 // Ids of windows (not displays) this viewer has seen or picked, so a streamed window never
@@ -719,7 +721,12 @@ worker.onmessage = ({ data }) => {
     case 'stats':
       // Over RTP the worker sees no video; the connection's own stats describe it.
       if (rtpVideo) data = { ...data, ...rtpStats };
-      if (++statsCount % 5 === 0) log('info', 'stats', data);
+      // Logged every fifth: with the loudest sound since the last one logged.
+      loggedPeak = Math.max(loggedPeak, data.audioPeak ?? 0);
+      if (++statsCount % 5 === 0) {
+        log('info', 'stats', { ...data, audioPeak: loggedPeak });
+        loggedPeak = 0;
+      }
       if (data.fps > 0) hideStatus();
       renderHud(data);
       break;
@@ -779,6 +786,7 @@ function onControl(msg) {
       input.setHostOs(msg.host_os ?? 'macos');
       ui.setHostOs(msg.host_os ?? 'macos');
       applyKeyboard(msg.host_os ?? 'macos');
+      files.setHostOs(msg.host_os ?? 'macos');
       if (remoteKey) {
         setLogSink((lines) => control({ t: 'log', lines }));
         rememberRemote(msg.computer);
@@ -786,7 +794,7 @@ function onControl(msg) {
       guest = Boolean(msg.guest);
       // Remote: other machines aren't reachable from here, so no machines menu either.
       ui.setGuest(guest || Boolean(remoteKey));
-      ui.setCanFit(!guest);
+      ui.setCanFit(!guest && msg.features?.fit !== false);
       // A new session has no second display (the host removed it when the last one ended).
       extended = undefined;
       ui.setExtend({ available: Boolean(msg.features?.extend && (msg.perms ? msg.perms.owner : !guest)), on: false });

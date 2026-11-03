@@ -2,7 +2,7 @@ mod access;
 mod account;
 mod actions;
 mod fleet;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod app;
 mod computer;
 mod admin;
@@ -23,14 +23,18 @@ mod ldap;
 mod lid;
 mod listen;
 mod lossless;
+#[cfg(not(target_os = "macos"))]
+mod mailbox;
 mod mcp;
 mod oauth;
 mod media;
 mod mic;
 mod notify;
 mod now_playing;
+mod pcm;
 mod oidc;
 mod passkey;
+mod policy;
 mod posture;
 mod power;
 mod privacy;
@@ -39,6 +43,7 @@ mod push;
 mod recording;
 mod scim;
 mod settings;
+mod signin;
 mod sharp;
 mod terminal;
 mod wol;
@@ -57,6 +62,8 @@ mod testmode;
 mod thumbs;
 mod update;
 mod viewers;
+#[cfg(any(windows, test))]
+mod win_capture;
 
 #[cfg(target_os = "macos")]
 #[path = "macos/mod.rs"]
@@ -64,6 +71,14 @@ mod platform;
 #[cfg(target_os = "linux")]
 #[path = "linux/mod.rs"]
 mod platform;
+#[cfg(windows)]
+#[path = "windows/mod.rs"]
+mod platform;
+// The Windows port's pure parts, so their tests run on every OS.
+#[cfg(all(test, not(windows)))]
+#[path = "windows/convert.rs"]
+#[allow(dead_code)]
+mod windows_convert;
 
 // Platform modules keep the same names everywhere, so shared code says `crate::input` etc.
 use platform::{agent, audio, clipboard, clock, input, permissions, video};
@@ -83,7 +98,7 @@ use crate::media::VideoSource;
 #[derive(Parser)]
 #[command(
     name = "glass",
-    about = "Low-latency remote desktop for your Mac",
+    about = "Low-latency remote desktop for your computer",
     version
 )]
 struct Args {
@@ -123,8 +138,9 @@ struct Args {
     #[arg(long, requires = "cert")]
     key: Option<PathBuf>,
     /// Host the browser should connect WebTransport to, when it differs from the page's
-    /// host (e.g. page served through a tunnel, video direct over the LAN).
-    #[arg(long)]
+    /// host (e.g. page served through a tunnel, video direct over the LAN). GLASS_WT_HOST
+    /// sets it too, for a host started by the background service.
+    #[arg(long, env = "GLASS_WT_HOST")]
     wt_host: Option<String>,
     /// Test mode: a generated test pattern instead of screen capture, recorded input, an
     /// in-memory clipboard, no Tailscale, and /test/* hooks. Never touches the real desktop.
@@ -159,9 +175,9 @@ enum Command {
         json: bool,
     },
     /// Open the Glass app: setup, who's connected, links, settings and more, in a window.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     App {
-        /// Just (re)create Glass.app in ~/Applications.
+        /// Just (re)create Glass.app in ~/Applications (on Windows, the Start menu shortcut).
         #[arg(long)]
         install: bool,
     },
@@ -213,7 +229,11 @@ enum Command {
     /// Restart the background service (viewers reconnect by themselves).
     Restart,
     /// Stop the background service and remove it from login items.
-    Uninstall,
+    Uninstall {
+        /// Windows: remove everything Glass added except its settings (Settings › Apps runs this).
+        #[arg(long, hide = true)]
+        everything: bool,
+    },
     /// Install the latest release (and restart the service onto it).
     Update,
     /// Make a one-time magic link that lets a device in without the token.
@@ -323,8 +343,9 @@ enum Command {
     Deny { id: Option<u64> },
     /// Send a message to everyone viewing.
     Chat { message: Vec<String> },
-    /// Viewers' microphones on this Mac (through BlackHole): status, or install BlackHole.
-    #[cfg(target_os = "macos")]
+    /// Viewers' microphones on this computer (macOS: Glass Microphone; Windows: VB-CABLE):
+    /// status, or install what they need.
+    #[cfg(any(target_os = "macos", windows))]
     Mic {
         #[arg(value_parser = ["status", "install", "uninstall"], default_value = "status")]
         action: String,
@@ -341,6 +362,14 @@ enum Command {
     Privacy {
         #[arg(value_parser = ["on", "off"])]
         state: String,
+    },
+    /// The secure-desktop service (LocalSystem): lets viewers use the lock screen, answer
+    /// UAC prompts, control elevated windows and send Ctrl+Alt+Del. Install or remove it
+    /// (needs administrator; `glass setup` asks for you).
+    #[cfg(windows)]
+    Service {
+        #[arg(value_parser = ["install", "uninstall", "status"], default_value = "status")]
+        action: String,
     },
     /// Wake a machine with Wake-on-LAN, by a MAC address or a tailnet name seen before.
     Wake { target: String },
@@ -527,8 +556,18 @@ fn config_cli(key: Option<&str>, value: Option<&str>) -> Result<()> {
     let mut s = settings::load();
     match (key, value) {
         (None, _) => {
+            let policy = policy::load();
             for (k, help) in settings::KEYS {
-                println!("{k:<16} {:<12} {help}", s.get(k)?);
+                let managed = if policy.locked(k) { format!(" ({})", policy::MANAGED) } else { String::new() };
+                println!("{k:<16} {:<12} {help}{managed}", s.get(k)?);
+            }
+            // Policies on things that aren't settings here (remote access, files…).
+            let others: Vec<_> = policy.iter().filter(|(d, _)| !settings::KEYS.iter().any(|(k, _)| *k == d.key)).collect();
+            if !others.is_empty() {
+                println!("\nAlso {}:", policy::MANAGED);
+                for (d, v) in others {
+                    println!("{:<16} {v:<12} {}", d.key, d.what);
+                }
             }
         }
         (Some(k), None) => println!("{}", s.get(k)?),
@@ -750,6 +789,35 @@ fn set_token(path: &std::path::Path) -> Result<()> {
 const FEEDBACK_URL: &str = "https://glassdesk.dev/api/feedback";
 
 fn main() -> Result<()> {
+    // Windows: the helper holding the local-input hooks (see platform::front).
+    #[cfg(windows)]
+    if let [_, flag, pid] = std::env::args().collect::<Vec<_>>().as_slice()
+        && flag == platform::front::HOOK_HELPER_ARG
+    {
+        return platform::front::run_hook_helper(pid);
+    }
+    // Windows: the secure-desktop service (started by the SCM) and the SYSTEM helper it
+    // keeps running in the active console session (see platform::service / platform::secure).
+    #[cfg(windows)]
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        match argv.get(1).map(String::as_str) {
+            Some(platform::service::SERVICE_ARG) => return platform::service::run_service(),
+            Some(platform::secure::HELPER_ARG) => return platform::secure::run_helper(),
+            Some(platform::micdriver::ARG) => return platform::micdriver::cli(&argv[2..]),
+            _ => {}
+        }
+    }
+    // Windows: the sign-in host (see signin.rs) is the host, minus its flag.
+    #[cfg(windows)]
+    let args = if std::env::args().nth(1).as_deref() == Some(signin::ARG) {
+        signin::enable();
+        platform::secure::mark_helper();
+        Args::parse_from(std::env::args().enumerate().filter(|(i, _)| *i != 1).map(|(_, a)| a))
+    } else {
+        Args::parse()
+    };
+    #[cfg(not(windows))]
     let args = Args::parse();
     // Quick support keeps everything in its own temporary config, chosen before anything
     // (or any thread) reads the environment.
@@ -772,16 +840,16 @@ fn main() -> Result<()> {
                 return Err(e);
             }
         };
-        // On the Mac's own screen: a window. Over SSH, with --no-window or --json: here.
-        #[cfg(target_os = "macos")]
+        // On the computer's own screen: a window. Over SSH, with --no-window or --json: here.
+        #[cfg(any(target_os = "macos", windows))]
         if !no_window && !json && std::env::var_os("SSH_CONNECTION").is_none() {
             return app::run_support(rt, session);
         }
         let _ = no_window;
         return rt.block_on(support::run_terminal(session, *json));
     }
-    // The app: `glass app`, or Glass.app (whose executable is this binary).
-    #[cfg(target_os = "macos")]
+    // The app: `glass app`, Glass.app (whose executable is this binary), or the Start menu.
+    #[cfg(any(target_os = "macos", windows))]
     match &args.command {
         Some(Command::App { install: true }) => {
             println!("{}", app::install_bundle()?.display());
@@ -803,6 +871,12 @@ fn main() -> Result<()> {
             std::process::exit(if result.is_ok() { 0 } else { 1 });
         });
         platform::menubar::run(handle);
+    }
+    // The host on Windows shows a notification-area icon (who's viewing) on its own thread.
+    #[cfg(windows)]
+    // (Quick support's host sets GLASS_NO_MENUBAR, as on a Mac: its window is the UI.)
+    if args.command.is_none() && !args.test && std::env::var_os("GLASS_NO_MENUBAR").is_none() && !signin::active() {
+        platform::tray::start(rt.handle().clone());
     }
     rt.block_on(async_main(args))
 }
@@ -935,7 +1009,7 @@ async fn async_main(args: Args) -> Result<()> {
         }
         Some(Command::Allow { id }) => decide_cli(*id, true),
         Some(Command::Deny { id }) => decide_cli(*id, false),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         Some(Command::Mic { action }) => {
             match action.as_str() {
                 "install" => println!("{}", mic::install(mic::Ask::Terminal)?),
@@ -948,6 +1022,9 @@ async fn async_main(args: Args) -> Result<()> {
                     None if cfg!(target_os = "macos") => {
                         println!("Not set up: a viewer's microphone needs Glass Microphone, a small audio driver. Install it: glass mic install")
                     }
+                    None if cfg!(windows) => println!(
+                        "Not set up: a viewer's microphone needs VB-CABLE, a free virtual audio cable (https://vb-audio.com/Cable/). Get it: glass mic install"
+                    ),
                     None => println!("Not set up: a viewer's microphone needs pactl and PipeWire or PulseAudio. Set it up: glass mic install"),
                 },
             }
@@ -995,6 +1072,8 @@ async fn async_main(args: Args) -> Result<()> {
             println!("Sent a wake-up to {target} ({macs}).");
             Ok(())
         }
+        #[cfg(windows)]
+        Some(Command::Service { action }) => platform::service::cli(action),
         Some(Command::Remote { action }) => remote_cli(action),
         Some(Command::Account { action, json }) => account_cli(action, *json),
         Some(Command::Fleet { action, arg, json }) => fleet_cli(action, arg.as_deref(), *json),
@@ -1022,10 +1101,10 @@ async fn async_main(args: Args) -> Result<()> {
             Ok(())
         }
         Some(Command::Restart) => restart_service(),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         Some(Command::App { .. }) => unreachable!("handled before the runtime starts"),
         Some(Command::Support { .. }) => unreachable!("handled before the runtime starts"),
-        Some(Command::Uninstall) => {
+        Some(Command::Uninstall { everything }) => {
             // Published to the internet for agents: not any more.
             if grants::load().public
                 && let Err(e) = oauth::publish(false)
@@ -1033,9 +1112,21 @@ async fn async_main(args: Args) -> Result<()> {
                 eprintln!("Couldn't stop publishing to agents with Tailscale Funnel ({e:#}); run: tailscale funnel --https=8443 off");
             }
             agent::uninstall()?;
-            println!(
-                "Glass service removed. Delete ~/.glass and ~/.config/glass to remove everything."
-            );
+            #[cfg(windows)]
+            if *everything {
+                platform::remove::everything()?;
+                println!("Glass is removed. Its settings stay in %APPDATA%\\Glass, in case you install it again.");
+                return Ok(());
+            }
+            #[cfg(not(windows))]
+            let _ = everything;
+            if cfg!(windows) {
+                println!(
+                    "Glass service removed. Delete %LOCALAPPDATA%\\Programs\\Glass and %APPDATA%\\Glass to remove everything."
+                );
+            } else {
+                println!("Glass service removed. Delete ~/.glass and ~/.config/glass to remove everything.");
+            }
             Ok(())
         }
     }
@@ -1055,6 +1146,10 @@ fn print_status() -> Result<()> {
                 _ => "off (glass remote on)",
             };
             println!("  remote:           {remote}");
+            if cfg!(windows) {
+                let pads = if gamepad::supported() { "yes (ViGEmBus)".to_string() } else { format!("no: install ViGEmBus ({})", gamepad::VIGEM_DOWNLOAD) };
+                println!("  controllers:      {pads}");
+            }
             if let Some(url) = &s.url {
                 println!("  open:             {url}");
             }
@@ -1143,6 +1238,18 @@ async fn run_host(args: Args) -> Result<()> {
     let (audio, _) = broadcast::channel(16);
     let (events, _) = broadcast::channel(32);
 
+    // Windows: link to the SYSTEM secure-desktop helper if the service is installed, so
+    // viewers can use the lock screen, answer UAC, control elevated windows and Ctrl+Alt+Del.
+    // A no-op (degrading to today's behaviour) when it isn't.
+    // (The sign-in host is SYSTEM itself, on the sign-in screen: it needs no helper.)
+    #[cfg(windows)]
+    if !args.test && !signin::active() {
+        platform::secure::start(frames.clone());
+    }
+    if signin::active() {
+        info!("sign-in host: the sign-in screen, until someone signs in (screen, keyboard and mouse only)");
+    }
+
     let token = control::load_or_create_token(&args.token_file)?;
     let tls = match args.cert.clone().zip(args.key.clone()) {
         Some((cert, key)) => Some(server::TlsFiles { cert, key }),
@@ -1208,16 +1315,21 @@ async fn run_host(args: Args) -> Result<()> {
             video,
             Box::new(testmode::FakeInput),
             Arc::new(testmode::FakeClipboard),
-            None,
+            // Who owns the computer on Tailscale, when a test says (see tailscale::identity).
+            std::env::var("GLASS_TEST_TAILNET_OWNER").ok(),
             None,
         )
     } else {
         // Keep displays (and the system) awake for as long as the host runs.
         let awake = platform::keep_awake();
         lid::watch();
+        if cfg!(windows) && !gamepad::supported() {
+            info!("game controllers: off until ViGEmBus is installed ({})", gamepad::VIGEM_DOWNLOAD);
+        }
         let video = Arc::new(video::Video::new(
             video::VideoConfig {
-                // Linux encodes in software: 60 at most.
+                // Linux encodes in software: 60 at most. Windows caps OpenH264 at 60 itself
+                // and lets its hardware encoder go faster.
                 fps: if cfg!(target_os = "linux") { args.fps.min(60) } else { args.fps },
                 bitrate: args.mbps * 1_000_000,
                 scale: args.scale,
@@ -1254,7 +1366,9 @@ async fn run_host(args: Args) -> Result<()> {
                 }
             }
         };
-        clipboard::watch(events.clone());
+        if !signin::active() {
+            clipboard::watch(events.clone());
+        }
         let tailnet_owner = match tailscale::self_login().await {
             Ok(login) => {
                 info!("tailnet devices owned by {login} connect without a token");
@@ -1274,9 +1388,13 @@ async fn run_host(args: Args) -> Result<()> {
         )
     };
     status::set_capturing(true);
-    update::watch();
-    if let Err(e) = ipc::serve() {
-        tracing::warn!("CLI socket: {e:#}");
+    // The sign-in host neither updates itself nor takes CLI commands (the user's host,
+    // started at sign-in, does).
+    if !signin::active() {
+        update::watch();
+        if let Err(e) = ipc::serve() {
+            tracing::warn!("CLI socket: {e:#}");
+        }
     }
 
     let test_routes = args
@@ -1329,15 +1447,22 @@ async fn run_host(args: Args) -> Result<()> {
 pub const PORT_TRIES: u16 = 20;
 
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME")
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
         .unwrap_or_default()
 }
 
-/// ~/.config/glass, or $GLASS_CONFIG_DIR (tests use it to stay out of the real config).
+/// ~/.config/glass (%APPDATA%\Glass on Windows), or $GLASS_CONFIG_DIR (tests use it to
+/// stay out of the real config).
 pub fn config_dir() -> PathBuf {
     std::env::var_os("GLASS_CONFIG_DIR")
         .map(PathBuf::from)
+        .or_else(|| {
+            cfg!(windows)
+                .then(|| std::env::var_os("APPDATA"))
+                .flatten()
+                .map(|d| PathBuf::from(d).join("Glass"))
+        })
         .unwrap_or_else(|| home().join(".config/glass"))
 }
 

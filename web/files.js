@@ -56,6 +56,7 @@ const join = (dir, name) => (dir ? `${dir}/${name}` : name);
 
 export function createFiles({ control, toast, upload, download, rawUrl, log }) {
   const button = document.getElementById('btn-files');
+  let trashName = 'Trash';
   const sheet = document.createElement('section');
   sheet.id = 'files';
   sheet.className = 'glass hidden';
@@ -322,7 +323,7 @@ export function createFiles({ control, toast, upload, download, rawUrl, log }) {
   });
   trashButton.addEventListener('click', () => {
     const e = shown[selected];
-    if (e && confirm(`Move “${e.name}” to the Trash?`)) control({ t: 'filesTrash', path: join(path, e.name) });
+    if (e && confirm(`Move “${e.name}” to the ${trashName}?`)) control({ t: 'filesTrash', path: join(path, e.name) });
   });
   $('.mkdir').addEventListener('click', () => askName('New folder', 'untitled folder', (name) => control({ t: 'filesMkdir', path, name })));
   viewButton.addEventListener('click', () => {
@@ -474,6 +475,11 @@ export function createFiles({ control, toast, upload, download, rawUrl, log }) {
 
   let refreshTimer;
   return {
+    /** Windows calls it the Recycle Bin. */
+    setHostOs(os) {
+      trashName = os === 'windows' ? 'Recycle Bin' : 'Trash';
+      sheet.querySelector('.act.trash').textContent = `Move to ${trashName}`;
+    },
     /** Owners with files allowed get the button. */
     setAvailable(on) {
       available = on;

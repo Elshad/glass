@@ -2,7 +2,8 @@
 //! read (`press`, `set_value`) through Accessibility, without moving the person's pointer
 //! or typing. Each element an agent can act on gets a ref like `@k3f9:e12`, good only for
 //! that snapshot: acting on one first checks the element is still there and still the
-//! same, and refuses rather than act on whatever took its place. macOS only for now.
+//! same, and refuses rather than act on whatever took its place. macOS (Accessibility)
+//! and Windows (UI Automation).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,7 +20,7 @@ pub struct Found {
 }
 
 /// One element of an app's window.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub struct Node {
     /// Short and lowercase: "button", "textfield", "text".
     pub role: String,
@@ -61,7 +62,7 @@ pub struct Now {
 }
 
 /// What became of an action, as far as the app says.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub enum Outcome {
     Done,
     /// Sent, but the app didn't reply in time: it may or may not have happened.
@@ -75,12 +76,14 @@ pub enum Outcome {
 
 #[cfg(target_os = "macos")]
 use crate::platform::ax;
+#[cfg(windows)]
+use crate::platform::uia as ax;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 mod ax {
     use super::{Budget, Found, Now, Outcome, Walk};
 
-    const NOT_HERE: &str = "Reading apps as text works on macOS only for now; use screenshot.";
+    const NOT_HERE: &str = "Reading apps as text works on macOS and Windows only for now; use screenshot.";
 
     pub struct Element;
 
@@ -103,6 +106,9 @@ mod ax {
         None
     }
 }
+
+/// What the OS calls the interface apps describe themselves through.
+const VIA: &str = if cfg!(windows) { "UI Automation" } else { "Accessibility" };
 
 /// Lines a snapshot shows unless the agent asks for more, and at most.
 const LINES: usize = 400;
@@ -373,7 +379,7 @@ pub async fn press(r: &str) -> Result<Value, Refused> {
             "Pressed {what}, but the app didn't confirm it in time (it may be busy, or a dialog opened). Check with snapshot or screenshot before pressing again."
         ),
         Outcome::Unsupported => {
-            return Err(Refused(format!("{what} can't be pressed through Accessibility; nothing was done.{}", click_instead(frame).await)));
+            return Err(Refused(format!("{what} can't be pressed through {VIA}; nothing was done.{}", click_instead(frame).await)));
         }
         Outcome::Gone => return Err(Refused(format!("{what} is gone (the window changed). Take a new snapshot. Nothing was done."))),
         Outcome::Failed(why) => {
@@ -411,7 +417,7 @@ pub async fn set_value(r: &str, text: &str) -> Result<Value, Refused> {
             None => format!("Set {what}, but couldn't read it back to check."),
         },
         Outcome::Unsupported => {
-            return Err(Refused(format!("{what} can't be filled in through Accessibility; nothing was done. Click it and use type_text.")));
+            return Err(Refused(format!("{what} can't be filled in through {VIA}; nothing was done. Click it and use type_text.")));
         }
         Outcome::Gone => return Err(Refused(format!("{what} is gone (the window changed). Take a new snapshot. Nothing was done."))),
         Outcome::Failed(why) => return Err(Refused(format!("Filling in {what} failed ({why}). Check it before trying again."))),
