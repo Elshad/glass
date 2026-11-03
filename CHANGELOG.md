@@ -2,6 +2,37 @@
 
 What changed in each release of Glass. `glass update` (or the Glass app) installs the newest; every build is on [GitHub Releases](https://github.com/Ntarasiuk/glass/releases).
 
+## 0.13.0
+
+November 3, 2026
+
+### Windows host (beta)
+
+Glass now runs on Windows 10 (2004 or newer) and 11, on x64 and Arm. In PowerShell:
+
+```powershell
+irm glassdesk.dev/install.ps1 | iex
+```
+
+That installs it for your user, no administrator needed. For installing on every computer you manage there's an MSI (`msiexec /i glass-….msi /qn`) and Group Policy settings.
+
+- Every display, with the pointer, or one window on its own. Mouse, keyboard, scroll, pen, and game controllers (with ViGEmBus).
+- Copy and paste both ways (text, rich text, images); sending files and the file browser; recording; one-time links; chat and notifications; the computer's sound.
+- With `glass service install`: the lock screen, UAC prompts, elevated windows and Ctrl+Alt+Del, and **signing in from the viewer after a restart**, with the same page going from the sign-in screen to your desktop.
+- AI agents: screenshots, clicks, keys and typing any text.
+- The viewer's microphone through VB-CABLE (Glass opens its installer).
+
+It's a beta: tested on Windows 11 in a VM, not yet widely on real PCs, and the programs aren't code-signed yet, so SmartScreen may warn before the installer runs. [Report problems](https://github.com/Ntarasiuk/glass/issues).
+
+### People on your tailnet
+
+- `glass acl add friend@gmail.com` (or `@domain`) lets that person's Tailscale devices in without the token, as a guest with the rule's limits. Before, only your own devices skipped the token.
+- `glass config tailnet-members on` (or **Let everyone on this tailnet in** in the app) lets everyone on the tailnet in as a guest. Off by default.
+
+### Also
+
+- The viewer's stats show how loud the sound reaching it is.
+
 ## 0.11.1
 
 November 2, 2026

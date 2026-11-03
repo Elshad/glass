@@ -5,7 +5,7 @@ What each host OS can do, to track what's done and what's left. Viewer-side feat
 
 ✅ works · 🧪 built, not yet run on real hardware · 🚧 being built · ❌ not yet · ? unverified · — doesn't apply
 
-Windows is in a stack of PRs (#75 onwards) and GitHub pre-releases (0.11.0-windows.*); a ✅ there means it ran in a Windows 11 Arm VM (UTM, no GPU), driven from a browser: the published x64 (under emulation) and Arm64 builds pass the VM suite (tests/e2e/windows-vm, 18 tests). Nothing has run on a real PC yet.
+Windows shipped in 0.13.0 (beta); a ✅ there means it ran in a Windows 11 Arm VM (UTM, no GPU), driven from a browser: the published x64 (under emulation) and Arm64 builds pass the VM suite (tests/e2e/windows-vm, 18 tests). Nothing has run on a real PC yet.
 
 ## Picture
 
@@ -80,7 +80,7 @@ Windows is in a stack of PRs (#75 onwards) and GitHub pre-releases (0.11.0-windo
 | Feature | macOS | Linux | Windows | Notes |
 |---|---|---|---|---|
 | One-line install | ✅ install.sh | ✅ install.sh | ✅ install.ps1 | `irm glassdesk.dev \| iex` |
-| Release builds | ✅ universal | ✅ x86_64 | ✅ x64 + Arm64 zips and MSIs | 0.11.0-windows.3 (pre-release): both pass the VM suite as published |
+| Release builds | ✅ universal | ✅ x86_64 | ✅ x64 + Arm64 zips and MSIs | 0.12.0-windows.1 (pre-release): both pass the VM suite as published |
 | Signed builds | ✅ stable identity | — | 🧪 Authenticode, timestamped | Windows: Azure Artifact Signing, a .pfx or SignPath (release.yml); unsigned until one is set up |
 | Managed deployment | ❌ | ❌ | ✅ per-machine MSI, 🧪 winget manifests | `msiexec /i glass-….msi /qn`; Program Files, starts for every user, firewall rule |
 | Admin policies (locked settings) | ❌ | ❌ | ✅ Group Policy / Intune (ADMX) | HKLM/HKCU\SOFTWARE\Policies\Glass; packaging/windows/policies |
