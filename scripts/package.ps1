@@ -47,11 +47,8 @@ if ($Step -in 'all', 'bundle') {
     Remove-Item "dist/$zip", "dist/$msi" -ErrorAction SilentlyContinue
     Compress-Archive -Path "$stage/glass" -DestinationPath "dist/$zip"
 
-    # The MSI's icon: the PNG in an .ico, as the per-user shortcut does (src/app/shortcut.rs).
-    $png = [IO.File]::ReadAllBytes((Resolve-Path crates/glass-host/assets/icon.png))
-    $ico = [byte[]]((0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 32, 0) + [BitConverter]::GetBytes([uint32]$png.Length) + [BitConverter]::GetBytes([uint32]22) + $png)
-    $icon = Join-Path (Resolve-Path $stage) 'Glass.ico'
-    [IO.File]::WriteAllBytes($icon, $ico)
+    # The MSI's icon: the same one as the programs' and the per-user shortcut's.
+    $icon = (Resolve-Path crates/glass-host/assets/glass.ico).Path
     $wixArch = if ($Arch -eq 'arm64') { 'arm64' } else { 'x64' }
     # MSI versions are numbers only.
     $msiVersion = ($version -split '-')[0]
