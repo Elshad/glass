@@ -98,6 +98,20 @@ if ($installed) {
     if ($LASTEXITCODE -eq 0) { Info 'Restarted Glass in the background' }
 }
 
+# The secure-desktop service (lock screen, UAC, Ctrl+Alt+Del) runs its own protected copy,
+# which only an administrator can replace, and Glass won't use one from another version.
+# Update it too: Windows asks once.
+$service = Get-CimInstance Win32_Service -Filter "Name='GlassSecureDesktop'" -ErrorAction SilentlyContinue
+$serviceVersion = ''
+if ($service -and $service.PathName -match '^"([^"]+)"') {
+    try { $serviceVersion = ((& $Matches[1] --version) -split ' ')[1] } catch {}
+}
+if ($service -and $serviceVersion -ne $version) {
+    Info 'Updating the secure-desktop service (Windows asks for permission)'
+    & $Glass service install | Out-Null
+    if ($LASTEXITCODE -ne 0) { Info 'Not updated: run  glass service install  to keep the lock screen working' }
+}
+
 # The app, in the Start menu (Glass.app on a Mac).
 $app = $false
 try { & $Glass app --install | Out-Null; $app = ($LASTEXITCODE -eq 0) } catch {}
