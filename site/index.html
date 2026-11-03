@@ -14,8 +14,8 @@
   </script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Glass: a low-latency remote desktop for Mac and Linux</title>
-  <meta name="description" content="Control your Mac or Linux computer from an iPad or any browser with about 20 ms of delay. Free, open source, end-to-end encrypted, one-line install.">
+  <title>Glass: a low-latency remote desktop for Mac, Linux and Windows</title>
+  <meta name="description" content="Control your Mac, Linux or Windows computer from an iPad or any browser with about 20 ms of delay. Free, open source, end-to-end encrypted, one-line install.">
   <link rel="canonical" href="https://glassdesk.dev/">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/icon-512.png">
@@ -27,11 +27,11 @@
   <meta property="og:site_name" content="Glass">
   <meta property="og:url" content="https://glassdesk.dev/">
   <meta property="og:title" content="Glass: your computer, in any browser">
-  <meta property="og:description" content="A remote desktop that feels local: about 20 ms from your Mac or Linux screen to your iPad, at home or from anywhere. Free, open source, one-line install.">
+  <meta property="og:description" content="A remote desktop that feels local: about 20 ms from your Mac, Linux or Windows screen to your iPad, at home or from anywhere. Free, open source, one-line install.">
   <meta property="og:image" content="https://glassdesk.dev/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="Glass: your computer, in any browser. About 20 ms from your Mac or Linux screen to an iPad, phone or laptop.">
+  <meta property="og:image:alt" content="Glass: your computer, in any browser. About 20 ms from your Mac, Linux or Windows screen to an iPad, phone or laptop.">
   <meta property="og:video" content="https://glassdesk.dev/og.mp4">
   <meta property="og:video:secure_url" content="https://glassdesk.dev/og.mp4">
   <meta property="og:video:type" content="video/mp4">
@@ -39,9 +39,9 @@
   <meta property="og:video:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Glass: your computer, in any browser">
-  <meta name="twitter:description" content="A remote desktop that feels local: about 20 ms from your Mac or Linux screen to your iPad, at home or from anywhere. Free, open source, one-line install.">
+  <meta name="twitter:description" content="A remote desktop that feels local: about 20 ms from your Mac, Linux or Windows screen to your iPad, at home or from anywhere. Free, open source, one-line install.">
   <meta name="twitter:image" content="https://glassdesk.dev/og.png">
-  <meta name="twitter:image:alt" content="Glass: your computer, in any browser. About 20 ms from your Mac or Linux screen to an iPad, phone or laptop.">
+  <meta name="twitter:image:alt" content="Glass: your computer, in any browser. About 20 ms from your Mac, Linux or Windows screen to an iPad, phone or laptop.">
   <meta name="theme-color" content="#07080a">
   <link rel="preload" href="/fonts/bricolage-grotesque-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="/fonts/hanken-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
@@ -57,7 +57,7 @@
       "@id": "https://glassdesk.dev/#website",
       "url": "https://glassdesk.dev/",
       "name": "Glass",
-      "description": "Control your Mac or Linux computer from an iPad or any browser with about 20 ms of delay. Free, open source, end-to-end encrypted, one-line install.",
+      "description": "Control your Mac, Linux or Windows computer from an iPad or any browser with about 20 ms of delay. Free, open source, end-to-end encrypted, one-line install.",
       "publisher": {
         "@id": "https://glassdesk.dev/#organization"
       },
@@ -67,7 +67,7 @@
       "@type": "WebPage",
       "@id": "https://glassdesk.dev/#webpage",
       "url": "https://glassdesk.dev/",
-      "name": "Glass: a low-latency remote desktop for Mac and Linux",
+      "name": "Glass: a low-latency remote desktop for Mac, Linux and Windows",
       "isPartOf": {
         "@id": "https://glassdesk.dev/#website"
       },
@@ -97,9 +97,9 @@
       "@id": "https://glassdesk.dev/#software",
       "name": "Glass",
       "url": "https://glassdesk.dev/",
-      "description": "Low-latency remote desktop for macOS and Linux. Install with one command, then see and control the computer from a browser on an iPad, iPhone or another computer, with 15–30 ms latency.",
+      "description": "Low-latency remote desktop for macOS, Linux and Windows. Install with one command, then see and control the computer from a browser on an iPad, iPhone or another computer, with 15–30 ms latency.",
       "applicationCategory": "UtilitiesApplication",
-      "operatingSystem": "macOS 13 or later, or Linux on Wayland (host); any browser with WebTransport and WebCodecs (viewer)",
+      "operatingSystem": "macOS 13 or later, Linux on Wayland, or Windows 10/11 (host); any browser with WebTransport and WebCodecs (viewer)",
       "offers": {
         "@type": "Offer",
         "price": "0",
@@ -179,6 +179,8 @@
         <p class="hint"><span class="only-unix">In Terminal on the computer you want to control: macOS 13+ or Linux.</span><span class="only-win">In PowerShell on the computer you want to control: Windows 10 or 11 (beta).</span> <button type="button" class="os-switch"><span class="only-unix">On Windows?</span><span class="only-win">On a Mac or Linux?</span></button> Free and <a href="https://github.com/Ntarasiuk/glass">open source</a>.</p>
         <ul class="works" aria-label="Works with">
           <li class="lg-glass-surface" data-lg-preset="control"><span>Works with</span><!-- Apple logo: Simple Icons (CC0). --><svg class="apple" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/></svg><b>macOS</b></li>
+          <!-- Windows logo: four panes, drawn here (Simple Icons no longer carries Microsoft's marks). -->
+          <li class="lg-glass-surface" data-lg-preset="control"><span>Works with</span><svg class="windows" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M0 0h11.3v11.3H0zM12.7 0H24v11.3H12.7zM0 12.7h11.3V24H0zM12.7 12.7H24V24H12.7z"/></svg><b>Windows</b></li>
           <!-- Omarchy wordmark: logo.svg from github.com/basecamp/omarchy (MIT), recoloured to currentColor. -->
           <li class="lg-glass-surface" data-lg-preset="control"><span>Works with</span><svg class="omarchy" viewBox="0 0 1215 285" role="img" aria-label="Omarchy"><g fill="currentColor"><path clip-rule="evenodd" d="m720 120h-15v15h-14.998v14.999l-60.002.001v15.002l90-.002v.002h.002l-.002 89.998h-15v15h-13v15h-17v-89.998h-45v90l-45-.002v-89.998h-14.998v-30h14.998v-15.002h-14.998v-30.001h14.998v-75h15v-14.997h15v-15.002h105.002zm-90-.001h45v-74.997h-45z" fill-rule="evenodd"/><path clip-rule="evenodd" d="m105 30.002h15v14.997h15v180.001h-15v15h-15v15.002h-75v-15.002h-15v-15h-15v-180.001h15v-14.997h15v-15.002h75zm-60 194.998h45v-179.998h-45z" fill-rule="evenodd"/><path d="m300 15h60v15h15v14.999h15v180.001h-15v15h-15v15h-15l-.004-209.998h-44.994v-.002h-.002v210.002h-45v-210h-44.998v179.997h-.002v30.003h-15v-15.002h-15v-15h-14.998v-180.001h14.998v-14.999h15v-15h60v-15h45z"/><path clip-rule="evenodd" d="m555 225h-15v15h-15v15h-15v-105.001l-44.998.001v105.002h-45.002v-105.002h-15v-30.001h15v-75h15.002v-14.997h15v-15.002h105zm-89.998-105.001h44.998v-74.997h-44.998z" fill-rule="evenodd"/><path d="m885 75h-15v15h-15v15h-15v-59.998h-45v179.998h45v-59.998h15v14.997h15v15.001h15v30h-15v15h-15v15.002l-105-.002v-210.001h14.998v-14.997h15.002v-15.002h105z"/><path d="m960 119.999h45v-104.999h15v15h15v14.999h15v75.001h15v15h-15v90h-15v15h-15v15h-15v-105h-45v105.002l-45-.002v-105h-30v-15h15v-15.001h15v-75h15v-14.997h15v-15.002h15z"/><path d="m1125 119.999h45v-104.999h15v15h15v15h15v180h-15v15h-15v15.002l-75-.002v-15h-15v-15h-15v-45.001h15v-14.997-.002h30v60h45v-75h-90v-105.001h15v-14.997h15v-15.002h15z"/></g></svg></li>
         </ul>
@@ -229,7 +231,7 @@
       <article class="use main lg-glass-surface">
         <p class="kind">Most common</p>
         <h3>Tailscale + Glass: your own computers, from your own devices</h3>
-        <p>Put Glass on the Mac or Linux box you want to reach and Tailscale on everything you own. Your iPad or phone opens it like a website, over your private tailnet: no ports opened, no account, nothing to install on the device in your hand.</p>
+        <p>Put Glass on the Mac, Linux or Windows box you want to reach and Tailscale on everything you own. Your iPad or phone opens it like a website, over your private tailnet: no ports opened, no account, nothing to install on the device in your hand.</p>
         <svg class="defs" width="0" height="0" aria-hidden="true" focusable="false"><defs>
           <symbol id="g-monitor" viewBox="0 0 120 100"><rect x="2" y="2" width="116" height="74" rx="9"/><path d="M60 76v14M36 92h48" stroke-linecap="round"/><image href="/icon.svg" x="44" y="21" width="32" height="32"/></symbol>
           <symbol id="g-ipad" viewBox="0 0 120 86"><rect x="2" y="2" width="116" height="82" rx="11"/><image href="/icon.svg" x="44" y="27" width="32" height="32"/></symbol>
