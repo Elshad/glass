@@ -2,6 +2,18 @@
 
 What changed in each release of Glass. `glass update` (or the Glass app) installs the newest; every build is on [GitHub Releases](https://github.com/Ntarasiuk/glass/releases).
 
+## 0.13.1
+
+November 3, 2026
+
+### Windows
+
+- Glass has its icon on Windows: the app's window, its taskbar button and Alt+Tab, the programs in Explorer, the Start menu and Settings › Apps. Before, most of them showed Windows' blank icon.
+
+### Website
+
+- glassdesk.dev shows Windows visitors the PowerShell install command (`irm glassdesk.dev | iex`), with a switch to the Mac and Linux one. The Mac and Linux installer, run from Git Bash or WSL on Windows, points to it instead of installing the wrong build.
+
 ## 0.13.0
 
 November 3, 2026
