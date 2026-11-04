@@ -863,6 +863,12 @@ async fn bridge(
     }
 
     let mut datagram_channel: Option<Arc<dyn DataChannel>> = None;
+    // Frame acknowledgements from the browser, on their way to the host: the bridge reads
+    // them too, so its own flow control knows what's on screen. Once they come, the host
+    // sets this viewer's bitrate from them (end to end, through this bridge), and the link
+    // meter steps aside.
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<(u8, u32)>();
+    let mut acking = false;
     let mut bridge_drops = 0u64;
     // Video over the data channel: measure the link and cap the bitrate to it (RTP video
     // has its own congestion control).
@@ -891,10 +897,16 @@ async fn bridge(
                     "d" => {
                         datagram_channel = Some(channel.clone());
                         let conn = conn.clone();
+                        let ack_tx = ack_tx.clone();
                         tokio::spawn(async move {
                             while let Some(event) = channel.poll().await {
                                 match event {
-                                    DataChannelEvent::OnMessage(m) => { let _ = conn.send_datagram(&m.data[..]); }
+                                    DataChannelEvent::OnMessage(m) => {
+                                        if let Some(ack) = glass_proto::read_frame_ack(&m.data[..]) {
+                                            let _ = ack_tx.send(ack);
+                                        }
+                                        let _ = conn.send_datagram(&m.data[..]);
+                                    }
                                     DataChannelEvent::OnClose => break,
                                     _ => {}
                                 }
@@ -938,7 +950,11 @@ async fn bridge(
                         }
                     }
                     flow.update(&mut link, now);
-                    // Tell the bitrate controller: the browser can't see these drops.
+                    // Tell the bitrate controller: the browser can't see these drops. (With
+                    // acknowledgements, the host sees them as frames that never arrive.)
+                    if acking {
+                        gate.dropped_frames = 0;
+                    }
                     if gate.dropped_frames > 0 && last_congestion_report.elapsed() >= Duration::from_secs(1) {
                         crate::server::bridge_congestion(std::mem::take(&mut gate.dropped_frames));
                         last_congestion_report = std::time::Instant::now();
@@ -979,6 +995,16 @@ async fn bridge(
                     pipe_stream_to_channel(recv, channel).await;
                 });
             }
+            Some((stream, id)) = ack_rx.recv() => {
+                if !acking {
+                    acking = true;
+                    crate::server::set_remote_cap(bridge_id, None);
+                    debug!("remote peer ({peer}): frames acknowledged; the host paces video by them");
+                }
+                let now = std::time::Instant::now();
+                link.acked(stream, id, now);
+                flow.update(&mut link, now);
+            }
             _ = flow_poll.tick(), if link.busy() => {
                 if let Some(dc) = &datagram_channel {
                     let now = std::time::Instant::now();
@@ -990,7 +1016,7 @@ async fn bridge(
                     flow.update(&mut link, now);
                 }
             }
-            _ = meter_tick.tick(), if !rtp_video => {
+            _ = meter_tick.tick(), if !rtp_video && !acking => {
                 if let Some(dc) = &datagram_channel {
                     let outstanding = dc.outstanding_bytes().await.unwrap_or(0);
                     let budget = video_backlog(crate::server::applied_bitrate());

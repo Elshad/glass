@@ -11,7 +11,13 @@
 //! shared, so a display is held while any viewer it goes to is full. A viewer stuck for
 //! seconds (a dead socket, a suspended tab) stops holding everyone else up.
 //!
-//! Adapted from voxl (MIT, github.com/tembo/voxl): `flow_ok` in its video.rs.
+//! A viewer that acknowledges frames once drawn (KIND_FRAME_ACK) is tracked by those
+//! instead: a frame is gone when the viewer has it on screen, so every queue on the way
+//! counts (a relay's, the network's, a slow decoder), and how long acknowledgements take
+//! feeds its bitrate (rate::AckRate).
+//!
+//! Adapted from voxl (MIT, github.com/tembo/voxl): `flow_ok` in its video.rs, and the
+//! delay and delivery estimates in its hub.rs.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -54,6 +60,7 @@ struct Sent {
     at: Instant,
     /// `Link::total` once this frame's last byte was handed over.
     end: u64,
+    bytes: usize,
 }
 
 /// One viewer's frames in flight.
@@ -77,6 +84,21 @@ pub struct Link {
     window: Option<(Instant, u64)>,
     /// Bytes a second delivered in recent windows, oldest first.
     rates: VecDeque<(Instant, f64)>,
+    /// The viewer acknowledges frames: they're gone when it says so, not when they leave
+    /// the send buffer.
+    acks: bool,
+    /// Bytes of frames acknowledged, ever.
+    acked: u64,
+    /// How much longer than the quickest lately acknowledgements take (smoothed).
+    queue_ms: f64,
+    /// Bytes a second acknowledged, smoothed, and the window being counted (start, bytes).
+    delivered: f64,
+    delivered_window: Option<(Instant, u64)>,
+}
+
+/// Wrapping frame-id order: `a` is `b` or before it.
+fn id_le(a: u32, b: u32) -> bool {
+    b.wrapping_sub(a) < u32::MAX / 2
 }
 
 impl Link {
@@ -85,12 +107,15 @@ impl Link {
         self.last_sent = Some(now);
         self.total += bytes as u64;
         match self.inflight.back_mut() {
-            Some(last) if last.stream == stream && last.id == id => last.end = self.total,
+            Some(last) if last.stream == stream && last.id == id => {
+                last.end = self.total;
+                last.bytes += bytes;
+            }
             _ => {
                 if self.inflight.len() >= MAX_TRACKED {
                     self.inflight.pop_front();
                 }
-                self.inflight.push_back(Sent { stream, id, at: now, end: self.total });
+                self.inflight.push_back(Sent { stream, id, at: now, end: self.total, bytes });
             }
         }
     }
@@ -122,6 +147,10 @@ impl Link {
         let out = self.total.saturating_sub(queued as u64).max(self.out);
         let delivered = out > self.out;
         self.out = out;
+        // Acknowledged frames are gone only when the viewer says so.
+        if self.acks {
+            return;
+        }
         while let Some(f) = self.inflight.front() {
             if f.end > out {
                 break;
@@ -132,25 +161,105 @@ impl Link {
         if self.inflight.is_empty() {
             self.stalled = false;
         }
-        // Delivery rate: bytes delivered between two deliveries, so a sample never counts
-        // a burst of acknowledgements without the wait before it. Only while there's
-        // more to deliver (an idle link says nothing about how much it could carry).
         if delivered {
-            match self.window {
-                Some((start, from)) if now.duration_since(start) >= RATE_WINDOW => {
-                    let rate = (out - from) as f64 / now.duration_since(start).as_secs_f64();
-                    self.rates.push_back((now, rate));
-                    while self.rates.front().is_some_and(|&(at, _)| now.duration_since(at) > RATE_MEMORY) {
-                        self.rates.pop_front();
-                    }
-                    self.window = Some((now, out));
-                }
-                Some(_) => {}
-                None => self.window = Some((now, out)),
-            }
+            self.delivery(out, now);
         }
         if !self.busy() {
             self.window = None;
+        }
+    }
+
+    /// Delivery rate: bytes delivered between two deliveries (`so_far`: delivered ever),
+    /// so a sample never counts a burst of acknowledgements without the wait before it.
+    /// Only while there's more to deliver (an idle link says nothing about how much it
+    /// could carry).
+    fn delivery(&mut self, so_far: u64, now: Instant) {
+        match self.window {
+            Some((start, from)) if now.duration_since(start) >= RATE_WINDOW => {
+                let rate = so_far.saturating_sub(from) as f64 / now.duration_since(start).as_secs_f64();
+                self.rates.push_back((now, rate));
+                while self.rates.front().is_some_and(|&(at, _)| now.duration_since(at) > RATE_MEMORY) {
+                    self.rates.pop_front();
+                }
+                self.window = Some((now, so_far));
+            }
+            Some(_) => {}
+            None => self.window = Some((now, so_far)),
+        }
+    }
+
+    /// The viewer drew frame `id` of `stream`: it and every earlier one of that stream are
+    /// gone (an earlier one it never drew was lost or skipped). From then on frames are
+    /// gone only when acknowledged.
+    pub fn acked(&mut self, stream: u8, id: u32, now: Instant) {
+        if !self.acks {
+            // Its own baseline: acknowledgements take a decode longer than the buffer did.
+            self.acks = true;
+            self.base = None;
+            self.window = None;
+        }
+        let mut bytes = 0;
+        let mut took = None;
+        self.inflight.retain(|f| {
+            let gone = f.stream == stream && id_le(f.id, id);
+            if gone {
+                bytes += f.bytes;
+                if f.id == id {
+                    took = Some(now.duration_since(f.at));
+                }
+            }
+            !gone
+        });
+        if let Some(took) = took {
+            self.sample(took, now);
+            let base = self.base.map_or(0.0, |(b, _)| b);
+            let queued = took.as_secs_f64() * 1000.0 - base;
+            self.queue_ms = self.queue_ms * 0.7 + queued * 0.3;
+        }
+        if bytes > 0 {
+            self.acked += bytes as u64;
+            self.delivery(self.acked, now);
+            let (start, counted) = *self.delivered_window.get_or_insert((now, 0));
+            let counted = counted + bytes as u64;
+            let took = now.duration_since(start).as_secs_f64();
+            if took >= 0.5 {
+                let rate = counted as f64 / took;
+                self.delivered = if self.delivered == 0.0 { rate } else { self.delivered * 0.6 + rate * 0.4 };
+                self.delivered_window = Some((now, 0));
+            } else {
+                self.delivered_window = Some((start, counted));
+            }
+        }
+        if self.inflight.is_empty() {
+            self.stalled = false;
+            self.window = None;
+        }
+    }
+
+    /// The viewer acknowledges frames.
+    pub fn acking(&self) -> bool {
+        self.acks
+    }
+
+    /// What acknowledgements say about the link now, for its bitrate.
+    pub fn ack_sample(&self, now: Instant) -> crate::rate::AckSample {
+        crate::rate::AckSample {
+            queue_ms: self.queue_ms,
+            oldest_ms: self
+                .inflight
+                .front()
+                .map_or(0.0, |f| now.duration_since(f.at).as_secs_f64() * 1000.0),
+            rtt_ms: self.rtt_ms(),
+            // Stale once acknowledgements stop (a hidden tab): it would keep "using" the
+            // rate, and raise it, while nothing is sent.
+            delivered_bps: if self
+                .delivered_window
+                .is_some_and(|(start, _)| now.saturating_duration_since(start) < Duration::from_secs(1))
+            {
+                self.delivered * 8.0
+            } else {
+                0.0
+            },
         }
     }
 
@@ -169,10 +278,10 @@ impl Link {
         }
     }
 
-    /// The round trip: the transport's, else the quickest a frame has gone lately.
+    /// The round trip: the transport's, else the quickest a frame has gone lately (with
+    /// acknowledgements, always that: it includes decoding, which the transport's doesn't).
     pub fn rtt_ms(&self) -> f64 {
-        self.rtt
-            .or(self.base)
+        if self.acks { self.base } else { self.rtt.or(self.base) }
             .map(|(b, _)| b)
             .unwrap_or(DEFAULT_RTT_MS)
     }
@@ -210,7 +319,11 @@ impl Link {
             None => 3,
         };
         let too_many_bytes = self.rate().is_some_and(|rate| {
-            let in_flight = self.total.saturating_sub(self.out) as f64;
+            let in_flight = if self.acks {
+                self.inflight.iter().map(|f| f.bytes).sum::<usize>() as f64
+            } else {
+                self.total.saturating_sub(self.out) as f64
+            };
             in_flight / rate * 1000.0 > rtt + SLACK_MS
         });
         self.inflight.len() >= max_frames || age.as_secs_f64() * 1000.0 > rtt + SLACK_MS || too_many_bytes
@@ -248,6 +361,10 @@ pub struct Viewer {
 impl Viewer {
     pub fn new() -> Self {
         Self { id: NEXT.fetch_add(1, Ordering::Relaxed), state: (0, 0) }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Re-evaluates `link` and publishes the result if it changed. Returns whether it's full.
@@ -431,6 +548,92 @@ pub(crate) mod tests {
         // them; one at a time, it waits for one at most.
         assert!(change_after_refreshes(false) > Duration::from_millis(1500));
         assert!(change_after_refreshes(true) < Duration::from_millis(350));
+    }
+
+    /// A moving screen (30 fps wanted) whose frames are sized by the ack-driven bitrate
+    /// (rate::AckRate), held by acknowledgements, over `link` for `secs`. Returns the
+    /// final bitrate and the worst change-to-screen delay over the last 5 seconds.
+    fn paced_by_acks(link: &mut SimLink, secs: u64) -> (u32, Duration) {
+        let t0 = Instant::now();
+        let mut l = Link::default();
+        let mut rate = crate::rate::AckRate::new(30_000_000);
+        let mut acks: VecDeque<(Instant, u32)> = VecDeque::new();
+        let (mut id, mut worst) = (0u32, Duration::ZERO);
+        let mut pending: Option<Instant> = None;
+        let (mut next_capture, mut next_tick) = (t0, t0);
+        let mut now = t0;
+        let end = t0 + Duration::from_secs(secs);
+        while now < end {
+            while acks.front().is_some_and(|&(at, _)| at <= now) {
+                let (_, acked) = acks.pop_front().unwrap();
+                l.acked(0, acked, now);
+            }
+            if now >= next_tick {
+                rate.update(l.ack_sample(now), now);
+                next_tick += crate::rate::ACK_TICK;
+            }
+            if now >= next_capture {
+                pending.get_or_insert(now);
+                next_capture += Duration::from_micros(33_333);
+            }
+            if let Some(changed) = pending
+                && !l.full(now)
+            {
+                let bytes = (rate.target() / 8 / 30) as usize;
+                // Drawn 5 ms after it arrives, and acknowledged half a round trip later.
+                let shown = link.send(bytes, now) + Duration::from_millis(5);
+                acks.push_back((shown + link.rtt / 2, id));
+                l.sent(0, id, bytes, now);
+                if now + Duration::from_secs(5) >= end {
+                    worst = worst.max(shown - changed);
+                }
+                id += 1;
+                pending = None;
+            }
+            now += Duration::from_millis(2);
+        }
+        (rate.target(), worst)
+    }
+
+    #[test]
+    fn acks_bring_the_rate_down_to_a_slow_link_and_keep_the_delay_short() {
+        // The bench case: 1 Mbps, 150 ms. From 4 Mbps it settles under the link, and what
+        // changes is on screen within half a second.
+        let mut link = SimLink::new(1_000_000.0, Duration::from_millis(150), Instant::now());
+        let (bps, worst) = paced_by_acks(&mut link, 30);
+        assert!((250_000..1_000_000).contains(&bps), "{bps} bps");
+        assert!(worst < Duration::from_millis(500), "worst delay {worst:?}");
+    }
+
+    #[test]
+    fn acks_find_a_fast_link_quickly() {
+        // 50 Mbps, 20 ms: slow start climbs well past where it began.
+        let mut link = SimLink::new(50_000_000.0, Duration::from_millis(20), Instant::now());
+        let (bps, worst) = paced_by_acks(&mut link, 5);
+        assert!(bps >= 20_000_000, "{bps} bps");
+        assert!(worst < Duration::from_millis(150), "worst delay {worst:?}");
+    }
+
+    #[test]
+    fn acks_decide_when_frames_are_gone() {
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        let mut l = Link::default();
+        for id in 0..3 {
+            l.sent(0, id, 1_000, t0);
+        }
+        l.sent(1, 0, 1_000, t0);
+        // Out of the buffer isn't gone, once the viewer acknowledges.
+        l.acked(0, 0, ms(40));
+        l.drained(0, ms(50));
+        assert_eq!(l.inflight.len(), 3);
+        // An ack covers the frames before it on its stream (2 implies 1), not other streams.
+        l.acked(0, 2, ms(60));
+        assert_eq!(l.inflight.len(), 1);
+        assert_eq!(l.rtt_ms(), 40.0);
+        // 20 ms more than the quickest: queueing, smoothed.
+        assert!((l.ack_sample(ms(60)).queue_ms - 6.0).abs() < 1e-9);
+        assert!(id_le(u32::MAX, 1) && !id_le(1, u32::MAX), "ids wrap");
     }
 
     #[test]

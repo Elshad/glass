@@ -401,6 +401,15 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let mut flow = crate::flow::Viewer::new();
     let mut flow_poll = tokio::time::interval(crate::flow::POLL);
     flow_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A viewer that acknowledges frames (KIND_FRAME_ACK) gets its own bitrate from them
+    // (rate::AckRate), as a cap on the shared encoders like a remote viewer's; its
+    // once-a-second reports then no longer drive the shared rate. Older viewers stay on
+    // the reports. Its acks also say when frames are gone (crate::flow).
+    let acking = Arc::new(AtomicBool::new(false));
+    let mut ack_rate: Option<crate::rate::AckRate> = None;
+    let cap = AckCap(ACK_CAP_KEYS + flow.id());
+    let mut rate_tick = tokio::time::interval(crate::rate::ACK_TICK);
+    rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result: Result<()> = async {
         loop {
@@ -414,6 +423,12 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         link.forget();
                     }
                     flow.update(&mut link, now);
+                }
+                _ = rate_tick.tick(), if link.acking() => {
+                    let now = std::time::Instant::now();
+                    let rate = ack_rate.get_or_insert_with(|| crate::rate::AckRate::new(shared.rate.lock().unwrap().max()));
+                    let bps = rate.update(link.ack_sample(now), now);
+                    set_remote_cap(cap.0, Some(bps));
                 }
                 _ = quiet_check.tick() => {
                     if last_heard.elapsed() > QUIET_LIMIT {
@@ -496,6 +511,16 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                             }
                         }
                         Some(&KIND_MIC) if mic_on.load(Ordering::Relaxed) => crate::mic::packet(&dgram),
+                        Some(&glass_proto::KIND_FRAME_ACK) => {
+                            if let Some((stream, id)) = glass_proto::read_frame_ack(&dgram) {
+                                if !acking.swap(true, Ordering::Relaxed) {
+                                    info!("{peer}: frames acknowledged: pacing video by them");
+                                }
+                                let now = std::time::Instant::now();
+                                link.acked(stream, id, now);
+                                flow.update(&mut link, now);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -515,6 +540,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         mic_on: mic_on.clone(),
                         local_cursor: local_cursor.clone(),
                         driver,
+                        acking: acking.clone(),
                     };
                     tokio::spawn(async move {
                         if let Err(e) = control(ctx, send, recv, rx).await {
@@ -536,6 +562,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         mic_on: mic_on.clone(),
                         local_cursor: local_cursor.clone(),
                         driver,
+                        acking: acking.clone(),
                     };
                     tokio::spawn(async move {
                         if let Err(e) = uni_stream(ctx, stream).await {
@@ -579,6 +606,24 @@ struct SessionCtx {
     local_cursor: Arc<AtomicBool>,
     /// Who this session is when it moves the pointer (`crate::cursor::moved_by`).
     driver: u64,
+    /// The viewer acknowledges frames: its bitrate comes from those, not its reports.
+    acking: Arc<AtomicBool>,
+}
+
+/// Bitrate-cap keys of viewers paced by frame acknowledgements, apart from the WebRTC
+/// bridges' (which count up from 1).
+const ACK_CAP_KEYS: u64 = 1 << 62;
+
+/// A viewer's ack-driven cap, removed when its session ends.
+struct AckCap(u64);
+
+impl Drop for AckCap {
+    fn drop(&mut self) {
+        let had = REMOTE_CAPS.lock().unwrap().as_ref().is_some_and(|c| c.contains_key(&self.0));
+        if had {
+            set_remote_cap(self.0, None);
+        }
+    }
 }
 
 async fn control(
@@ -1260,6 +1305,12 @@ async fn control(
                         .join("\n");
                     append_client_log(path.clone(), body).await;
                 }
+            }
+            // A viewer that acknowledges frames has its own rate (rate::AckRate), so its
+            // loss and latency no longer cut the shared one; how much it used still lets
+            // that climb (it would otherwise stay wherever a cautious start left it).
+            ClientMsg::NetStats(report) if ctx.acking.load(Ordering::Relaxed) => {
+                apply_rate_report(shared, crate::rate::Report { dropped: 0, latency_ms: None, ..report });
             }
             ClientMsg::NetStats(report) => {
                 apply_rate_report(shared, report);

@@ -67,6 +67,7 @@ export class VideoStream {
     this.env = env;
     this.ctx = undefined;
     this.pending = new Map(); // frameId -> { parts, received, keyframe, captureUs, checksum }
+    this.acks = new Map(); // capture time -> frameId, for frames being decoded
     this.reset();
     this.decoder = undefined;
     this.codec = undefined;
@@ -164,6 +165,9 @@ export class VideoStream {
   onFrame(id, frame) {
     // Anything older and still incomplete is lost.
     for (const key of this.pending.keys()) if (key <= id) this.pending.delete(key);
+    // A whole frame that won't be drawn (waiting for a keyframe) has still arrived: say so,
+    // or the host takes the wait for a keyframe as a queue on the link.
+    const skip = () => this.env.ack?.(this.index, id);
 
     const contiguous = this.lastDecodedId !== undefined && id === ((this.lastDecodedId + 1) >>> 0);
     // A delta in the other codec (the host just switched) can't follow this decoder.
@@ -171,6 +175,7 @@ export class VideoStream {
     if (!frame.keyframe && (this.waitingForKeyframe || !contiguous || !sameCodec)) {
       this.env.stats.dropped++;
       this.requestKeyframe();
+      skip();
       return;
     }
 
@@ -182,10 +187,13 @@ export class VideoStream {
       });
       this.env.stats.dropped++;
       this.requestKeyframe();
+      skip();
       return;
     }
-    if (frame.keyframe && !this.ensureDecoder(data, frame.hevc)) return;
-    if (!this.decoder) return;
+    if ((frame.keyframe && !this.ensureDecoder(data, frame.hevc)) || !this.decoder) {
+      skip();
+      return;
+    }
     this.waitingForKeyframe = false;
     this.lastDecodedId = id;
     this.lastChunk = { type: frame.keyframe ? 'key' : 'delta', size: data.byteLength, id, nals: nalTypes(data, frame.hevc) };
@@ -194,6 +202,9 @@ export class VideoStream {
       if (this.refreshes.size > 64) this.refreshes.clear();
       this.refreshes.add(frame.captureUs);
     }
+    // Acked once drawn (by capture time, which the decoded frame carries).
+    if (this.acks.size > 64) this.acks.clear();
+    this.acks.set(frame.captureUs, id);
     this.decoder.decode(new EncodedVideoChunk({ type: frame.keyframe ? 'key' : 'delta', timestamp: frame.captureUs, data }));
   }
 
@@ -279,6 +290,13 @@ export class VideoStream {
       if (this.holding) this.drawBacking();
     }
     const hostNow = this.env.hostNowUs();
+    // Tell the host it's on screen: it sends the next frame when the link has room
+    // (instead of queuing), and sets the bitrate by how long frames take to get here.
+    const id = this.acks.get(videoFrame.timestamp);
+    if (id !== undefined) {
+      this.acks.delete(videoFrame.timestamp);
+      this.env.ack?.(this.index, id);
+    }
     videoFrame.close();
 
     const stats = this.env.stats;

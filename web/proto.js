@@ -12,6 +12,8 @@ export const CURSOR_VISIBLE = 1;
 export const CURSOR_YOURS = 2;
 export const CURSOR_BAKED = 4;
 export const CURSOR_OFF_STREAM = 0xff;
+// 7 is Opus audio, 9 the cursor.
+export const KIND_FRAME_ACK = 8;
 export const AUDIO_HEADER_LEN = 16;
 export const FLAG_KEYFRAME = 1;
 export const FLAG_HEVC = 2;
@@ -47,6 +49,16 @@ export function readAudioHeader(view) {
 }
 
 export const STREAM_SHIFT = 4;
+
+/** A frame decoded and drawn: the host paces video by these (flow and bitrate). */
+export function frameAck(stream, frameId) {
+  const buf = new ArrayBuffer(8);
+  const view = new DataView(buf);
+  view.setUint8(0, KIND_FRAME_ACK);
+  view.setUint8(1, stream);
+  view.setUint32(4, frameId, true);
+  return new Uint8Array(buf);
+}
 
 export function readVideoHeader(view) {
   const flags = view.getUint8(1);

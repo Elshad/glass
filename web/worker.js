@@ -2,7 +2,7 @@
 // so none of the video path touches the main thread.
 
 import {
-  AUDIO_HEADER_LEN, KIND_AUDIO, KIND_AUDIO_OPUS, KIND_KEYFRAME_REQUEST, KIND_PONG, KIND_VIDEO, micPacket, ping, readAudioHeader, readPong, readVideoHeader, KIND_CURSOR, readCursor,
+  AUDIO_HEADER_LEN, KIND_AUDIO, KIND_AUDIO_OPUS, KIND_KEYFRAME_REQUEST, KIND_PONG, KIND_VIDEO, micPacket, ping, readAudioHeader, readPong, readVideoHeader, KIND_CURSOR, readCursor, frameAck,
 } from './proto.js';
 import { VideoStream, probeCodecs, probeDecoders, setDecoderStep } from './video-stream.js';
 import { RtcTransport } from './rtc-transport.js';
@@ -74,6 +74,8 @@ const streamEnv = {
   stats,
   hostNowUs: () => (clockSynced ? performance.now() * 1000 + clockOffsetUs : undefined),
   requestKeyframe: (index) => datagramWriter?.write(new Uint8Array([KIND_KEYFRAME_REQUEST, index])).catch(() => {}),
+  // Over WebTransport, or the WebRTC data channel (RtcTransport's datagrams).
+  ack: (index, frameId) => datagramWriter?.write(frameAck(index, frameId)).catch(() => {}),
 };
 const streams = []; // VideoStream per host stream number
 function videoStream(index) {

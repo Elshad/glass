@@ -10,6 +10,7 @@
 //!   host -> client  AUDIO  5 ms of 48 kHz s16 PCM (only to sessions that enabled audio)
 //!   host -> client  AUDIO_OPUS  one Opus packet instead, to viewers whose hello offered "opus"
 //!   host -> client  CURSOR where the pointer is (only to sessions that draw it themselves)
+//!   client -> host  FRAME_ACK  [kind, stream, 0, 0, frame id u32] once a frame is drawn
 //!
 //! Input travels client -> host on one reliable unidirectional stream as fixed-size
 //! [`InputEvent`] records, so a lost key-up can never leave a key stuck down. Text (IME,
@@ -28,6 +29,27 @@ pub const KIND_MIC: u8 = 6;
 pub const KIND_AUDIO_OPUS: u8 = 7;
 /// host -> client: where the pointer is, for a viewer that draws it itself (see [`CursorPos`]).
 pub const KIND_CURSOR: u8 = 9;
+/// client -> host: a frame was decoded and drawn. The host paces video by these: frames
+/// still unacknowledged hold capture back, and how long acks take sets the bitrate.
+/// (7 is Opus audio, 9 the cursor.)
+pub const KIND_FRAME_ACK: u8 = 8;
+pub const FRAME_ACK_LEN: usize = 8;
+
+pub fn frame_ack(stream: u8, frame_id: u32) -> [u8; FRAME_ACK_LEN] {
+    let mut out = [0u8; FRAME_ACK_LEN];
+    out[0] = KIND_FRAME_ACK;
+    out[1] = stream;
+    out[4..8].copy_from_slice(&frame_id.to_le_bytes());
+    out
+}
+
+/// (stream, frame id) from a FRAME_ACK datagram.
+pub fn read_frame_ack(buf: &[u8]) -> Option<(u8, u32)> {
+    if buf.len() < FRAME_ACK_LEN || buf[0] != KIND_FRAME_ACK {
+        return None;
+    }
+    Some((buf[1], u32::from_le_bytes(buf[4..8].try_into().ok()?)))
+}
 
 /// 5 ms at 48 kHz: one packet fits a datagram (16 + 240 * 2 ch * 2 B = 976 bytes).
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
@@ -605,5 +627,14 @@ mod tests {
         assert_eq!(p[0], KIND_PONG);
         assert_eq!(f64::from_le_bytes(p[8..16].try_into().unwrap()), 1234.5);
         assert_eq!(u64::from_le_bytes(p[16..24].try_into().unwrap()), 99);
+    }
+
+    #[test]
+    fn frame_acks_round_trip() {
+        let ack = frame_ack(2, 0xdead_beef);
+        assert_eq!(ack[0], KIND_FRAME_ACK);
+        assert_eq!(read_frame_ack(&ack), Some((2, 0xdead_beef)));
+        assert_eq!(read_frame_ack(&ack[..7]), None);
+        assert_eq!(read_frame_ack(&[KIND_PING; 8]), None);
     }
 }

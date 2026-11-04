@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  fletcher16, inputEvent, penEvent, textEvents, Input, INPUT_EVENT_LEN, MAX_TEXT_BYTES, TEXT_CHUNK, ping, readPong, readVideoHeader, KIND_PING, KIND_PONG, VIDEO_HEADER_LEN, readCursor, KIND_CURSOR, CURSOR_VISIBLE, CURSOR_YOURS,
+  fletcher16, inputEvent, penEvent, textEvents, Input, INPUT_EVENT_LEN, MAX_TEXT_BYTES, TEXT_CHUNK, ping, readPong, readVideoHeader, KIND_PING, KIND_PONG, VIDEO_HEADER_LEN, readCursor, KIND_CURSOR, CURSOR_VISIBLE, CURSOR_YOURS, frameAck, KIND_FRAME_ACK,
 } from '../../web/proto.js';
 
 test('fletcher16 matches the Rust implementation', () => {
@@ -136,4 +136,10 @@ test('cursor positions match glass_proto::CursorPos byte for byte', () => {
   v.setFloat32(8, 0.25, true);
   v.setFloat32(12, 0.5, true);
   assert.deepEqual(readCursor(v), { stream: 1, flags: 3, shape: 7, x: 0.25, y: 0.5 });
+});
+
+test('frame acks are kind 8, stream, two spare bytes, then the frame id', () => {
+  // Same bytes as glass_proto::frame_ack(2, 0xdeadbeef).
+  assert.equal(KIND_FRAME_ACK, 8);
+  assert.deepEqual([...frameAck(2, 0xdeadbeef)], [8, 2, 0, 0, 0xef, 0xbe, 0xad, 0xde]);
 });

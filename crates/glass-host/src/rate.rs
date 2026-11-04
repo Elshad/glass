@@ -147,6 +147,105 @@ impl RateControl {
     }
 }
 
+/// What a viewer's frame acknowledgements say about its link, every [`ACK_TICK`].
+#[derive(Debug, Clone, Copy)]
+pub struct AckSample {
+    /// How much longer than the quickest lately frames take to be acknowledged: queueing
+    /// somewhere on the way (network buffers, a relay, a slow decoder).
+    pub queue_ms: f64,
+    /// Age of the oldest frame not yet acknowledged (0: none).
+    pub oldest_ms: f64,
+    /// The quickest a frame has been acknowledged lately.
+    pub rtt_ms: f64,
+    /// Bits a second acknowledged (smoothed).
+    pub delivered_bps: f64,
+}
+
+/// How often [`AckRate`] looks.
+pub const ACK_TICK: Duration = Duration::from_millis(100);
+
+/// A viewer's bitrate from its frame acknowledgements, ten times a second, instead of the
+/// once-a-second reports [`RateControl`] gets (which cut to 70% a second after a queue
+/// had already built). Frames queueing: back off to 85% of what was delivered. At the
+/// start: ramp ×1.5 every 250 ms until the first sign of a queue, like TCP's slow start.
+/// After: recover quickly to just under where the link last choked, then probe past it
+/// gently. Only raised while the stream uses what it has (a still screen proves nothing).
+///
+/// Adapted from voxl (MIT, github.com/tembo/voxl): `RateCtl` in its video.rs.
+pub struct AckRate {
+    target: f64,
+    max: f64,
+    last_decrease: Option<Instant>,
+    last_increase: Option<Instant>,
+    slow_start: bool,
+    /// What was delivered when the link last choked, and when.
+    ceiling: Option<(f64, Instant)>,
+}
+
+/// Where a viewer's rate starts before its link is known.
+pub const ACK_START_BPS: u32 = 4_000_000;
+/// The least it goes to: still a picture, if a slow one. An absolute floor, not a share of
+/// the maximum: 8% of a 30 Mbps maximum is more than a 1 Mbps link carries.
+const MIN_BPS: u32 = 250_000;
+
+impl AckRate {
+    pub fn new(max: u32) -> Self {
+        Self {
+            target: ACK_START_BPS.min(max) as f64,
+            max: max as f64,
+            last_decrease: None,
+            last_increase: None,
+            slow_start: true,
+            ceiling: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn target(&self) -> u32 {
+        self.target as u32
+    }
+
+    /// Every [`ACK_TICK`]; returns the target.
+    pub fn update(&mut self, s: AckSample, now: Instant) -> u32 {
+        let since = |t: Option<Instant>| t.map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+        let congested = s.queue_ms > 30.0 || s.oldest_ms > s.rtt_ms + 80.0;
+        let clear = s.queue_ms <= 15.0;
+        // Raising only means something when the stream presses against the target.
+        let used = s.delivered_bps >= self.target * 0.5;
+        if congested && since(self.last_decrease) >= Duration::from_millis(300) {
+            let mut next = self.target * 0.85;
+            // What was delivered is the link's capacity only when we were pushing near
+            // the target; one big frame on a still screen would pin it at a trickle.
+            if used {
+                self.ceiling = Some((s.delivered_bps, now));
+                next = next.min(s.delivered_bps * 0.85);
+            }
+            self.target = next.max(MIN_BPS as f64);
+            self.last_decrease = Some(now);
+            self.slow_start = false;
+        } else if self.slow_start && !congested && clear {
+            if used && since(self.last_increase) >= Duration::from_millis(250) {
+                self.target = (self.target * 1.5).min(self.max);
+                self.last_increase = Some(now);
+            }
+        } else if !congested && clear && used && since(self.last_decrease) >= Duration::from_secs(1) {
+            // Paths change: forget a choke point not seen lately.
+            if self.ceiling.is_some_and(|(_, at)| now.saturating_duration_since(at) >= Duration::from_secs(15)) {
+                self.ceiling = None;
+            }
+            let near = self.ceiling.map_or(f64::INFINITY, |(c, _)| c * 0.9);
+            if self.target < near && since(self.last_increase) >= Duration::from_millis(200) {
+                self.target = (self.target * 1.06 + 100_000.0).min(near).min(self.max);
+                self.last_increase = Some(now);
+            } else if self.target >= near && since(self.last_increase) >= Duration::from_secs(1) {
+                self.target = (self.target * 1.02).min(self.max);
+                self.last_increase = Some(now);
+            }
+        }
+        self.target as u32
+    }
+}
+
 /// Shares a total bitrate between displays by how much each is changing (bytes it
 /// produced recently): a still display needs a trickle, the one with motion needs most.
 /// Floors keep a still display refreshable and a busy one usable.
@@ -371,6 +470,43 @@ mod tests {
             rc.report(lossy(), t0);
         }
         assert_eq!(rc.target(), (MAX as f64 * MIN_FRACTION) as u32);
+    }
+
+    fn sample(queue_ms: f64, delivered_bps: f64) -> AckSample {
+        AckSample { queue_ms, oldest_ms: 0.0, rtt_ms: 150.0, delivered_bps }
+    }
+
+    #[test]
+    fn acks_ramp_up_fast_at_the_start_and_cut_to_what_was_delivered() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut r = AckRate::new(MAX);
+        assert_eq!(r.target(), ACK_START_BPS);
+        // Busy and clear: ×1.5 every 250 ms, not more often.
+        assert_eq!(r.update(sample(0.0, 3_000_000.0), ms(0)), 6_000_000);
+        assert_eq!(r.update(sample(0.0, 5_000_000.0), ms(100)), 6_000_000);
+        assert_eq!(r.update(sample(0.0, 5_000_000.0), ms(250)), 9_000_000);
+        // A still screen (little delivered) doesn't raise it.
+        assert_eq!(r.update(sample(0.0, 100_000.0), ms(600)), 9_000_000);
+        // Queueing: 85% of what got through.
+        assert_eq!(r.update(sample(80.0, 5_000_000.0), ms(700)), 4_250_000);
+        // Not again within 300 ms; then again.
+        assert_eq!(r.update(sample(80.0, 4_000_000.0), ms(800)), 4_250_000);
+        assert_eq!(r.update(sample(80.0, 4_000_000.0), ms(1000)), 3_400_000);
+        // No more slow start: near the choke point (4 Mbps), +6% steps up to 90% of it,
+        // a second after the last cut...
+        assert_eq!(r.update(sample(0.0, 3_000_000.0), ms(1500)), 3_400_000);
+        assert_eq!(r.update(sample(0.0, 3_000_000.0), ms(2000)), 3_600_000);
+        assert_eq!(r.update(sample(0.0, 3_000_000.0), ms(2200)), 3_600_000, "capped at 90%");
+        // ...then 2% a second past it.
+        assert_eq!(r.update(sample(0.0, 3_000_000.0), ms(3200)), 3_672_000);
+    }
+
+    #[test]
+    fn an_old_unacknowledged_frame_is_congestion() {
+        let mut r = AckRate::new(MAX);
+        let stuck = AckSample { oldest_ms: 400.0, ..sample(0.0, 3_000_000.0) };
+        assert!(r.update(stuck, Instant::now()) < ACK_START_BPS);
     }
 
     #[test]
