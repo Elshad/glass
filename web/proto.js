@@ -14,7 +14,10 @@ export const FLAG_REFRESH = 4;
 export const VIDEO_HEADER_LEN = 20;
 export const INPUT_EVENT_LEN = 12;
 
-export const Input = { MOVE: 1, DOWN: 2, UP: 3, SCROLL: 4, KEY_DOWN: 5, KEY_UP: 6, PAD_BUTTON: 7, PAD_AXIS: 8, PAD_CONNECTED: 9, MOVE_BY: 10, PEN: 11 };
+export const Input = { MOVE: 1, DOWN: 2, UP: 3, SCROLL: 4, KEY_DOWN: 5, KEY_UP: 6, PAD_BUTTON: 7, PAD_AXIS: 8, PAD_CONNECTED: 9, MOVE_BY: 10, PEN: 11, TEXT: 12 };
+/** Text bytes in one TEXT event, and the most one piece of text may carry. */
+export const TEXT_CHUNK = INPUT_EVENT_LEN - 2;
+export const MAX_TEXT_BYTES = 4096;
 
 /** One mic packet: same layout as host audio (kind, channels, seq, capture time, s16 PCM). */
 export function micPacket(seq, captureUs, channels, pcm) {
@@ -88,6 +91,35 @@ export function penEvent(pen) {
 export function penFields({ near, pressure = 0, tiltX = 0, tiltY = 0, twist = 0 }) {
   const t = (v) => Math.max(-90, Math.min(90, Math.round(v))) & 0xff;
   return { button: near ? 1 : 0, keycode: t(tiltX) | (t(tiltY) << 8), a: Math.max(0, Math.min(1, pressure)), b: twist };
+}
+
+/**
+ * Text for the host to type as is (IME, emoji, accented letters), as TEXT events: chunks of
+ * whole characters, in pieces of at most MAX_TEXT_BYTES whose last chunk is marked.
+ * Mirrors glass_proto::text_events.
+ */
+export function textEvents(text) {
+  const enc = new TextEncoder();
+  const events = [];
+  let chunk = [];
+  let piece = 0;
+  const chars = [...text].map((c) => enc.encode(c));
+  chars.forEach((c, i) => {
+    chunk.push(...c);
+    piece += c.length;
+    const next = chars[i + 1]?.length ?? 0;
+    const last = !next || piece + next > MAX_TEXT_BYTES;
+    if (last || chunk.length + next > TEXT_CHUNK) {
+      const ev = new Uint8Array(INPUT_EVENT_LEN);
+      ev[0] = Input.TEXT;
+      ev[1] = chunk.length | (last ? 0x80 : 0);
+      ev.set(chunk, 2);
+      events.push(ev);
+      chunk = [];
+      if (last) piece = 0;
+    }
+  });
+  return events;
 }
 
 /** Fletcher-16 (mod 255); mirrors glass_proto::fletcher16. */

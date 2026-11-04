@@ -1,6 +1,6 @@
 // Pointer, touch, keyboard and clipboard input → remote input events.
 
-import { Input, penFields } from './proto.js';
+import { Input, penFields, textEvents } from './proto.js';
 import { MAC_KEYCODES, charToKey, KVK_SHIFT } from './keymap.js';
 import { log } from './log.js';
 import { pointsPerPx, scrollBatcher, wheelPixels } from './scroll.js';
@@ -589,6 +589,20 @@ export function attachInput({
     if (shift) send(Input.KEY_UP, { keycode: KVK_SHIFT });
   }
 
+  /**
+   * Typed text: as key presses when each character has a key on a US keyboard (as before),
+   * else as text the host types as is: IME results, emoji, accented letters.
+   */
+  function typeText(text) {
+    if (!text) return;
+    const keys = [...text].map(charToKey);
+    if (keys.every(Boolean)) {
+      for (const key of keys) tapKey(key.keycode, key.shift);
+      return;
+    }
+    for (const bytes of textEvents(text)) send(Input.TEXT, { bytes });
+  }
+
   // Typing in Glass's own fields (token prompt, share link) stays local.
   const localField = (el) => el !== keySink && el?.matches?.('input, textarea');
 
@@ -603,7 +617,8 @@ export function attachInput({
       onLocalShortcut(e.code);
       return;
     }
-    if (e.isComposing) return;
+    // An IME is composing (229: the key that starts it): the result comes as compositionend.
+    if (e.isComposing || e.keyCode === 229) return;
     const code = codeOf(e);
     const keycode = MAC_KEYCODES[code];
     // On-screen keyboards often report no code; their text arrives via beforeinput.
@@ -693,17 +708,29 @@ export function attachInput({
     else control({ t: 'clipboard', text, paste: true });
   });
 
+  // An IME (Chinese, Japanese, Korean; Android keyboards for every word) composes in the
+  // key sink, which can't be stopped; what it settles on is typed, and the field emptied.
+  let composed; // { text, at }: Safari can follow compositionend with the same insertText
+  keySink.addEventListener('compositionend', (e) => {
+    typeText(e.data);
+    composed = { text: e.data, at: performance.now() };
+    keySink.value = '';
+  });
+
   // On-screen keyboard text (and anything else that bypassed keydown).
   keySink.addEventListener('beforeinput', (e) => {
+    // Composition steps can't be cancelled; compositionend types the result.
+    if (e.isComposing || /Composition/.test(e.inputType)) return;
     e.preventDefault();
     switch (e.inputType) {
       case 'insertText':
-      case 'insertReplacementText':
-        for (const ch of e.data ?? '') {
-          const key = charToKey(ch);
-          if (key) tapKey(key.keycode, key.shift);
-        }
+      case 'insertReplacementText': {
+        const text = e.data ?? e.dataTransfer?.getData('text/plain') ?? '';
+        const again = composed && composed.text === text && performance.now() - composed.at < 100;
+        composed = undefined;
+        if (!again) typeText(text);
         break;
+      }
       case 'insertLineBreak':
       case 'insertParagraph':
         tapKey(MAC_KEYCODES.Enter, false);

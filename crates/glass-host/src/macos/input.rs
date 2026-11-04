@@ -198,8 +198,8 @@ impl Injector {
                 CGEvent::set_integer_value_field(ev.as_deref(), CGEventField::ScrollWheelEventIsContinuous, 1);
                 self.post(ev);
             }
-            // Routed to crate::gamepad by the server, never here.
-            InputEvent::Gamepad { .. } => {}
+            // Routed to crate::gamepad by the server, never here; text goes to type_text.
+            InputEvent::Gamepad { .. } | InputEvent::Text { .. } => {}
             InputEvent::KeyDown { keycode } | InputEvent::KeyUp { keycode } => {
                 let down = matches!(ev, InputEvent::KeyDown { .. });
                 if let Some(flag) = modifier_flag(keycode) {

@@ -11,7 +11,9 @@
 //!   host -> client  AUDIO_OPUS  one Opus packet instead, to viewers whose hello offered "opus"
 //!
 //! Input travels client -> host on one reliable unidirectional stream as fixed-size
-//! [`InputEvent`] records, so a lost key-up can never leave a key stuck down.
+//! [`InputEvent`] records, so a lost key-up can never leave a key stuck down. Text (IME,
+//! emoji, accented letters) rides the same stream as [`InputEvent::Text`] chunks, so it
+//! stays in order with keys.
 
 pub const KIND_VIDEO: u8 = 1;
 pub const KIND_PING: u8 = 2;
@@ -235,6 +237,75 @@ pub enum InputEvent {
     /// in proximity (hovering or touching); false when it leaves. `pressure` 0..1, tilt in
     /// degrees (-90..90) toward +x / +y, `twist` the barrel rotation in degrees (0..359).
     Pen { near: bool, pressure: f32, tilt_x: i8, tilt_y: i8, twist: f32 },
+    /// Up to [`TEXT_CHUNK`] bytes of UTF-8 text to type, whole characters only; `last` ends
+    /// one piece of text (see [`text_events`] and [`TextReader`]).
+    Text { len: u8, last: bool, bytes: [u8; TEXT_CHUNK] },
+}
+
+/// Text bytes in one [`InputEvent::Text`]: the record after its tag and length byte.
+pub const TEXT_CHUNK: usize = INPUT_EVENT_LEN - 2;
+/// The most text one piece may carry; hosts drop longer ones.
+pub const MAX_TEXT_BYTES: usize = 4096;
+const TEXT_LAST: u8 = 0x80;
+
+/// `text` as [`InputEvent::Text`] chunks, split between characters: pieces of at most
+/// [`MAX_TEXT_BYTES`], the last chunk of each marked. Empty text is no events.
+pub fn text_events(text: &str) -> Vec<InputEvent> {
+    let mut events = Vec::new();
+    let mut piece = 0;
+    let mut chunk = [0u8; TEXT_CHUNK];
+    let mut len = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let mut utf8 = [0u8; 4];
+        let c = c.encode_utf8(&mut utf8).as_bytes();
+        chunk[len..len + c.len()].copy_from_slice(c);
+        len += c.len();
+        piece += c.len();
+        let next = chars.peek().map_or(0, |c| c.len_utf8());
+        let ends_piece = next == 0 || piece + next > MAX_TEXT_BYTES;
+        if ends_piece || len + next > TEXT_CHUNK {
+            events.push(InputEvent::Text { len: len as u8, last: ends_piece, bytes: chunk });
+            chunk = [0u8; TEXT_CHUNK];
+            len = 0;
+            if ends_piece {
+                piece = 0;
+            }
+        }
+    }
+    events
+}
+
+/// Puts [`InputEvent::Text`] chunks back together, one viewer's stream at a time.
+#[derive(Debug, Default)]
+pub struct TextReader {
+    buf: Vec<u8>,
+    /// The piece being read grew past [`MAX_TEXT_BYTES`]: dropped up to its last chunk.
+    overflow: bool,
+}
+
+impl TextReader {
+    /// Adds a chunk; returns the text once its last chunk is in (`None` for non-text events,
+    /// unfinished text, and text too long or not UTF-8).
+    pub fn push(&mut self, ev: &InputEvent) -> Option<String> {
+        let InputEvent::Text { len, last, bytes } = ev else { return None };
+        let len = (*len as usize).min(TEXT_CHUNK);
+        if self.buf.len() + len > MAX_TEXT_BYTES {
+            self.overflow = true;
+            self.buf.clear();
+        }
+        if !self.overflow {
+            self.buf.extend_from_slice(&bytes[..len]);
+        }
+        if !*last {
+            return None;
+        }
+        let buf = std::mem::take(&mut self.buf);
+        if std::mem::take(&mut self.overflow) {
+            return None;
+        }
+        String::from_utf8(buf).ok().filter(|t| !t.is_empty())
+    }
 }
 
 pub const GAMEPAD_BUTTON: u8 = 0;
@@ -268,11 +339,25 @@ impl InputEvent {
                 tilt_y: (keycode >> 8) as u8 as i8,
                 twist: b,
             },
+            12 => {
+                let len = button & !TEXT_LAST;
+                if len as usize > TEXT_CHUNK {
+                    return None;
+                }
+                Self::Text { len, last: button & TEXT_LAST != 0, bytes: buf[2..].try_into().unwrap() }
+            }
             _ => return None,
         })
     }
 
     pub fn write(&self) -> [u8; INPUT_EVENT_LEN] {
+        if let Self::Text { len, last, bytes } = *self {
+            let mut out = [0u8; INPUT_EVENT_LEN];
+            out[0] = 12;
+            out[1] = len.min(TEXT_CHUNK as u8) | if last { TEXT_LAST } else { 0 };
+            out[2..].copy_from_slice(&bytes);
+            return out;
+        }
         let (kind, button, keycode, a, b) = match *self {
             Self::MouseMove { x, y, stream } => (1, stream, 0, x, y),
             Self::MouseDown { button } => (2, button, 0, 0.0, 0.0),
@@ -290,6 +375,7 @@ impl InputEvent {
             Self::Pen { near, pressure, tilt_x, tilt_y, twist } => {
                 (11, near as u8, u16::from_le_bytes([tilt_x as u8, tilt_y as u8]), pressure, twist)
             }
+            Self::Text { .. } => unreachable!("written above"),
         };
         let mut out = [0u8; INPUT_EVENT_LEN];
         out[0] = kind;
@@ -347,6 +433,7 @@ mod tests {
             InputEvent::MouseMoveBy { dx: 7.0, dy: -3.0 },
             InputEvent::Pen { near: true, pressure: 0.5, tilt_x: -45, tilt_y: 30, twist: 270.0 },
             InputEvent::Pen { near: false, pressure: 0.0, tilt_x: 0, tilt_y: 0, twist: 0.0 },
+            text_events("日本")[0],
         ] {
             assert_eq!(InputEvent::read(&ev.write()), Some(ev));
         }
@@ -359,6 +446,61 @@ mod tests {
         assert_eq!(&b[..4], &[11, 1, 0xd3, 0x1e]);
         assert_eq!(f32::from_le_bytes(b[4..8].try_into().unwrap()), 0.5);
         assert_eq!(f32::from_le_bytes(b[8..12].try_into().unwrap()), 270.0);
+    }
+
+    fn read_all(events: &[InputEvent]) -> Vec<String> {
+        let mut reader = TextReader::default();
+        events
+            .iter()
+            .filter_map(|ev| reader.push(&InputEvent::read(&ev.write()).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn text_survives_chunking() {
+        for text in ["a", "café", "日本語の入力", "👍🏽 ok", "한국어", "0123456789", "x\ny"] {
+            assert_eq!(read_all(&text_events(text)), [text], "{text:?}");
+        }
+        assert!(text_events("").is_empty());
+    }
+
+    #[test]
+    fn text_chunks_hold_whole_characters() {
+        // 4-byte emoji: two per chunk, never split across chunks.
+        let events = text_events("😀😀😀");
+        assert_eq!(events.len(), 2);
+        for ev in &events {
+            let InputEvent::Text { len, bytes, .. } = ev else { panic!() };
+            assert!(std::str::from_utf8(&bytes[..*len as usize]).is_ok());
+        }
+    }
+
+    #[test]
+    fn text_wire_layout() {
+        // Same bytes as web/proto.js's textEvents (tests/unit/proto.test.mjs).
+        let b = text_events("é!")[0].write();
+        assert_eq!(&b[..5], &[12, 0x80 | 3, 0xc3, 0xa9, b'!']);
+        assert!(b[5..].iter().all(|&x| x == 0));
+        // A length past the chunk is no event.
+        let mut bad = b;
+        bad[1] = 11;
+        assert_eq!(InputEvent::read(&bad), None);
+    }
+
+    #[test]
+    fn long_text_splits_into_pieces_and_too_long_is_dropped() {
+        let long = "é".repeat(MAX_TEXT_BYTES); // twice the limit in bytes
+        let pieces = read_all(&text_events(&long));
+        assert!(pieces.len() >= 2 && pieces.iter().all(|p| p.len() <= MAX_TEXT_BYTES));
+        assert_eq!(pieces.concat(), long);
+        // A sender that never marks the end gets nothing typed, and the next text is fine.
+        let mut reader = TextReader::default();
+        let chunk = InputEvent::Text { len: TEXT_CHUNK as u8, last: false, bytes: *b"aaaaaaaaaa" };
+        for _ in 0..MAX_TEXT_BYTES {
+            assert_eq!(reader.push(&chunk), None);
+        }
+        assert_eq!(reader.push(&InputEvent::Text { len: 1, last: true, bytes: *b"b\0\0\0\0\0\0\0\0\0" }), None);
+        assert_eq!(text_events("next").iter().find_map(|e| reader.push(e)), Some("next".into()));
     }
 
     #[test]

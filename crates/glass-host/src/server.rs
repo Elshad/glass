@@ -1964,6 +1964,28 @@ fn record_auth_failure(shared: &Shared, peer: std::net::IpAddr) {
 /// left an approved viewer seeing the screen with no mouse or keyboard.
 const AUTH_WAIT: Duration = Duration::from_secs(crate::approval::TIMEOUT.as_secs() + 10);
 
+/// Types text a viewer sent (IME, emoji, accented letters), in order with its keys: the
+/// next event isn't read until it's typed. Hosts without a text path press US keys for
+/// what they can.
+async fn type_viewer_text(ctx: &SessionCtx, text: String) {
+    let shared = ctx.shared.clone();
+    // Typing paces itself (apps drop bursts), so not on the async runtime.
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut injector = shared.injector.lock().unwrap();
+        if injector.type_text(&text) {
+            return;
+        }
+        let (events, missing) = crate::keys::text_key_events(&text);
+        for ev in events {
+            injector.handle(ev);
+        }
+        if missing > 0 {
+            tracing::debug!("input: {missing} characters have no key on this computer; not typed");
+        }
+    })
+    .await;
+}
+
 /// Input streams open right now, across viewers.
 static INPUT_STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -2001,6 +2023,8 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
             // What this viewer is holding down, to let go of when it leaves.
             let mut keys = std::collections::HashSet::new();
             let mut buttons = std::collections::HashSet::new();
+            // Text from an IME or a phone keyboard, put back together from its chunks.
+            let mut text = glass_proto::TextReader::default();
             while stream.read_exact(&mut buf).await.is_ok() {
                 // A view-only link's input is read and dropped.
                 if !perms.input {
@@ -2009,6 +2033,12 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
                 match InputEvent::read(&buf) {
                     Some(ev @ InputEvent::Gamepad { .. }) if !crate::testmode::enabled() => {
                         crate::gamepad::handle(ev)
+                    }
+                    Some(ev @ InputEvent::Text { .. }) => {
+                        if let Some(text) = text.push(&ev) {
+                            crate::computer::human_input();
+                            type_viewer_text(&ctx, text).await;
+                        }
                     }
                     Some(ev) => {
                         // A person clicking, typing or scrolling: agents wait for them.

@@ -149,7 +149,10 @@ pub trait InputSink: Send {
     /// Moves the pointer to `x`, `y` (0..1) of display `display`, streamed or not (agents).
     fn move_on_display(&mut self, display: u32, x: f32, y: f32);
     /// Types `text` as is, any characters; `false` when this sink can't (the caller then
-    /// presses keys for it).
+    /// presses keys for it). Linux can't: uinput sends key codes through the desktop's own
+    /// keyboard layout, with no way to type a character the layout lacks (no XTest on
+    /// Wayland, and Glass doesn't drive the RemoteDesktop portal, which takes keysyms), so
+    /// only characters on a US keyboard are typed there.
     fn type_text(&mut self, _text: &str) -> bool {
         false
     }

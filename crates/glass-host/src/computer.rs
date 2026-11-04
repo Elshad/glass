@@ -484,16 +484,10 @@ pub async fn type_text(text: &str) -> Result<Value, Refused> {
         // Key by key on a US layout.
         let mut events = Vec::new();
         for c in text.chars() {
-            let (key, shift) = crate::keys::char_key(c)
-                .ok_or_else(|| Refused(format!("can't type {c:?} on this computer; try pasting it")))?;
-            if shift {
-                events.push(InputEvent::KeyDown { keycode: crate::keys::SHIFT });
-            }
-            events.push(InputEvent::KeyDown { keycode: key });
-            events.push(InputEvent::KeyUp { keycode: key });
-            if shift {
-                events.push(InputEvent::KeyUp { keycode: crate::keys::SHIFT });
-            }
+            events.extend(
+                crate::keys::char_events(c)
+                    .ok_or_else(|| Refused(format!("can't type {c:?} on this computer; try pasting it")))?,
+            );
         }
         inject(events)?;
     }

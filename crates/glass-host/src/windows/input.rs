@@ -305,7 +305,7 @@ impl Injector {
                         super::secure::move_abs(gx, gy);
                     }
                 }
-                Ev::Gamepad { .. } => {}
+                Ev::Gamepad { .. } | Ev::Text { .. } => {}
                 other => {
                     super::secure::send_input(&other);
                 }
@@ -322,8 +322,8 @@ impl Injector {
             }
             // Relative: what games and 3D apps reading raw input want.
             Ev::MouseMoveBy { dx, dy } => send(&[mouse(dx.round() as i32, dy.round() as i32, 0, MOUSEEVENTF_MOVE)]),
-            // Routed to crate::gamepad by the server, never here.
-            Ev::Gamepad { .. } => {}
+            // Routed to crate::gamepad by the server, never here; text goes to type_text.
+            Ev::Gamepad { .. } | Ev::Text { .. } => {}
             Ev::Pen { near, pressure, tilt_x, tilt_y, twist } => {
                 let was_near = self.pen.is_some();
                 if near {

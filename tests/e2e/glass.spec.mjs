@@ -362,6 +362,25 @@ test.describe('input', () => {
     expect(await keys(host, 'keydown')).toEqual([K.Shift, K.H, K.I]);
   });
 
+  it('types IME, emoji and accented text as text, in order with keys', async ({ page, host }) => {
+    await open(page, host);
+    await host.clearInput();
+    await page.locator('#keys').focus();
+    await page.keyboard.insertText('café 👍');
+    // An IME settling on what was composed.
+    await page.evaluate(() => {
+      const sink = document.getElementById('keys');
+      sink.dispatchEvent(new CompositionEvent('compositionstart', { data: '' }));
+      sink.dispatchEvent(new CompositionEvent('compositionend', { data: '日本語' }));
+    });
+    // Plain ASCII still goes as keys.
+    await page.keyboard.insertText('i');
+    await expect.poll(() => keys(host, 'keyup')).toEqual([K.I]);
+    const { events } = await host.input();
+    const typed = events.filter((e) => e.t === 'text' || e.t === 'keydown').map((e) => e.text ?? e.keycode);
+    expect(typed).toEqual(['café 👍', '日本語', K.I]);
+  });
+
   it('PC keyboard mode turns Ctrl into ⌘ and Super into Ctrl', async ({ page, host }) => {
     await page.goto(host.url());
     await page.evaluate(() => localStorage.setItem('glass.pcKeyboard', '1'));

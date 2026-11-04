@@ -501,6 +501,8 @@ impl InputSink for FakeInput {
             InputEvent::Gamepad { pad, kind, index, value } => {
                 serde_json::json!({"t": "gamepad", "pad": pad, "kind": kind, "index": index, "value": value})
             }
+            // Put together by the server and typed with type_text.
+            InputEvent::Text { .. } => return,
         };
         INPUT.lock().unwrap().events.push(json);
     }

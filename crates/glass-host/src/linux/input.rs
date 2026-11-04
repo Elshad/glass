@@ -132,8 +132,8 @@ impl Injector {
                 let y = (self.pos.1 + dy as f64).clamp(l.y, l.y + l.h - 1.0);
                 self.move_to(x, y);
             }
-            // Routed to crate::gamepad by the server, never here.
-            Ev::Gamepad { .. } => {}
+            // Routed to crate::gamepad by the server, never here; text goes to type_text.
+            Ev::Gamepad { .. } | Ev::Text { .. } => {}
             // Pressure needs a tablet device; the pen still works as a mouse.
             Ev::Pen { .. } => {}
             Ev::MouseDown { button } | Ev::MouseUp { button } => {

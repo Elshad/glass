@@ -1,7 +1,7 @@
 // Main thread: wires input, UI and the worker together. Video and networking live
 // in worker.js so the main thread only handles input and small DOM updates.
 
-import { inputEvent } from './proto.js';
+import { Input, inputEvent } from './proto.js';
 import { attachInput } from './input.js';
 import { attachGamepads } from './gamepad.js';
 import { createUI, positionNames } from './ui.js';
@@ -195,7 +195,8 @@ worker.onerror = (e) => log('error', `worker: ${e.message}`, { src: `${e.filenam
 const control = (msg) => worker.postMessage({ type: 'control', msg });
 // A view-only link sends no input (the host would drop it anyway).
 let inputAllowed = true;
-const send = (kind, fields) => inputAllowed && worker.postMessage({ type: 'input', bytes: inputEvent(kind, fields) });
+// Text events come ready made (textEvents); the rest from their fields.
+const send = (kind, fields) => inputAllowed && worker.postMessage({ type: 'input', bytes: kind === Input.TEXT ? fields.bytes : inputEvent(kind, fields) });
 let session = 0; // this session's id, from welcome (chat from it is our own)
 let perms = { input: true, clipboard: true, files: true, owner: true };
 let features = {};
