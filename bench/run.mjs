@@ -27,11 +27,15 @@ export const LINKS = {
   '5m60': { mbps: 5, rtt: 60, loss: 0 },
   // Tesla-like: a car's LTE link.
   '1m150': { mbps: 1, rtt: 150, loss: 1 },
+  // A phone on cellular over a tailnet (measured: 288 ms idle, 1-3 s loaded).
+  phone: { mbps: 5, rtt: 288, loss: 0, queue: 3000 },
+  phoneloss: { mbps: 5, rtt: 288, loss: 0.5, queue: 3000 },
+  phoneslow: { mbps: 2, rtt: 288, loss: 0.5, queue: 3000 },
 };
-const WORKLOADS = ['anim', 'scroll'];
+const WORKLOADS = ['anim', 'scroll', 'still', 'noise'];
 
 function args() {
-  const o = { workload: WORKLOADS.join(','), link: Object.keys(LINKS).join(','), path: 'wt', shaper: 'user', secs: 20, warmup: 5, size: '1280x720', fps: 60 };
+  const o = { workload: 'anim,scroll', link: Object.keys(LINKS).join(','), path: 'wt', shaper: 'user', secs: 20, warmup: 5, size: '1280x720', fps: 60, sharp: '0' };
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i].replace(/^--/, '');
@@ -78,7 +82,7 @@ async function freePort(kind) {
 
 // ---- A test-mode host ----
 
-class Host {
+export class Host {
   constructor(env) {
     this.env = env;
     this.dir = mkdtempSync(join(tmpdir(), 'glass-bench-'));
@@ -118,7 +122,7 @@ class Host {
   }
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- The introducer, for the WebRTC path (as tests/e2e/remote.spec.mjs runs it) ----
 
@@ -142,14 +146,14 @@ async function startIntroducer() {
 
 // ---- Shaping ----
 
-async function shape(o, link, port) {
+export async function shape(o, link, port) {
   if (!link) return { stop: async () => {} };
   if (o.shaper === 'kernel') {
     execFileSync('sudo', [join(ROOT, 'bench/shape.sh'), 'up', String(port), String(link.mbps), String(link.rtt), String(link.loss)], { stdio: 'inherit' });
     return { stop: async () => execFileSync('sudo', [join(ROOT, 'bench/shape.sh'), 'down'], { stdio: 'inherit' }) };
   }
   const listen = await freePort('udp');
-  const proc = spawn('node', [join(ROOT, 'bench/udpshaper.mjs'), String(listen), String(port), String(link.mbps), String(link.rtt), String(link.loss)], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const proc = spawn('node', [join(ROOT, 'bench/udpshaper.mjs'), String(listen), String(port), String(link.mbps), String(link.rtt), String(link.loss), String(link.queue ?? 200)], { stdio: ['ignore', 'pipe', 'inherit'] });
   let out = '';
   proc.stdout.on('data', (d) => { out += d; });
   for (let i = 0; i < 50 && !out.includes('udpshaper :'); i++) await sleep(50);
@@ -187,6 +191,14 @@ export function summarise(seconds) {
   };
 }
 
+export function countWatchdog(host) {
+  try {
+    return readFileSync(join(host.dir, 'logs', 'client.log'), 'utf8').split('\n').filter((l) => l.includes('session killed: no data')).length;
+  } catch {
+    return 0;
+  }
+}
+
 async function run(o, browser, introducer, workload, linkName) {
   const link = LINKS[linkName];
   if (o.path === 'rtc' && link && o.shaper === 'user') {
@@ -205,10 +217,11 @@ async function run(o, browser, introducer, workload, linkName) {
   try {
     shaper = await shape(o, link, o.path === 'rtc' ? rtcPort : host.wt);
     const page = await context.newPage();
-    await page.addInitScript((rtc) => {
+    await page.addInitScript((o) => {
       localStorage.setItem('glass.bench', '1');
-      if (rtc) sessionStorage.setItem('glass.rtp', '0'); // video over the data channel
-    }, o.path === 'rtc');
+      if (o.sharp) localStorage.setItem('glass.sharp', '1'); // capture restarts for it
+      if (o.rtc) sessionStorage.setItem('glass.rtp', '0'); // video over the data channel
+    }, { rtc: o.path === 'rtc', sharp: o.sharp === '1' });
     let url;
     if (o.path === 'rtc') {
       for (let i = 0; i < 100 && !host.cli('status', '--json').includes('"running":true'); i++) await sleep(100);
@@ -223,15 +236,39 @@ async function run(o, browser, introducer, workload, linkName) {
         });
       }
     }
+    const started = Date.now();
     await page.goto(url);
-    await page.waitForFunction(() => window.glassBench?.some((s) => s.unique > 0), null, { timeout: 30_000 });
-    await sleep(o.warmup * 1000);
-    const from = await page.evaluate(() => window.glassBench.length);
-    await sleep(o.secs * 1000);
-    const seconds = (await page.evaluate(() => window.glassBench)).slice(from);
+    // The adaptive bitrate from the very start: a cold start must not talk itself down.
+    const bitrate = [];
+    const poll = setInterval(async () => {
+      try {
+        bitrate.push([(Date.now() - started) / 1000, (await (await fetch(`${host.base}/test/bitrate`)).json()).bps / 1e6]);
+      } catch {}
+    }, 500);
+    let seconds;
+    let firstPicture;
+    try {
+      await page.waitForFunction(() => window.glassBench?.some((s) => s.unique > 0), null, { timeout: 45_000 });
+      firstPicture = (Date.now() - started) / 1000;
+      await sleep(o.warmup * 1000);
+      const from = await page.evaluate(() => window.glassBench.length);
+      await sleep(o.secs * 1000);
+      seconds = (await page.evaluate(() => window.glassBench)).slice(from);
+    } finally {
+      clearInterval(poll);
+    }
     const shaperCounts = await shaper.stop();
     shaper = undefined;
-    return { ...summarise(seconds), ...(shaperCounts && { shaper: JSON.parse(shaperCounts) }) };
+    return {
+      ...summarise(seconds),
+      ...(shaperCounts && { shaper: JSON.parse(shaperCounts) }),
+      bitrate,
+      firstPictureS: round(firstPicture),
+      ...(await (await fetch(`${host.base}/test/bitrate`)).json()),
+      // The viewer's watchdog (no data for 3 s) going off means it lost its session.
+      watchdog: countWatchdog(host),
+      logDir: join(host.dir, 'logs'),
+    };
   } finally {
     await shaper?.stop().catch(() => {});
     await context.close();
@@ -267,7 +304,7 @@ if (import.meta.main ?? process.argv[1] === import.meta.filename) {
         const cell = (v, n) => String(v ?? '-').padStart(n);
         console.log(r.skipped || r.error
           ? `${workload.padEnd(9)} ${link.padEnd(6)} ${r.skipped ? 'skipped' : 'error'}: ${r.skipped ?? r.error}`
-          : `${workload.padEnd(9)} ${link.padEnd(6)}${cell(r.fps, 5)}${cell(r.worstSecond, 7)}${cell(r.latencyMs.p50, 8)}${cell(r.latencyMs.p99, 8)}${cell(r.glassLatencyMs, 10)}${cell(r.mbps, 6)}${cell(r.dropped, 9)}`);
+          : `${workload.padEnd(9)} ${link.padEnd(6)}${cell(r.fps, 5)}${cell(r.worstSecond, 7)}${cell(r.latencyMs.p50, 8)}${cell(r.latencyMs.p99, 8)}${cell(r.glassLatencyMs, 10)}${cell(r.mbps, 6)}${cell(r.dropped, 9)}  first ${r.firstPictureS}s, watchdog ${r.watchdog}, keyframes ${r.keyframes}${r.biggestKeyframe ? ` (${Math.round(r.biggestKeyframe / 1024)} KB)` : ''}, end ${r.bitrate?.at(-1)?.[1]?.toFixed(1)} Mbps`);
       }
     }
   } finally {

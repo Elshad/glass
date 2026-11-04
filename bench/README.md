@@ -16,6 +16,9 @@ running Glass for real.
   a 16-bit frame counter, the host clock in ms (24 bits) and an 8-bit check.
   - `anim`: a box moving and changing colour over the still page (part of the screen moves).
   - `scroll`: the page scrolling 6 px a frame (all of it moves).
+  - `still`: the page unchanged, as a desktop mostly is: a keyframe when asked, a few
+    refreshes after it, then nothing.
+  - `noise`: blocks of noise changing every frame, more than any bitrate carries.
   - `GLASS_TEST_SIZE=WxH` sets the displays' size (default for the bench: 1280×720).
 - **Reader.** With `localStorage['glass.bench'] = '1'`, the viewer's worker hands each
   decoded `VideoFrame` of the first stream to `web/bench.js` before closing it. It reads
@@ -37,6 +40,24 @@ running Glass for real.
   - Host to viewer: the rate, half the RTT, the loss and a drop-tail queue (200 ms in
     `user`, 100 packets in `kernel`). Viewer to host: half the RTT.
 
+## Regressions
+
+`bench/regress.mjs` checks what went wrong on an iPhone on a cellular link, and exits
+non-zero on a failure:
+
+- `cold`: with more to send than the link carries (`noise`), the rate stays near the link's
+  capacity from a cold start, on a healthy link and a queueing one.
+- `watchdog`: a viewer on a queueing, slightly lossy link never trips its 3 s watchdog.
+- `pause`: a hidden tab leaves the rate alone, and video comes back.
+
+```sh
+GLASS_BIN=/path/to/glass-host node bench/regress.mjs [--only cold,watchdog,pause]
+```
+
+Real VideoToolbox isn't reachable from test mode. For what it does at low bitrates, on a
+synthetic picture (no screen capture): `cargo test -p glass-host vt_at_low_bitrates --
+--ignored --nocapture`.
+
 ## Setup
 
 ```sh
@@ -57,7 +78,8 @@ node bench/run.mjs --json /tmp/bench.json            # also write the results as
 
 Options: `--workload anim,scroll`, `--link lan,10m40,5m60,1m150`, `--path wt|rtc`,
 `--shaper user|kernel`, `--secs 20` (measured), `--warmup 5`, `--size 1280x720`,
-`--fps 60`, `--json <file>`. `HEADFUL=1` shows the browser.
+`--fps 60`, `--sharp 1` (as a viewer with sharp text on: capture restarts for it),
+`--json <file>`. `HEADFUL=1` shows the browser.
 
 | Link    | Rate     | RTT    | Loss (host → viewer) |
 |---------|----------|--------|----------------------|
@@ -65,6 +87,9 @@ Options: `--workload anim,scroll`, `--link lan,10m40,5m60,1m150`, `--path wt|rtc
 | `10m40` | 10 Mbps  | 40 ms  | 0                    |
 | `5m60`  | 5 Mbps   | 60 ms  | 0                    |
 | `1m150` | 1 Mbps   | 150 ms | 1% (Tesla-like LTE)  |
+| `phone` | 5 Mbps   | 288 ms | 0, 3 s queue (a phone on cellular over a tailnet) |
+| `phoneloss` | 5 Mbps | 288 ms | 0.5%, 3 s queue |
+| `phoneslow` | 2 Mbps | 288 ms | 0.5%, 3 s queue |
 
 Each run prints a row:
 
@@ -73,7 +98,9 @@ Each run prints a row:
 - `glass ms`: Glass's own latency (frame capture timestamp to draw), as a cross-check.
 - `Mbps`: what the viewer received. `dropped`: frames lost or undecodable.
 
-The JSON also has decoded frames a second (repeats included), marker misreads
+Each row ends with the seconds to the first picture, how often the viewer's watchdog went
+off, the keyframes sent and the bitrate at the end; the JSON has the bitrate over time. The
+JSON also has decoded frames a second (repeats included), marker misreads
 (`badMarkers`), the RTT the viewer measured and, with `user`, the shaper's packet counts.
 
 ### The WebRTC path

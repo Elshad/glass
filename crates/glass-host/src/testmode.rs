@@ -83,6 +83,12 @@ pub fn record_wake(mac: &str) {
 
 /// Current adaptive bitrate, readable at /test/bitrate.
 static BITRATE: AtomicU32 = AtomicU32::new(0);
+/// Keyframes encoded and the bytes of the biggest, also there (for the bench).
+static KEYFRAMES: AtomicU32 = AtomicU32::new(0);
+static BIGGEST_KEYFRAME: AtomicU32 = AtomicU32::new(0);
+/// Refreshes real capture sends after a change: 12 a second, stopping after 3 tiny ones.
+const STILL_REFRESH_EVERY: Duration = Duration::from_millis(83);
+const STILL_TINY: usize = 1024;
 
 pub fn enable() {
     ENABLED.store(true, Ordering::Relaxed);
@@ -226,7 +232,12 @@ impl VideoSource for TestVideo {
     }
 
     fn set_full_colour(&self, on: bool) {
-        FULL_COLOUR.store(on, Ordering::Relaxed);
+        // Real capture restarts for this (BGRA), and a new encoder starts on a keyframe.
+        if FULL_COLOUR.swap(on, Ordering::Relaxed) != on && bench().is_some() {
+            for k in &self.keyframes {
+                k.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     fn picture(&self, id: u32, max: [u32; 2]) -> Option<crate::lossless::RawFrame> {
@@ -358,12 +369,20 @@ fn pattern_loop(
     // The pattern's position: frozen while paused, so frames repeat the same picture.
     let mut shown = 0u64;
     let mut last_encoded = None;
+    // Still workload: tiny refreshes so far, and when the last frame went (None: settled).
+    let mut still = (0, None::<Instant>);
     loop {
         next += Duration::from_secs_f64(1.0 / fps as f64);
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
         let s = slot.load(Ordering::Relaxed);
         if s < 0 {
             continue;
+        }
+        if bench() == Some(Bench::Still) && !keyframe.load(Ordering::Relaxed) {
+            // Nothing changes: only a refresh that's due.
+            if still.1.is_none_or(|at: Instant| at.elapsed() < STILL_REFRESH_EVERY) {
+                continue;
+            }
         }
         // Dynamic resolution or a new frame rate: a new encoder, starting on a keyframe.
         let want = width.load(Ordering::Relaxed);
@@ -400,6 +419,14 @@ fn pattern_loop(
         }
         let force = keyframe.swap(false, Ordering::Relaxed);
         if let Ok(Some((data, key))) = encoder.encode(&frame, force) {
+            if key {
+                KEYFRAMES.fetch_add(1, Ordering::Relaxed);
+                BIGGEST_KEYFRAME.fetch_max(data.len() as u32, Ordering::Relaxed);
+                still = (0, Some(Instant::now()));
+            } else if still.1.is_some() {
+                still.0 += (data.len() < STILL_TINY) as u32;
+                still.1 = (still.0 < 3).then(Instant::now);
+            }
             let refresh = last_encoded == Some(shown);
             last_encoded = Some(shown);
             let _ = frames.send(Arc::new(EncodedFrame {
@@ -459,6 +486,13 @@ enum Bench {
     Anim,
     /// A page of text scrolling by 6 px a frame: all of it moves.
     Scroll,
+    /// A page of text that doesn't change, as a desktop mostly is. Like real capture it
+    /// sends nothing while still: a keyframe when asked and a few refreshes after it, so a
+    /// keyframe that doesn't make it isn't followed by frames that reveal the loss.
+    Still,
+    /// Blocks of noise that change every frame: more than any bitrate can carry, so the
+    /// encoder presses against its target and the adaptive rate has to find the link's.
+    Noise,
 }
 
 fn bench() -> Option<Bench> {
@@ -466,6 +500,8 @@ fn bench() -> Option<Bench> {
     *WORKLOAD.get_or_init(|| match std::env::var("GLASS_TEST_BENCH").as_deref() {
         Ok("anim") => Some(Bench::Anim),
         Ok("scroll") => Some(Bench::Scroll),
+        Ok("still") => Some(Bench::Still),
+        Ok("noise") => Some(Bench::Noise),
         _ => None,
     })
 }
@@ -543,6 +579,21 @@ fn bench_render(workload: Bench, width: usize, height: usize, n: u64) -> Frame {
     for y in 0..height {
         let src = (y + scroll) % rows;
         data[y * row_bytes..][..row_bytes].copy_from_slice(&tex[src * row_bytes..][..row_bytes]);
+    }
+    if workload == Bench::Noise {
+        const BLOCK: usize = 16;
+        for by in (0..height).step_by(BLOCK) {
+            for bx in (0..width).step_by(BLOCK) {
+                let mut v = (bx as u64 * 73_856_093) ^ (by as u64 * 19_349_663) ^ (n * 83_492_791);
+                v = v.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                let c = [(v >> 56) as u8, (v >> 48) as u8, (v >> 40) as u8, 255];
+                for y in by..(by + BLOCK).min(height) {
+                    for x in bx..(bx + BLOCK).min(width) {
+                        data[(y * width + x) * 4..][..4].copy_from_slice(&c);
+                    }
+                }
+            }
+        }
     }
     if workload == Bench::Anim {
         let size = (height / 4).max(16);
@@ -821,7 +872,11 @@ pub fn routes(events: broadcast::Sender<ServerMsg>, downloads: PathBuf) -> axum:
         )
         .route("/test/updates", get(|| async { Json(serde_json::json!({"count": UPDATES.load(Ordering::Relaxed)})) }))
         .route("/test/fit", get(|| async { Json(serde_json::json!({"requests": *FITS.lock().unwrap()})) }))
-        .route("/test/bitrate", get(|| async { Json(serde_json::json!({"bps": BITRATE.load(Ordering::Relaxed)})) }))
+        .route("/test/bitrate", get(|| async { Json(serde_json::json!({
+            "bps": BITRATE.load(Ordering::Relaxed),
+            "keyframes": KEYFRAMES.load(Ordering::Relaxed),
+            "biggestKeyframe": BIGGEST_KEYFRAME.load(Ordering::Relaxed),
+        })) }))
         .route(
             "/test/records",
             get(|Query(q): Query<KindQuery>| async move {
