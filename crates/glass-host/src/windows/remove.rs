@@ -82,13 +82,20 @@ pub fn everything() -> Result<()> {
                 ps(&exe.display().to_string())
             );
         }
+        admin += "Remove-ItemProperty -Path 'HKLM:\\SOFTWARE\\Glass' -Name FirewallScope -ErrorAction SilentlyContinue; ";
         let done = if super::service::is_elevated() {
             super::powershell(&admin).status().is_ok_and(|s| s.success())
         } else {
             elevated(&admin)
         };
         if !done {
-            eprintln!("The secure-desktop service and firewall rule weren't removed (administrator approval was declined?). Remove the service later with: glass service uninstall");
+            eprintln!("The secure-desktop service, firewall rule, and saved firewall scope weren't removed (administrator approval was declined?). Remove the service later with: glass service uninstall");
+        }
+    } else if firewall::machine_scope().is_some() {
+        if super::service::is_elevated() {
+            firewall::clear_machine_scope();
+        } else {
+            eprintln!("The saved firewall scope wasn't removed. That needs administrator.");
         }
     }
 

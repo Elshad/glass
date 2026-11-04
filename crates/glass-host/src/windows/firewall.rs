@@ -130,9 +130,19 @@ fn program(exe: &Path) -> String {
     crate::browse::shell_path(&exe.to_string_lossy())
 }
 
+/// netsh arguments that delete the rule named `name` for `exe`.
+pub fn delete_named_args(exe: &Path, name: &str) -> String {
+    format!("advfirewall firewall delete rule name=\"{name}\" program=\"{}\"", program(exe))
+}
+
 /// netsh arguments that delete the rule named Glass for `exe`.
 pub fn delete_rule_args(exe: &Path) -> String {
-    format!("advfirewall firewall delete rule name=\"Glass\" program=\"{}\"", program(exe))
+    delete_named_args(exe, "Glass")
+}
+
+/// The add command, but under a temporary name so a later delete of `Glass` leaves it.
+fn pending_add(add: &str) -> String {
+    add.replacen("name=\"Glass\"", "name=\"Glass-new\"", 1)
 }
 
 /// netsh arguments for Glass's allow, or `None` when loopback needs no allow.
@@ -156,16 +166,29 @@ fn netsh(args: &str) -> bool {
     cmd.status().is_ok_and(|s| s.success())
 }
 
-/// Deletes Glass's rule for `exe`, then adds the one `remote` asks for. Already admin.
-/// A missing rule counts as deleted. Success is the firewall then matching `remote`.
+/// Adds the rule `remote` asks for, then removes the previous Glass rules. Already admin.
+/// The new rule is added as `Glass-new` first, so a delete of `Glass` cannot remove it.
+/// Loopback only deletes. A missing rule counts as deleted. Success is the firewall then matching `remote`.
 fn replace_rule(exe: &Path, remote: Remote) -> bool {
-    if !remove_rule_quietly(exe) {
+    let Some(add) = add_rule_args(exe, remote) else {
+        return remove_rule_quietly(exe);
+    };
+    if !netsh(&pending_add(&add)) {
         return false;
     }
-    if let Some(add) = add_rule_args(exe, remote)
-        && !netsh(&add)
-    {
+    if !remove_rule_quietly(exe) {
+        let _ = netsh(&delete_named_args(exe, "Glass-new"));
         return false;
+    }
+    let renamed = netsh(&format!(
+        "advfirewall firewall set rule name=\"Glass-new\" program=\"{}\" new name=\"Glass\"",
+        program(exe)
+    ));
+    if !renamed && !netsh(&add) {
+        return false;
+    }
+    if !renamed {
+        let _ = netsh(&delete_named_args(exe, "Glass-new"));
     }
     in_sync(exe, remote) == Some(true)
 }
@@ -306,6 +329,17 @@ pub fn machine_scope() -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Removes the machine-wide scope. A missing value is fine. Needs administrator.
+pub fn clear_machine_scope() {
+    let _ = unsafe {
+        windows::Win32::System::Registry::RegDeleteKeyValueW(
+            windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+            &HSTRING::from(SCOPE_KEY),
+            &HSTRING::from(SCOPE_VALUE),
+        )
+    };
+}
+
 fn store_scope(remote: Remote) -> bool {
     let wide: Vec<u16> = remote_arg(remote).encode_utf16().chain([0]).collect();
     // SAFETY: a NUL-terminated UTF-16 word and its size in bytes. Creates the key.
@@ -352,7 +386,33 @@ fn rules_match(found: &[Rule], remote: Remote) -> bool {
 
 /// Whether Glass's own rule for `exe` already matches `remote`.
 pub fn in_sync(exe: &Path, remote: Remote) -> Option<bool> {
-    Some(rules_match(&glass_rules(exe)?, remote))
+    Some(glass_matches(&program_rules(exe)?, remote))
+}
+
+/// Every rule for `exe`. `None` if the firewall can't be listed.
+pub fn program_rules(exe: &Path) -> Option<Vec<Rule>> {
+    Some(rules()?.into_iter().filter(|r| same_program(&r.program, exe)).collect())
+}
+
+/// Whether the rules named Glass in `rules` are exactly what `remote` asks for.
+pub fn glass_matches(rules: &[Rule], remote: Remote) -> bool {
+    let glass: Vec<Rule> = rules.iter().filter(|r| r.name.trim().eq_ignore_ascii_case("Glass")).cloned().collect();
+    rules_match(&glass, remote)
+}
+
+/// Enabled inbound allows for this program other than the rule named Glass.
+pub fn other_allow_names(rules: &[Rule]) -> Vec<String> {
+    let mut names: Vec<String> = rules
+        .iter()
+        .filter(|r| r.enabled && r.inbound && r.allow && !r.name.trim().eq_ignore_ascii_case("Glass"))
+        .map(|r| {
+            let name = r.name.trim();
+            if name.is_empty() { "(unnamed)".into() } else { name.to_string() }
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// What to say after `bind` changes. Nothing when the rule already matches and we are not elevated.
@@ -387,7 +447,7 @@ pub fn bind_change_note() -> Option<String> {
 pub fn ready_sentence(remote: Remote) -> &'static str {
     match remote {
         Remote::Any => "Glass can accept connections on private networks",
-        Remote::Tailscale => "Glass accepts connections from Tailscale only",
+        Remote::Tailscale => "Glass's firewall rule allows only Tailscale (100.64.0.0/10, fd7a:115c:a1e0::/48)",
         Remote::Loopback => "Glass only listens on this computer, so it has no inbound firewall rule",
     }
 }
@@ -425,6 +485,21 @@ mod tests {
         assert!(tailscale.contains("remoteip=\"100.64.0.0/10,fd7a:115c:a1e0::/48\""));
         assert!(tailscale.ends_with("edge=no"));
         assert!(add_rule_args(exe, Remote::Loopback).is_none());
+        let pending = pending_add(&tailscale);
+        assert!(pending.contains("name=\"Glass-new\""));
+        assert!(!pending.contains("name=\"Glass\""));
+        assert!(delete_rule_args(exe).contains("name=\"Glass\""));
+        assert!(!delete_rule_args(exe).contains("Glass-new"));
+    }
+
+    #[test]
+    fn other_allows_are_named_and_are_not_the_glass_rule() {
+        let mut glass = rule(r"C:\Glass\glass.exe", true, 2);
+        glass.name = "Glass".into();
+        let mut prompt = rule(r"C:\Glass\glass.exe", true, 4);
+        prompt.name = "glass.exe".into();
+        assert_eq!(other_allow_names(&[glass.clone(), prompt]), vec!["glass.exe".to_string()]);
+        assert!(glass_matches(&[glass], Remote::Any));
     }
 
     #[test]

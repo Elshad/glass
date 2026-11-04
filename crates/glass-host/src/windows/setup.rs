@@ -52,17 +52,19 @@ fn service_step() -> Result<()> {
 
 /// Without a rule, Windows asks the first time the host listens, on this screen, and
 /// "Cancel" there leaves Glass blocked. Adding the rule now asks once, here, with context.
+fn warn_other_allows(rules: &[firewall::Rule]) -> Result<()> {
+    let names = firewall::other_allow_names(rules);
+    if names.is_empty() {
+        return Ok(());
+    }
+    let which = if names.len() == 1 { "another rule" } else { "other rules" };
+    log::warning(format!("Windows also allows this program through {which}: {}.", names.join(", ")))?;
+    Ok(())
+}
+
 fn firewall_step() -> Result<()> {
     log::step("Windows Defender Firewall")?;
     let exe = std::env::current_exe()?;
-    if firewall::inbound(&exe) == Some(Inbound::Blocked) {
-        log::warning(
-            "Windows Defender Firewall is blocking Glass (maybe its prompt was turned down). In\n\
-             Windows Security › Firewall & network protection › Allow an app through firewall,\n\
-             tick Private for Glass, then run `glass setup` again.",
-        )?;
-        return Ok(());
-    }
     let remote = match firewall::saved_remote() {
         Ok(remote) => remote,
         Err(()) => {
@@ -70,15 +72,26 @@ fn firewall_step() -> Result<()> {
             return Ok(());
         }
     };
-    if firewall::in_sync(&exe, remote) == Some(true) {
-        log::success(firewall::ready_sentence(remote))?;
-        return Ok(());
-    }
-    if firewall::inbound(&exe).is_none() {
+    // One listing for the block check, the in-sync check, and the missing check.
+    let Some(listed) = firewall::program_rules(&exe) else {
         log::warning("Couldn't read the firewall's rules; Windows may ask about Glass when it starts.")?;
         return Ok(());
+    };
+    let state = firewall::decide(&listed, |_| true);
+    // A loopback bind needs no inbound allow, so a block rule is not something to tick Private for.
+    if state == Inbound::Blocked && remote != Remote::Loopback {
+        log::warning(
+            "Windows Defender Firewall is blocking Glass (maybe its prompt was turned down). In\n\
+             Windows Security › Firewall & network protection › Allow an app through firewall,\n\
+             tick Private for Glass, then run `glass setup` again.",
+        )?;
+        return Ok(());
     }
-    let missing = firewall::inbound(&exe) == Some(Inbound::Missing);
+    if firewall::glass_matches(&listed, remote) {
+        log::success(firewall::ready_sentence(remote))?;
+        return warn_other_allows(&listed);
+    }
+    let missing = state == Inbound::Missing;
     let (title, body, question, skip) = match (remote, missing) {
         (Remote::Loopback, _) => ("Glass only listens on this computer", "It doesn't need an inbound firewall rule, so Glass can remove the one named Glass for this program. Windows asks for administrator approval once.", "Remove the inbound rule now?", "Skipped: the firewall rule was left in place."),
         (Remote::Tailscale, _) => ("Only Tailscale can connect", "Glass listens on Tailscale, so its firewall rule can allow only 100.64.0.0/10 and fd7a:115c:a1e0::/48. Windows asks for administrator approval once.", "Update the firewall rule now?", "Skipped: the firewall rule was left as it is."),
@@ -93,8 +106,11 @@ fn firewall_step() -> Result<()> {
     let _ = firewall::add_rule_elevated(&exe);
     if firewall::in_sync(&exe, remote) == Some(true) {
         log::success(firewall::ready_sentence(remote))?;
+        if let Some(listed) = firewall::program_rules(&exe) {
+            warn_other_allows(&listed)?;
+        }
     } else {
-        log::warning("The firewall rule wasn't updated. Run `glass setup` again; it removes the old Glass rule before adding the new one.")?;
+        log::warning("The firewall rule wasn't updated. Run `glass setup` again; it adds the new Glass rule before removing the old one.")?;
     }
     Ok(())
 }
@@ -105,15 +121,15 @@ pub fn prepare_unattended() -> Vec<crate::setup::Need> {
     let Ok(exe) = std::env::current_exe() else { return needs };
     let action = match firewall::saved_remote() {
         Err(()) => Some("Couldn't read the saved listen address, so no firewall rule was added.".into()),
-        Ok(_) if firewall::inbound(&exe) == Some(Inbound::Blocked) => Some(
+        Ok(remote) if remote != Remote::Loopback && firewall::inbound(&exe) == Some(Inbound::Blocked) => Some(
             "Windows Defender Firewall blocks Glass: in Windows Security › Firewall & network protection › Allow an app through firewall, tick Private for Glass".into(),
         ),
         Ok(remote) if firewall::in_sync(&exe, remote) == Some(true) => None,
         Ok(remote) if firewall::add_rule_quietly(&exe) && firewall::in_sync(&exe, remote) == Some(true) => None,
         Ok(remote) => Some(match remote {
-            Remote::Tailscale => "Limit Glass's firewall rule to Tailscale (100.64.0.0/10 and fd7a:115c:a1e0::/48). Run `glass setup`; it removes the old Glass rule before adding the Tailscale one.".into(),
+            Remote::Tailscale => "Limit Glass's firewall rule to Tailscale (100.64.0.0/10 and fd7a:115c:a1e0::/48). Run `glass setup`; it adds the Tailscale rule before removing the old one.".into(),
             Remote::Loopback => "Remove Glass's inbound firewall rule (it only listens on this computer). Run `glass setup`.".into(),
-            Remote::Any => "Allow Glass through Windows Defender Firewall on private networks. Run `glass setup` (asks for administrator approval once); it removes any old Glass rule first.".into(),
+            Remote::Any => "Allow Glass through Windows Defender Firewall on private networks. Run `glass setup` (asks for administrator approval once); it adds the new rule before removing the old one.".into(),
         }),
     };
     if let Some(action) = action {
