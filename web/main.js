@@ -621,6 +621,8 @@ worker.postMessage({
   // A wide-colour screen: a Display P3 stream is drawn in P3, not clipped to sRGB.
   wideColor: matchMedia('(color-gamut: p3)').matches,
   decoderStep: Number(storage((s) => s.getItem(DECODER_STEP_KEY)) ?? 0),
+  // bench/ only: read the test host's frame marker (see bench.js).
+  bench: storage((s) => s.getItem('glass.bench')) === '1',
 }, rtcPort ? [rtcPort] : []);
 armMachineTimeout();
 showStatus('connecting', 'Connecting', machineName(currentHost));
@@ -744,6 +746,10 @@ worker.onmessage = ({ data }) => {
       }
       if (data.fps > 0) hideStatus();
       renderHud(data);
+      break;
+    case 'bench':
+      // One second of the bench probe, for bench/run.mjs to collect.
+      (window.glassBench ??= []).push(data);
       break;
     case 'decoderStep':
       storage((s) => s.setItem(DECODER_STEP_KEY, String(data.step)));

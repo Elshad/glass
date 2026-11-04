@@ -60,7 +60,7 @@ export function setDecoderStep(step) {
 export class VideoStream {
   /**
    * @param index   stream number (matches the host's)
-   * @param env     { log, post, requestKeyframe(index), hostNowUs(), stats }
+   * @param env     { log, post, requestKeyframe(index), hostNowUs(), stats, probe?(index, frame, hostNowUs) }
    */
   constructor(index, env) {
     this.index = index;
@@ -297,6 +297,7 @@ export class VideoStream {
       this.acks.delete(videoFrame.timestamp);
       this.env.ack?.(this.index, id);
     }
+    this.env.probe?.(this.index, videoFrame, hostNow);
     videoFrame.close();
 
     const stats = this.env.stats;

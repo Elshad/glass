@@ -22,6 +22,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 - On a slow link, below 3 Mbps frames may be coarser so they fit, instead of huge ones holding up everything behind them; a still screen sharpens afterwards. On Windows and Linux hardware encoders, no single frame takes much more than its share of the bitrate.
 - A still screen sharpens without slowing down what comes next on a slow link: on the Mac, Glass refines it a few times (fewer and smaller the lower the bitrate) and only once the frames before have arrived, instead of re-sending the whole picture a dozen times a second for 3 seconds.
 - The viewer tells Glass when each frame is on screen. Glass uses that to send the next frame only when there's room, and to set the bitrate ten times a second from how long frames take to arrive and how much gets through: it backs off before a queue builds, and finds a fast link's rate within a second or two. It can go as low as 0.25 Mbps when that's all the link carries, but a keyframe arriving, a hidden tab, or the delay swings of a phone network don't count against it. Older viewers keep the once-a-second adjustment.
+- For developers: `bench/` measures frame rate and end-to-end latency on a test host (no screen capture) through LAN and slow shaped links, to catch regressions. See `bench/README.md`.
 
 ## 0.13.1
 

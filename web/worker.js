@@ -6,6 +6,7 @@ import {
 } from './proto.js';
 import { VideoStream, probeCodecs, probeDecoders, setDecoderStep } from './video-stream.js';
 import { RtcTransport } from './rtc-transport.js';
+import { BenchProbe } from './bench.js';
 
 const PING_INTERVAL_MS = 500;
 const CLOCK_SAMPLES = 16;
@@ -58,6 +59,7 @@ let wake; // resolves the reconnect backoff early
 let denied = false; // the host's owner said no; don't knock again on our own
 let datagramWriter;
 let inputWriter;
+let bench; // BenchProbe, when the page asked for it (bench/ only)
 
 // Host clock offset (µs), taken from the lowest-RTT recent ping.
 const clockSamples = [];
@@ -73,6 +75,8 @@ const streamEnv = {
   post: (msg) => self.postMessage(msg),
   stats,
   hostNowUs: () => (clockSynced ? performance.now() * 1000 + clockOffsetUs : undefined),
+  // Bench only: the first stream's frames go to the probe before they're closed.
+  probe: (index, frame, hostNowUs) => { if (bench && index === 0) bench.read(frame, hostNowUs); },
   requestKeyframe: (index) => datagramWriter?.write(new Uint8Array([KIND_KEYFRAME_REQUEST, index])).catch(() => {}),
   // Over WebTransport, or the WebRTC data channel (RtcTransport's datagrams).
   ack: (index, frameId) => datagramWriter?.write(frameAck(index, frameId)).catch(() => {}),
@@ -88,6 +92,7 @@ self.onmessage = async ({ data }) => {
     localCursor = Boolean(data.localCursor);
     wideColor = Boolean(data.wideColor);
     setDecoderStep(data.decoderStep ?? 0);
+    if (data.bench) bench = new BenchProbe();
     await probeDecoders(log);
     codecs = await probeCodecs();
     // Opus system audio (~100 kbps instead of 1.5 Mbps of PCM) where WebCodecs decodes it;
@@ -618,6 +623,12 @@ function reportStats() {
     // Showing a lossless picture now (until the screen changes).
     holding: streams.some((v) => v?.holding),
   });
+  if (bench) {
+    self.postMessage({
+      type: 'bench', ...bench.flush(), fps: stats.frames, mbps: (stats.bytes * 8) / 1e6, dropped: stats.dropped,
+      glassLatency: stats.latencySamples ? stats.latencySum / stats.latencySamples : null, rtt: rttMs,
+    });
+  }
   audioPackets = 0;
   audioLost = 0;
   audioPeak = 0;

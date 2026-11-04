@@ -698,6 +698,15 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 
+/// Where peer connections listen: any port, except that a test host can be pinned to one
+/// (`GLASS_TEST_RTC_PORT`, IPv4) so bench/ can shape exactly that traffic.
+fn udp_addrs() -> Vec<String> {
+    match std::env::var("GLASS_TEST_RTC_PORT").ok().filter(|_| crate::testmode::enabled()) {
+        Some(port) => vec![format!("0.0.0.0:{port}")],
+        None => vec!["0.0.0.0:0".to_string(), "[::]:0".to_string()],
+    }
+}
+
 /// Answers a browser's offer; returns the answer SDP and its signature. The bridge runs
 /// until the peer goes away.
 async fn answer(
@@ -756,7 +765,7 @@ async fn answer(
         .with_interceptor_registry(registry)
         .with_handler(handler)
         .with_runtime(runtime)
-        .with_udp_addrs(vec!["0.0.0.0:0".to_string(), "[::]:0".to_string()])
+        .with_udp_addrs(udp_addrs())
         .build()
         .await?;
     let pc: Arc<dyn PeerConnection> = Arc::new(pc);
