@@ -166,7 +166,7 @@ fn netsh(args: &str) -> bool {
 fn set_rule_args(exe: &Path, remote: Remote) -> Option<String> {
     let (remoteip, edge) = match remote {
         Remote::Loopback => return None,
-        Remote::Any => ("any".to_string(), ""),
+        Remote::Any => ("any".to_string(), " edge=no"),
         Remote::Tailscale => (format!("\"{TAILSCALE_V4},{TAILSCALE_V6}\""), " edge=no"),
     };
     Some(format!(
@@ -522,7 +522,7 @@ mod tests {
         let prog = r"C:\Program Files\Glass\glass.exe";
         assert_eq!(
             set_rule_args(exe, Remote::Any).as_deref(),
-            Some("advfirewall firewall set rule name=\"Glass\" dir=in program=\"C:\\Program Files\\Glass\\glass.exe\" new remoteip=any profile=private action=allow enable=yes")
+            Some("advfirewall firewall set rule name=\"Glass\" dir=in program=\"C:\\Program Files\\Glass\\glass.exe\" new remoteip=any profile=private action=allow enable=yes edge=no")
         );
         assert_eq!(
             set_rule_args(exe, Remote::Tailscale).as_deref(),
