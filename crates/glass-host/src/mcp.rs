@@ -233,6 +233,10 @@ pub(crate) fn tools() -> Value {
             "region": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4,
               "description": "Only changes in [x, y, width, height] count, in pixels of the latest screenshot of this display." },
             "timeout_ms": { "type": "integer", "description": "Default 10000, at most 60000." } }), &[]) },
+        { "name": "record", "description": "Records the screen as an MP4 (what's streamed: the main display unless a viewer chose another, with the pointer). Either for `seconds` (5 by default, at most 60; the call returns when it's done), or `start: true` to start one and get its id, then `stop: <id>` to end it and get it (a started recording ends by itself after 10 minutes). Use it to show the person what happened, or to look at something that moves. The video comes back as an embedded video/mp4 resource when it's 20 MB or less, with its path on that computer either way.",
+          "inputSchema": schema(json!({ "seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 60 },
+            "start": { "type": "boolean", "description": "Start a recording and return its id at once." },
+            "stop": { "type": "integer", "description": "Stop the recording with this id (from start) and return it." } }), &[]) },
         { "name": "request_help", "description": "Asks the person to do something you can't (sign in, a 2FA code, a CAPTCHA, a decision) and waits until they say it's done. Their note comes back. If they haven't answered within wait_seconds, it says the question is pending: collect the answer later with check_answer.",
           "inputSchema": schema(json!({ "message": { "type": "string", "description": "What you need them to do, in one or two sentences." }, "wait_seconds": wait }), &["message"]) },
         { "name": "confirm", "description": "Asks the person to approve an action before you take it (sending, buying, deleting, posting…). Waits for yes or no. If they haven't answered within wait_seconds, it says the question is pending: don't take the action; collect the answer later with check_answer.",
@@ -293,6 +297,8 @@ pub(crate) enum Show {
     Confirm,
     /// A pending question's answer: help or confirm, as it was asked.
     Answer,
+    /// A recording: started, or done.
+    Clip,
 }
 
 fn wait_ms(args: &Value) -> Value {
@@ -326,6 +332,8 @@ pub(crate) fn plan(name: &str, args: &Value) -> Result<Step, String> {
         "request_help" => (json!({ "action": "request_help", "text": args["message"], "wait_ms": wait_ms(args) }), Show::Help),
         "confirm" => (json!({ "action": "confirm", "text": args["action"], "wait_ms": wait_ms(args) }), Show::Confirm),
         "check_answer" => (json!({ "action": "check_answer", "id": args["id"], "wait_ms": wait_ms(args) }), Show::Answer),
+        "record" => (json!({ "action": "record", "seconds": args.get("seconds"),
+            "start": args["start"].as_bool().unwrap_or(false), "stop": args.get("stop") }), Show::Clip),
         other => return Err(format!("unknown tool {other}")),
     };
     let after = after && (matches!(show, Show::Done) || matches!(name, "press" | "set_value"));
@@ -334,7 +342,7 @@ pub(crate) fn plan(name: &str, args: &Value) -> Result<Step, String> {
 
 /// Tools that only look (no input); the rest need `computer:use`.
 pub(crate) fn looks_only(name: &str) -> bool {
-    matches!(name, "list_displays" | "screenshot" | "wait_for_change" | "snapshot")
+    matches!(name, "list_displays" | "screenshot" | "wait_for_change" | "snapshot" | "record")
 }
 
 /// An action's result as MCP content.
@@ -374,8 +382,58 @@ pub(crate) fn show(how: Show, v: &Value) -> Vec<Value> {
                 format!("Not approved: don't do it.{note}")
             })]
         }
+        Show::Clip => clip_content(v),
         Show::Answer => unreachable!(),
     }
+}
+
+/// A path on the host as a file URI (Windows paths get a leading slash and forward ones).
+fn file_uri(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    let mut uri = String::from("file://");
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~:".contains(&b) {
+            uri.push(b as char);
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    uri
+}
+
+/// A recording as MCP content: started (its id), or done (where it is, and the video as an
+/// embedded resource when it came inline, since the agent may not be on that computer).
+fn clip_content(v: &Value) -> Vec<Value> {
+    if v["recording"] == true {
+        return vec![text(format!(
+            "Recording (id {0}). Call record with stop: {0} to end it and get the video; it ends by itself after {1} seconds.",
+            v["id"], v["max_seconds"]
+        ))];
+    }
+    let secs = v["duration_ms"].as_f64().unwrap_or(0.0) / 1000.0;
+    let display = v["display"].as_u64().map(|d| format!(" of display {d}")).unwrap_or_default();
+    let mb = v["bytes"].as_f64().unwrap_or(0.0) / 1_048_576.0;
+    let parts = v["parts"].as_array().map_or(0, Vec::len);
+    let mut said = format!("Recorded {secs:.1} s{display} ({mb:.1} MB), saved on that computer at {}", v["path"].as_str().unwrap_or("?"));
+    if parts > 1 {
+        said.push_str(&format!(" and {} more parts (the picture size changed)", parts - 1));
+    }
+    let mut out = vec![];
+    match v["mp4"].as_str() {
+        Some(data) => {
+            said.push('.');
+            out.push(text(said));
+            let path = v["path"].as_str().unwrap_or("recording.mp4");
+            out.push(json!({ "type": "resource", "resource": {
+                "uri": file_uri(path), "mimeType": "video/mp4", "blob": data } }));
+        }
+        None => {
+            said.push_str("; too big to send here.");
+            out.push(text(said));
+        }
+    }
+    out
 }
 
 /// A wait's result in words.
@@ -519,6 +577,25 @@ mod tests {
         let w = wait_after(&json!(1), &json!({ "ok": true, "seq": 5 }));
         assert_eq!((w["since"].clone(), w["change"].clone()), (json!(5), json!(true)));
         assert!(serde_json::from_value::<crate::computer::Action>(w).is_ok());
+    }
+
+    #[test]
+    fn recordings_come_back_as_resources() {
+        let Step::Act { action, .. } = plan("record", &json!({ "stop": 12 })).unwrap() else { panic!() };
+        let a: crate::computer::Action = serde_json::from_value(action).unwrap();
+        assert!(matches!(a, crate::computer::Action::Record { stop: Some(12), start: false, seconds: None }));
+        assert!(looks_only("record"));
+        let started = show(Show::Clip, &json!({ "id": 3, "recording": true, "max_seconds": 600 }));
+        assert!(started[0]["text"].as_str().unwrap().contains("stop: 3"));
+        let done = show(Show::Clip, &json!({ "id": 3, "display": 1, "duration_ms": 2500, "bytes": 1000, "path": "/tmp/a b.mp4", "parts": ["/tmp/a b.mp4"], "mp4": "AAAA" }));
+        assert_eq!(done[1]["resource"]["mimeType"], "video/mp4");
+        assert_eq!(done[1]["resource"]["blob"], "AAAA");
+        assert_eq!(done[1]["resource"]["uri"], "file:///tmp/a%20b.mp4");
+        let windows = show(Show::Clip, &json!({ "duration_ms": 1, "path": "C:\\r\\a.mp4", "parts": [1], "mp4": "AA" }));
+        assert_eq!(windows[1]["resource"]["uri"], "file:///C:/r/a.mp4");
+        let big = show(Show::Clip, &json!({ "duration_ms": 1, "path": "/x.mp4", "parts": [1, 2] }));
+        assert_eq!(big.len(), 1);
+        assert!(big[0]["text"].as_str().unwrap().contains("1 more parts"));
     }
 
     #[test]

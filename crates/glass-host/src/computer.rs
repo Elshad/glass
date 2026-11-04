@@ -363,7 +363,7 @@ fn move_to(d: &DisplayInfo, x: f32, y: f32) -> Result<(), Refused> {
 
 /// An agent under a grant doesn't see protected apps (passwords, keychains…), or apps
 /// outside its limit, when they're in front.
-fn screen_visible() -> Result<(), Refused> {
+pub(crate) fn screen_visible() -> Result<(), Refused> {
     let crate::grants::Actor::Agent(g) = crate::grants::current() else { return Ok(()) };
     let Some(front) = crate::grants::frontmost_app() else { return Ok(()) };
     if crate::grants::PROTECTED_APPS.contains(&front.as_str()) {
@@ -868,6 +868,9 @@ pub enum Action {
     RequestHelp { text: String, wait_ms: Option<u64> },
     Confirm { text: String, wait_ms: Option<u64> },
     CheckAnswer { id: u64, wait_ms: Option<u64> },
+    /// Records the screen for `seconds`, or starts a recording (`start`) or stops one
+    /// (`stop`, its id).
+    Record { seconds: Option<f64>, #[serde(default)] start: bool, stop: Option<u64> },
 }
 
 impl Action {
@@ -888,6 +891,7 @@ impl Action {
             Action::RequestHelp { .. } => ("request_help", false),
             Action::Confirm { .. } => ("confirm", false),
             Action::CheckAnswer { .. } => ("check_answer", false),
+            Action::Record { .. } => ("record", true),
         }
     }
 
@@ -909,6 +913,11 @@ impl Action {
             Action::Key { keys } => shown_keys(keys),
             Action::RequestHelp { text, .. } | Action::Confirm { text, .. } => text.chars().take(200).collect(),
             Action::CheckAnswer { id, .. } => format!("question {id}"),
+            Action::Record { seconds, start, stop } => match (stop, start) {
+                (Some(id), _) => format!("stop {id}"),
+                (None, true) => "start".into(),
+                (None, false) => format!("{} s", seconds.unwrap_or(5.0)),
+            },
         }
     }
 }
@@ -958,6 +967,11 @@ async fn run(action: Action) -> Result<Value, Refused> {
         Action::CheckAnswer { id, wait_ms } => {
             check_answer(id, Duration::from_millis(wait_ms.unwrap_or(0).min(ASK_WAIT.as_millis() as u64))).await
         }
+        Action::Record { seconds, start, stop } => match (stop, start) {
+            (Some(id), _) => crate::clips::stop(id).await,
+            (None, true) => crate::clips::start().await,
+            (None, false) => crate::clips::record(crate::clips::record_len(seconds.unwrap_or(5.0))?).await,
+        },
     }
 }
 

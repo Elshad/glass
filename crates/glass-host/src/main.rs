@@ -9,6 +9,7 @@ mod admin;
 mod acl;
 mod approval;
 mod browse;
+mod clips;
 mod codec;
 mod connlog;
 mod cursor;

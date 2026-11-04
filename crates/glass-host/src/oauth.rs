@@ -1703,6 +1703,10 @@ async fn run_tool(g: &Grant, name: &str, args: &Value) -> Result<Vec<Value>, Str
         let asked = args["wait_seconds"].as_u64().unwrap_or(ASK_HOLD_DEFAULT);
         args["wait_seconds"] = json!(asked.min(ASK_HOLD_MAX));
     }
+    if name == "record" && args["seconds"].as_f64().is_some_and(|s| s > ASK_HOLD_MAX as f64) {
+        // A cloud agent's request can't stay open for a minute; start and stop instead.
+        args["seconds"] = json!(ASK_HOLD_MAX);
+    }
     let args = &args;
     // One tool call counts once against the hour, its follow-up screenshot included.
     let act = |v: Value, charge: bool| async move {
