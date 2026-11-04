@@ -401,12 +401,14 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let mut flow = crate::flow::Viewer::new();
     let mut flow_poll = tokio::time::interval(crate::flow::POLL);
     flow_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // A viewer that acknowledges frames (KIND_FRAME_ACK) gets its own bitrate from them
-    // (rate::AckRate), as a cap on the shared encoders like a remote viewer's; its
-    // once-a-second reports then no longer drive the shared rate. Older viewers stay on
-    // the reports. Its acks also say when frames are gone (crate::flow).
+    // A viewer that acknowledges frames (it says so in hello; KIND_FRAME_ACK) gets its own
+    // bitrate from them (rate::AckRate), as a cap on the shared encoders like a remote
+    // viewer's; its once-a-second reports then don't drive the shared rate, from the start.
+    // Older viewers stay on the reports. Its acks also say when frames are gone
+    // (crate::flow).
     let acking = Arc::new(AtomicBool::new(false));
     let mut ack_rate: Option<crate::rate::AckRate> = None;
+    let mut last_cap = None;
     let cap = AckCap(ACK_CAP_KEYS + flow.id());
     let mut rate_tick = tokio::time::interval(crate::rate::ACK_TICK);
     rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -424,11 +426,16 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                     }
                     flow.update(&mut link, now);
                 }
-                _ = rate_tick.tick(), if link.acking() => {
+                // While paused nothing's sent, so there's nothing to learn about the link.
+                _ = rate_tick.tick(), if acking.load(Ordering::Relaxed) && video_on.load(Ordering::Relaxed) => {
                     let now = std::time::Instant::now();
                     let rate = ack_rate.get_or_insert_with(|| crate::rate::AckRate::new(shared.rate.lock().unwrap().max()));
                     let bps = rate.update(link.ack_sample(now), now);
-                    set_remote_cap(cap.0, Some(bps));
+                    link.set_pace(bps);
+                    if last_cap != Some(bps) {
+                        last_cap = Some(bps);
+                        set_remote_cap(cap.0, Some(bps));
+                    }
                 }
                 _ = quiet_check.tick() => {
                     if last_heard.elapsed() > QUIET_LIMIT {
@@ -456,6 +463,9 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                     let Some(next_id) = next_frame_id.get_mut(frame.stream as usize) else { continue };
                     if authed.load(Ordering::Relaxed) && video_on.load(Ordering::Relaxed) {
                         let now = std::time::Instant::now();
+                        if acking.load(Ordering::Relaxed) {
+                            link.expect_acks();
+                        }
                         link.drained(datagrams_queued(&conn, datagram_capacity), now);
                         let (id, bytes) = send_frame(&conn, &frame, next_id)?;
                         if bytes > 0 {
@@ -663,7 +673,13 @@ async fn control(
             codecs,
             ua,
             cursor,
-        })) => (token, link, pass, device, codecs, ua, cursor),
+            acks,
+        })) => {
+            if acks {
+                ctx.acking.store(true, Ordering::Relaxed);
+            }
+            (token, link, pass, device, codecs, ua, cursor)
+        }
         _ => (None, None, None, None, Vec::new(), None, false),
     };
     let mut device = crate::viewers::clean_device(hello_device.as_deref());
@@ -2510,9 +2526,28 @@ pub fn set_remote_cap(viewer: u64, bps: Option<u32>) {
             None => caps.remove(&viewer),
         };
     }
-    if let Some(shared) = SHARED.get() {
-        apply_bitrate(shared);
-    }
+    apply_bitrate_soon();
+}
+
+/// Applies the bitrate off the caller's thread: changing it takes the streams' lock (held for
+/// as long as a capture restart takes) and calls into the encoders, and the callers are the
+/// tasks that send video and answer the viewer's pings, which mustn't wait on that.
+fn apply_bitrate_soon() {
+    static WORKER: std::sync::OnceLock<std::sync::mpsc::Sender<()>> = std::sync::OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let _ = std::thread::Builder::new().name("glass-bitrate".into()).spawn(move || {
+            while rx.recv().is_ok() {
+                // However many came meanwhile, once covers them.
+                while rx.try_recv().is_ok() {}
+                if let Some(shared) = SHARED.get() {
+                    apply_bitrate(shared);
+                }
+            }
+        });
+        tx
+    });
+    let _ = worker.send(());
 }
 
 /// The encoders' bitrate: the tailnet clients' adaptive target, capped by every remote

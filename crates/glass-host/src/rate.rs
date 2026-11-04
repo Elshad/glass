@@ -157,8 +157,14 @@ pub struct AckSample {
     pub oldest_ms: f64,
     /// The quickest a frame has been acknowledged lately.
     pub rtt_ms: f64,
-    /// Bits a second acknowledged (smoothed).
+    /// Bits a second acknowledged (smoothed); 0 when none have been heard lately.
     pub delivered_bps: f64,
+    /// The link is full: capture is waiting for it (crate::flow).
+    pub held: bool,
+    /// How long the oldest frame has been out, beyond what its own size takes to send.
+    pub waited_ms: f64,
+    /// Bits sent and not yet acknowledged.
+    pub in_flight_bits: f64,
 }
 
 /// How often [`AckRate`] looks.
@@ -180,8 +186,12 @@ pub struct AckRate {
     slow_start: bool,
     /// What was delivered when the link last choked, and when.
     ceiling: Option<(f64, Instant)>,
+    /// When acknowledgements first said something.
+    first_heard: Option<Instant>,
 }
 
+/// How long after the first acknowledgement delay doesn't count against the link.
+const ACK_GRACE: Duration = Duration::from_secs(3);
 /// Where a viewer's rate starts before its link is known.
 pub const ACK_START_BPS: u32 = 4_000_000;
 /// The least it goes to: still a picture, if a slow one. An absolute floor, not a share of
@@ -197,6 +207,7 @@ impl AckRate {
             last_increase: None,
             slow_start: true,
             ceiling: None,
+            first_heard: None,
         }
     }
 
@@ -208,21 +219,51 @@ impl AckRate {
     /// Every [`ACK_TICK`]; returns the target.
     pub fn update(&mut self, s: AckSample, now: Instant) -> u32 {
         let since = |t: Option<Instant>| t.map_or(Duration::MAX, |t| now.saturating_duration_since(t));
-        let congested = s.queue_ms > 30.0 || s.oldest_ms > s.rtt_ms + 80.0;
-        let clear = s.queue_ms <= 15.0;
+        // Nothing heard lately: no evidence of anything, so no change. (Frames unconfirmed
+        // while a tab is hidden, a last frame lost, a decoder sitting on one.)
+        if s.delivered_bps <= 0.0 {
+            return self.target as u32;
+        }
+        // The first frames (keyframes, and a capture restart's) go out through QUIC's own slow
+        // start, which stretches them by a few round trips whatever the link: not a queue.
+        let heard_since = *self.first_heard.get_or_insert(now);
+        let settled = now.saturating_duration_since(heard_since) >= ACK_GRACE;
+        // Delay swings more on a long path (a cell's is hundreds of ms): what counts as a
+        // queue scales with it.
+        // Capture being held also keeps the delay down, so the queue alone can't show a target
+        // above what the link carries. That shows as capture waiting with a round trip's worth
+        // of the target out, the oldest of it out for longer than its size and a round trip
+        // explain, and less than the target getting through. (Not a keyframe on a link that
+        // can take it, or a few small frames on a stream with little to send.)
+        let overrun = s.held
+            && s.waited_ms > s.rtt_ms
+            && s.in_flight_bits >= self.target * s.rtt_ms / 1000.0 * 0.5
+            && s.delivered_bps < self.target * 0.9;
+        let congested = overrun || s.queue_ms > 30f64.max(s.rtt_ms / 4.0) || s.oldest_ms > s.rtt_ms + 80.0;
+        let clear = s.queue_ms <= 15f64.max(s.rtt_ms / 8.0);
         // Raising only means something when the stream presses against the target.
         let used = s.delivered_bps >= self.target * 0.5;
-        if congested && since(self.last_decrease) >= Duration::from_millis(300) {
-            let mut next = self.target * 0.85;
-            // What was delivered is the link's capacity only when we were pushing near
-            // the target; one big frame on a still screen would pin it at a trickle.
-            if used {
+        // Nor does cutting, unless frames are really waiting: a few small ones on a still
+        // screen, delayed by the path's own jitter, aren't overrunning anything, and a lower
+        // target wouldn't help them. When they do wait, what got through is what it carries.
+        //
+        // Nor when the encoder is already well over its target (it can't make frames that
+        // small: see `vt_at_low_bitrates`): a lower target wouldn't lower what's sent.
+        let obeyed = s.delivered_bps <= self.target * 1.1;
+        if congested && settled && (used || s.held) {
+            if obeyed && since(self.last_decrease) >= Duration::from_millis(300) {
                 self.ceiling = Some((s.delivered_bps, now));
-                next = next.min(s.delivered_bps * 0.85);
+                let mut next = self.target * 0.85;
+                // What got through is the link's rate only when the stream was pressing against
+                // the target; one big frame among few would pin it at a trickle.
+                if used {
+                    self.ceiling = Some((s.delivered_bps, now));
+                    next = next.min(s.delivered_bps * 0.85);
+                    self.slow_start = false;
+                }
+                self.target = next.max(MIN_BPS as f64);
+                self.last_decrease = Some(now);
             }
-            self.target = next.max(MIN_BPS as f64);
-            self.last_decrease = Some(now);
-            self.slow_start = false;
         } else if self.slow_start && !congested && clear {
             if used && since(self.last_increase) >= Duration::from_millis(250) {
                 self.target = (self.target * 1.5).min(self.max);
@@ -472,15 +513,22 @@ mod tests {
         assert_eq!(rc.target(), (MAX as f64 * MIN_FRACTION) as u32);
     }
 
+    /// A rate past its first seconds, as of `t0`.
+    fn settled(t0: Instant) -> AckRate {
+        let mut r = AckRate::new(MAX);
+        r.update(sample(0.0, 1.0), t0 - ACK_GRACE);
+        r
+    }
+
     fn sample(queue_ms: f64, delivered_bps: f64) -> AckSample {
-        AckSample { queue_ms, oldest_ms: 0.0, rtt_ms: 150.0, delivered_bps }
+        AckSample { queue_ms, oldest_ms: 0.0, rtt_ms: 150.0, delivered_bps, held: false, waited_ms: 0.0, in_flight_bits: 0.0 }
     }
 
     #[test]
     fn acks_ramp_up_fast_at_the_start_and_cut_to_what_was_delivered() {
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
-        let mut r = AckRate::new(MAX);
+        let mut r = settled(t0);
         assert_eq!(r.target(), ACK_START_BPS);
         // Busy and clear: ×1.5 every 250 ms, not more often.
         assert_eq!(r.update(sample(0.0, 3_000_000.0), ms(0)), 6_000_000);
@@ -503,10 +551,48 @@ mod tests {
     }
 
     #[test]
+    fn jitter_on_a_quiet_stream_is_not_congestion() {
+        let t0 = Instant::now();
+        let mut r = settled(t0);
+        // 200 ms of "queue" on a still screen sending 100 kbps: no cut, however long.
+        for i in 0..100 {
+            let at = t0 + Duration::from_millis(i * 100);
+            assert_eq!(r.update(sample(200.0, 100_000.0), at), ACK_START_BPS);
+        }
+        // The same delay with capture waiting for the link: that's the link's rate.
+        let held = AckSample { held: true, ..sample(200.0, 800_000.0) };
+        assert_eq!(r.update(held, t0 + Duration::from_secs(11)), 3_400_000);
+    }
+
+    #[test]
+    fn a_target_the_encoder_is_already_over_isnt_cut_further() {
+        let t0 = Instant::now();
+        let mut r = settled(t0);
+        // 5 Mbps coming out against a target of 4: queueing, but cutting changes nothing.
+        for i in 0..50 {
+            let at = t0 + Duration::from_millis(i * 100);
+            assert_eq!(r.update(sample(200.0, 5_000_000.0), at), ACK_START_BPS);
+        }
+    }
+
+    #[test]
+    fn capture_waiting_with_the_target_out_is_an_overrun() {
+        let t0 = Instant::now();
+        let stuffed = AckSample { held: true, waited_ms: 200.0, in_flight_bits: 400_000.0, ..sample(0.0, 2_000_000.0) };
+        // 4 Mbps, 150 ms: half a round trip's worth of the target is out, and 2 Mbps gets through.
+        assert_eq!(settled(t0).update(stuffed, t0), 1_700_000);
+        // A few small frames with capture momentarily waiting: not the same thing.
+        let few = AckSample { in_flight_bits: 100_000.0, ..stuffed };
+        assert_eq!(settled(t0).update(few, t0), 6_000_000);
+    }
+
+    #[test]
     fn an_old_unacknowledged_frame_is_congestion() {
-        let mut r = AckRate::new(MAX);
+        let t0 = Instant::now();
         let stuck = AckSample { oldest_ms: 400.0, ..sample(0.0, 3_000_000.0) };
-        assert!(r.update(stuck, Instant::now()) < ACK_START_BPS);
+        assert!(settled(t0).update(stuck, t0) < ACK_START_BPS);
+        // Not in the first seconds: that's QUIC's slow start.
+        assert_eq!(AckRate::new(MAX).update(stuck, t0), ACK_START_BPS);
     }
 
     #[test]

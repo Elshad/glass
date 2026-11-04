@@ -61,6 +61,8 @@ struct Sent {
     /// `Link::total` once this frame's last byte was handed over.
     end: u64,
     bytes: usize,
+    /// Bytes of frames still in flight when it was sent: it waits behind those.
+    ahead: u64,
 }
 
 /// One viewer's frames in flight.
@@ -94,7 +96,18 @@ pub struct Link {
     /// Bytes a second acknowledged, smoothed, and the window being counted (start, bytes).
     delivered: f64,
     delivered_window: Option<(Instant, u64)>,
+    /// When `delivered` was last measured.
+    delivered_at: Option<Instant>,
+    /// When a frame was last acknowledged.
+    last_ack: Option<Instant>,
+    /// The bitrate frames are being made at, to tell how long one takes just to send.
+    pace_bps: f64,
 }
+
+/// Nothing on its way for this long: the stream had nothing to send.
+const REST: Duration = Duration::from_millis(250);
+/// No acknowledgement for this long: what they said no longer describes the link.
+const NO_NEWS: Duration = Duration::from_secs(1);
 
 /// Wrapping frame-id order: `a` is `b` or before it.
 fn id_le(a: u32, b: u32) -> bool {
@@ -115,7 +128,12 @@ impl Link {
                 if self.inflight.len() >= MAX_TRACKED {
                     self.inflight.pop_front();
                 }
-                self.inflight.push_back(Sent { stream, id, at: now, end: self.total, bytes });
+                let ahead = self.inflight.iter().map(|f| f.bytes as u64).sum();
+                // Delivery is measured from here after a rest: time spent idle says nothing.
+                if ahead == 0 && self.last_ack.is_none_or(|at| now.saturating_duration_since(at) > REST) {
+                    self.delivered_window = Some((now, 0));
+                }
+                self.inflight.push_back(Sent { stream, id, at: now, end: self.total, bytes, ahead });
             }
         }
     }
@@ -192,12 +210,9 @@ impl Link {
     /// gone (an earlier one it never drew was lost or skipped). From then on frames are
     /// gone only when acknowledged.
     pub fn acked(&mut self, stream: u8, id: u32, now: Instant) {
-        if !self.acks {
-            // Its own baseline: acknowledgements take a decode longer than the buffer did.
-            self.acks = true;
-            self.base = None;
-            self.window = None;
-        }
+        self.expect_acks();
+        self.last_ack = Some(now);
+        let pace = self.pace();
         let mut bytes = 0;
         let mut took = None;
         self.inflight.retain(|f| {
@@ -205,15 +220,19 @@ impl Link {
             if gone {
                 bytes += f.bytes;
                 if f.id == id {
-                    took = Some(now.duration_since(f.at));
+                    let sending = (f.ahead + f.bytes as u64) as f64 / pace;
+                    took = Some((now.duration_since(f.at), Duration::from_secs_f64(sending)));
                 }
             }
             !gone
         });
-        if let Some(took) = took {
+        if let Some((took, sending)) = took {
             self.sample(took, now);
             let base = self.base.map_or(0.0, |(b, _)| b);
-            let queued = took.as_secs_f64() * 1000.0 - base;
+            // How long it took beyond the quickest, less how long it (and what was ahead of
+            // it) takes just to send at the rate it was made for. A keyframe is many times
+            // the size of a frame: its own length isn't a queue on the link.
+            let queued = (took.saturating_sub(sending).as_secs_f64() * 1000.0 - base).max(0.0);
             self.queue_ms = self.queue_ms * 0.7 + queued * 0.3;
         }
         if bytes > 0 {
@@ -224,7 +243,9 @@ impl Link {
             let took = now.duration_since(start).as_secs_f64();
             if took >= 0.5 {
                 let rate = counted as f64 / took;
-                self.delivered = if self.delivered == 0.0 { rate } else { self.delivered * 0.6 + rate * 0.4 };
+                let recent = self.delivered > 0.0 && self.delivered_at.is_some_and(|at| now.saturating_duration_since(at) < NO_NEWS);
+                self.delivered = if recent { self.delivered * 0.6 + rate * 0.4 } else { rate };
+                self.delivered_at = Some(now);
                 self.delivered_window = Some((now, 0));
             } else {
                 self.delivered_window = Some((start, counted));
@@ -236,30 +257,48 @@ impl Link {
         }
     }
 
-    /// The viewer acknowledges frames.
-    pub fn acking(&self) -> bool {
-        self.acks
+    /// It said so (or just did): frames are gone only when it says, from now on.
+    pub fn expect_acks(&mut self) {
+        if !self.acks {
+            // Its own baseline: acknowledgements take a decode longer than the buffer did.
+            self.acks = true;
+            self.base = None;
+            self.window = None;
+        }
+    }
+
+    /// The bitrate frames are being made at (see [`Link::acked`]).
+    pub fn set_pace(&mut self, bps: u32) {
+        self.pace_bps = bps as f64;
+    }
+
+    /// Bytes a second frames are expected to take to send.
+    fn pace(&self) -> f64 {
+        let bps = if self.pace_bps > 0.0 { self.pace_bps } else { crate::rate::ACK_START_BPS as f64 };
+        bps / 8.0
     }
 
     /// What acknowledgements say about the link now, for its bitrate.
-    pub fn ack_sample(&self, now: Instant) -> crate::rate::AckSample {
+    pub fn ack_sample(&mut self, now: Instant) -> crate::rate::AckSample {
+        let heard = self.last_ack.is_some_and(|at| now.saturating_duration_since(at) < NO_NEWS);
+        let pace = self.pace();
         crate::rate::AckSample {
-            queue_ms: self.queue_ms,
-            oldest_ms: self
-                .inflight
-                .front()
-                .map_or(0.0, |f| now.duration_since(f.at).as_secs_f64() * 1000.0),
+            // Nothing on its way: whatever queue there was, the last frames came through it.
+            queue_ms: if self.busy() && heard { self.queue_ms } else { 0.0 },
+            oldest_ms: self.inflight.front().map_or(0.0, |f| {
+                let sending = (f.ahead + f.bytes as u64) as f64 / pace;
+                (now.duration_since(f.at).as_secs_f64() - sending).max(0.0) * 1000.0
+            }),
             rtt_ms: self.rtt_ms(),
-            // Stale once acknowledgements stop (a hidden tab): it would keep "using" the
-            // rate, and raise it, while nothing is sent.
-            delivered_bps: if self
-                .delivered_window
-                .is_some_and(|(start, _)| now.saturating_duration_since(start) < Duration::from_secs(1))
-            {
-                self.delivered * 8.0
-            } else {
-                0.0
-            },
+            // None heard lately means no evidence either way: it would "use" the rate, and
+            // raise it, or count as a link that delivers nothing, on a silence that can be a
+            // hidden tab, a lost last frame or a decoder sitting on one.
+            delivered_bps: if heard { self.delivered * 8.0 } else { 0.0 },
+            held: self.full(now),
+            waited_ms: self.inflight.front().map_or(0.0, |f| {
+                (now.duration_since(f.at).as_secs_f64() - f.bytes as f64 / pace).max(0.0) * 1000.0
+            }),
+            in_flight_bits: self.inflight.iter().map(|f| f.bytes as f64 * 8.0).sum(),
         }
     }
 
@@ -569,7 +608,8 @@ pub(crate) mod tests {
                 l.acked(0, acked, now);
             }
             if now >= next_tick {
-                rate.update(l.ack_sample(now), now);
+                let bps = rate.update(l.ack_sample(now), now);
+                l.set_pace(bps);
                 next_tick += crate::rate::ACK_TICK;
             }
             if now >= next_capture {
@@ -579,7 +619,8 @@ pub(crate) mod tests {
             if let Some(changed) = pending
                 && !l.full(now)
             {
-                let bytes = (rate.target() / 8 / 30) as usize;
+                // A keyframe first; then as much as the bitrate allows.
+                let bytes = if id == 0 { 400_000 } else { (rate.target() / 8 / 30) as usize };
                 // Drawn 5 ms after it arrives, and acknowledged half a round trip later.
                 let shown = link.send(bytes, now) + Duration::from_millis(5);
                 acks.push_back((shown + link.rtt / 2, id));
@@ -597,11 +638,12 @@ pub(crate) mod tests {
 
     #[test]
     fn acks_bring_the_rate_down_to_a_slow_link_and_keep_the_delay_short() {
-        // The bench case: 1 Mbps, 150 ms. From 4 Mbps it settles under the link, and what
+        // The bench case: 1 Mbps, 150 ms. From 4 Mbps it settles around the link, and what
         // changes is on screen within half a second.
         let mut link = SimLink::new(1_000_000.0, Duration::from_millis(150), Instant::now());
         let (bps, worst) = paced_by_acks(&mut link, 30);
-        assert!((250_000..1_000_000).contains(&bps), "{bps} bps");
+        // (Around the link's rate: it keeps probing gently, with capture holding the queue.)
+        assert!((250_000..1_250_000).contains(&bps), "{bps} bps");
         assert!(worst < Duration::from_millis(500), "worst delay {worst:?}");
     }
 
@@ -631,9 +673,89 @@ pub(crate) mod tests {
         l.acked(0, 2, ms(60));
         assert_eq!(l.inflight.len(), 1);
         assert_eq!(l.rtt_ms(), 40.0);
-        // 20 ms more than the quickest: queueing, smoothed.
+        // 20 ms more than the quickest: queueing, smoothed. (Set far above their size here,
+        // so that takes no time to send.)
+        l.set_pace(1_000_000_000);
+        l.queue_ms = 6.0;
+        l.sent(0, 3, 10, ms(60));
         assert!((l.ack_sample(ms(60)).queue_ms - 6.0).abs() < 1e-9);
         assert!(id_le(u32::MAX, 1) && !id_le(1, u32::MAX), "ids wrap");
+    }
+
+    #[test]
+    fn a_keyframes_own_length_isnt_a_queue() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut l = Link::default();
+        l.set_pace(4_000_000);
+        // A small frame sets the baseline: 150 ms.
+        l.sent(0, 0, 1_000, t0);
+        l.acked(0, 0, t0 + ms(152));
+        assert!(l.base.is_some_and(|(b, _)| (b - 152.0).abs() < 1.0), "{:?}", l.base);
+        // 400 KB at 4 Mbps is 800 ms just to send: arriving in 950 ms is no queue, and nor
+        // is the small frame right behind it.
+        let t1 = t0 + ms(1000);
+        l.sent(0, 1, 400_000, t1);
+        l.sent(0, 2, 1_000, t1 + ms(20));
+        assert!(l.ack_sample(t1 + ms(900)).oldest_ms < 100.0);
+        l.acked(0, 1, t1 + ms(950));
+        l.acked(0, 2, t1 + ms(960));
+        assert!(l.queue_ms < 5.0, "{}", l.queue_ms);
+        // Taking twice that (a link at half the rate) is.
+        let t2 = t1 + ms(1000);
+        l.sent(0, 3, 400_000, t2);
+        l.acked(0, 3, t2 + ms(1750));
+        assert!(l.queue_ms > 100.0, "{}", l.queue_ms);
+    }
+
+    #[test]
+    fn silence_is_no_evidence_about_the_link() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut l = Link::default();
+        l.expect_acks();
+        l.sent(0, 0, 100_000, t0);
+        l.acked(0, 0, t0 + ms(600));
+        l.sent(0, 1, 1_000, t0 + ms(600));
+        l.acked(0, 1, t0 + ms(1400));
+        let heard = l.ack_sample(t0 + ms(1400));
+        assert!(heard.delivered_bps > 0.0);
+        // Its last frame is never confirmed (lost, or a decoder sitting on it): no queue
+        // and no delivery to judge by, however old the frame gets.
+        l.sent(0, 2, 1_000, t0 + ms(1500));
+        let later = l.ack_sample(t0 + ms(3000));
+        assert_eq!((later.queue_ms, later.delivered_bps), (0.0, 0.0));
+        // And it doesn't change the rate.
+        let mut rate = crate::rate::AckRate::new(30_000_000);
+        for i in 0..50 {
+            let at = t0 + ms(3000 + i * 100);
+            assert_eq!(rate.update(l.ack_sample(at), at), crate::rate::ACK_START_BPS);
+        }
+    }
+
+    #[test]
+    fn a_pause_says_nothing_about_the_link() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut l = Link::default();
+        l.expect_acks();
+        let mut rate = crate::rate::AckRate::new(30_000_000);
+        for id in 0..3 {
+            l.sent(0, id, 1_000, t0);
+        }
+        // The tab is hidden: frames in flight are never acknowledged.
+        l.forget();
+        let s = l.ack_sample(t0 + ms(5000));
+        assert_eq!((s.queue_ms, s.oldest_ms, s.held), (0.0, 0.0, false));
+        assert_eq!(rate.update(s, t0 + ms(5000)), crate::rate::ACK_START_BPS);
+    }
+
+    #[test]
+    fn a_healthy_link_stays_near_its_capacity_from_a_cold_start() {
+        // 8 Mbps, 288 ms: the keyframe (400 KB) at the very start must not read as congestion.
+        let mut link = SimLink::new(8_000_000.0, Duration::from_millis(288), Instant::now());
+        let (bps, _) = paced_by_acks(&mut link, 20);
+        assert!((5_000_000..=9_000_000).contains(&bps), "{bps} bps");
     }
 
     #[test]

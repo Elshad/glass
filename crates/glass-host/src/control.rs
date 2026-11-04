@@ -46,6 +46,10 @@ pub enum ClientMsg {
         /// rather than needing it in the video. See `crate::cursor`.
         #[serde(default)]
         cursor: bool,
+        /// The viewer acknowledges frames (KIND_FRAME_ACK), so its bitrate comes from those
+        /// from the start, not from its reports. See `rate::AckRate`.
+        #[serde(default)]
+        acks: bool,
     },
     /// The viewer now draws the pointer itself, or (trackpad mode, which has its own) wants
     /// it back in the video.
