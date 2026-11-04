@@ -24,10 +24,10 @@ const HOLD_AFTER_DECREASE: Duration = Duration::from_secs(2);
 const LATENCY_SLACK_MS: f64 = 40.0;
 /// Recent latency samples used to estimate the uncongested baseline.
 const BASELINE_WINDOW: usize = 30;
-/// The least the rate goes to: still a picture, if a slow one. An absolute floor, not a
-/// share of the maximum: 8% of a 30 Mbps maximum (2.4 Mbps) was more than a 1 Mbps link
-/// carries, so the queue grew without end and nothing decoded.
-pub const MIN_BPS: u32 = 250_000;
+/// Below this the picture becomes unusable; hold here instead. (These reports can't tell a
+/// queue on the way from a bad second, so they stop well short of what a viewer that
+/// acknowledges frames can go down to: see `AckRate`.)
+const MIN_FRACTION: f64 = 0.08;
 /// The short-window limit: a frame interval's worth of the target, this many intervals...
 const SHORT_WINDOW_FRAMES: f64 = 2.0;
 /// ...with this much slack (so a frame may be about three average frames, no more).
@@ -110,7 +110,7 @@ impl RateControl {
             .received_bps
             .is_none_or(|bps| bps >= self.target as f64 * USED_FOR_INCREASE);
 
-        let min = MIN_BPS.min(self.max);
+        let min = (self.max as f64 * MIN_FRACTION) as u32;
         let next = if congested {
             self.last_decrease = Some(now);
             self.ceiling = Some(self.target);
@@ -182,10 +182,11 @@ pub fn split(total: u32, activity: &[u64]) -> Vec<u32> {
 }
 
 /// The most an encoder may spend over a short window, as (bytes, seconds): about two frames
-/// at the target, with some slack. Without it, a limit over a whole second let one frame
-/// take most of the second's bits; on a slow link that one frame is a queue everything
-/// after it waits behind. Encoders meet it by coarsening the frame (see [`motion_policy`]:
-/// the QP cap is loose at low rates so they can).
+/// at the target, with some slack, for encoders with a rate buffer to size (Media
+/// Foundation, VA-API; VideoToolbox ignores such limits). Without it, one frame could take
+/// most of a second's bits; on a slow link that one frame is a queue everything after it
+/// waits behind.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn short_window(bps: u32, fps: u32) -> (f64, f64) {
     let secs = SHORT_WINDOW_FRAMES / fps.max(1) as f64;
     (bps as f64 / 8.0 * secs * SHORT_WINDOW_SLACK, secs)
@@ -357,26 +358,7 @@ mod tests {
         for _ in 0..50 {
             rc.report(lossy(), t0);
         }
-        assert_eq!(rc.target(), MIN_BPS);
-    }
-
-    #[test]
-    fn a_slow_link_can_take_the_rate_down_to_a_quarter_megabit() {
-        // WebTransport over a 1 Mbps link with a 30 Mbps maximum: congestion every second
-        // brings it under the link within a dozen seconds, and it can go lower still.
-        let mut rc = RateControl::new(MAX);
-        let t0 = Instant::now();
-        let under = (0..20u64)
-            .position(|i| {
-                rc.report(lossy(), t0 + Duration::from_secs(i));
-                rc.target() < 1_000_000
-            })
-            .expect("gets under the link");
-        assert!(under < 12, "{under} s");
-        for i in 20..40 {
-            rc.report(lossy(), t0 + Duration::from_secs(i));
-        }
-        assert_eq!(rc.target(), 250_000);
+        assert_eq!(rc.target(), (MAX as f64 * MIN_FRACTION) as u32);
     }
 
     #[test]

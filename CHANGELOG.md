@@ -19,7 +19,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 - Scrolling keeps up with your fingers on a phone or tablet: two-finger and wheel scrolling move the remote content as far as they move it on your screen, whatever size the remote display is shown at (before, a Mac shown at a quarter size scrolled about four times too slowly). On a Mac, slow trackpad scrolling no longer gets lost to rounding, and apps scroll as smoothly as with a trackpad.
 - Chinese, Japanese and Korean input methods, emoji, and accented letters from a phone or tablet keyboard now type on the remote computer (before, they were dropped). On Linux hosts, characters a US keyboard doesn't have still can't be typed.
 - On a slow or lossy link, the picture no longer sticks waiting for a keyframe: while a viewer's connection is still busy with the last frames, Glass waits before capturing the next one, and that frame then carries everything that changed. Fewer frames get through, but none are dropped.
-- On a slow link, no single frame takes much more than its share of the bitrate (before, one could take most of a second's worth and hold up everything behind it), and below 3 Mbps frames may be coarser so they fit; a still screen sharpens afterwards. The bitrate can now go as low as 0.25 Mbps on any connection, not just 8% of the maximum (2.4 Mbps, more than a 1 Mbps link carries).
+- On a slow link, below 3 Mbps frames may be coarser so they fit, instead of huge ones holding up everything behind them; a still screen sharpens afterwards. On Windows and Linux hardware encoders, no single frame takes much more than its share of the bitrate.
 
 ## 0.13.1
 
