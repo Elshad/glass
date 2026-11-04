@@ -192,6 +192,18 @@ pub fn short_window(bps: u32, fps: u32) -> (f64, f64) {
     (bps as f64 / 8.0 * secs * SHORT_WINDOW_SLACK, secs)
 }
 
+/// How much a still screen may be refined after motion stops, at `bps` and `fps`: how
+/// many re-encodes, and how many bytes they may take in all (each about two frames' worth
+/// on average). On a slow link a burst of 36 full re-encodes queued ahead of the next real
+/// change; a few, small enough, sharpen it without that.
+// Only the Mac's capture refines a still screen.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn refresh_budget(bps: u32, fps: u32) -> (u32, u64) {
+    let count = (bps / 1_000_000).clamp(3, 36);
+    let frame = bps as u64 / 8 / fps.max(1) as u64;
+    (count, frame * 2 * count as u64)
+}
+
 /// What a display's encoder does at a given bitrate to keep text sharp: a frame-rate
 /// ceiling, and a cap on how coarse a frame may get (QP; lower is sharper). When bits run
 /// short it sends fewer, sharp frames rather than many blurry ones; a still screen keeps
@@ -359,6 +371,15 @@ mod tests {
             rc.report(lossy(), t0);
         }
         assert_eq!(rc.target(), (MAX as f64 * MIN_FRACTION) as u32);
+    }
+
+    #[test]
+    fn a_slow_link_gets_a_short_refresh_burst() {
+        // The Tesla case: 1 Mbps at 10 fps: three refreshes, 75 KB in all.
+        assert_eq!(refresh_budget(1_000_000, 10), (3, 75_000));
+        // A LAN: as many as before (3 s of them), each up to two frames' worth.
+        assert_eq!(refresh_budget(50_000_000, 60).0, 36);
+        assert_eq!(refresh_budget(12_000_000, 60), (12, 12 * 2 * 25_000));
     }
 
     #[test]

@@ -20,6 +20,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 - Chinese, Japanese and Korean input methods, emoji, and accented letters from a phone or tablet keyboard now type on the remote computer (before, they were dropped). On Linux hosts, characters a US keyboard doesn't have still can't be typed.
 - On a slow or lossy link, the picture no longer sticks waiting for a keyframe: while a viewer's connection is still busy with the last frames, Glass waits before capturing the next one, and that frame then carries everything that changed. Fewer frames get through, but none are dropped.
 - On a slow link, below 3 Mbps frames may be coarser so they fit, instead of huge ones holding up everything behind them; a still screen sharpens afterwards. On Windows and Linux hardware encoders, no single frame takes much more than its share of the bitrate.
+- A still screen sharpens without slowing down what comes next on a slow link: on the Mac, Glass refines it a few times (fewer and smaller the lower the bitrate) and only once the frames before have arrived, instead of re-sending the whole picture a dozen times a second for 3 seconds.
 
 ## 0.13.1
 

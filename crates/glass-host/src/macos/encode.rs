@@ -106,6 +106,8 @@ pub struct Encoder {
     bytes: Arc<AtomicU64>,
     /// Size of the latest output frame (an idle refresh stops once these get tiny).
     last_size: Arc<AtomicU64>,
+    /// The bitrate its policy was last applied for.
+    bps: AtomicU32,
 }
 
 // VTCompressionSession is thread-safe; frames are submitted from the capture queue only.
@@ -225,6 +227,7 @@ impl Encoder {
             cap_lifted: AtomicBool::new(false),
             bytes: Arc::new(AtomicU64::new(0)),
             last_size: Arc::new(AtomicU64::new(0)),
+            bps: AtomicU32::new(bitrate as u32),
         })
     }
 
@@ -233,6 +236,7 @@ impl Encoder {
     /// ceiling for capture (at most `max_fps`: what the display and viewers can show).
     pub fn apply_policy(&self, bps: u32, max_fps: u32) -> u32 {
         let (fps, qp) = crate::rate::sharp_policy(bps, max_fps);
+        self.bps.store(bps, Ordering::Relaxed);
         set_rate(&self.session, bps);
         self.set(
             unsafe { kVTCompressionPropertyKey_ExpectedFrameRate },
@@ -266,6 +270,10 @@ impl Encoder {
     /// Bytes produced since the last call.
     pub fn take_bytes(&self) -> u64 {
         self.bytes.swap(0, Ordering::Relaxed)
+    }
+
+    pub fn bitrate(&self) -> u32 {
+        self.bps.load(Ordering::Relaxed)
     }
 
     pub fn last_frame_size(&self) -> u64 {

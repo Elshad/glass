@@ -219,30 +219,34 @@ impl Link {
     }
 }
 
-/// Per viewer: the streams it holds (a bit each; 0 when its link isn't full).
-static VIEWERS: Mutex<Option<HashMap<u64, u8>>> = Mutex::new(None);
-/// The union of those, read by capture on every frame.
+/// Per viewer: the streams it holds (a bit each; 0 when its link isn't full), and the
+/// streams it has frames in flight for.
+static VIEWERS: Mutex<Option<HashMap<u64, (u8, u8)>>> = Mutex::new(None);
+/// The unions of those, read by capture on every frame.
 static HELD: AtomicU8 = AtomicU8::new(0);
+static BUSY: AtomicU8 = AtomicU8::new(0);
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 /// A send path's place in the registry; its hold is lifted when it drops.
 pub struct Viewer {
     id: u64,
-    held: u8,
+    /// What it last published: (held, busy).
+    state: (u8, u8),
 }
 
 impl Viewer {
     pub fn new() -> Self {
-        Self { id: NEXT.fetch_add(1, Ordering::Relaxed), held: 0 }
+        Self { id: NEXT.fetch_add(1, Ordering::Relaxed), state: (0, 0) }
     }
 
     /// Re-evaluates `link` and publishes the result if it changed. Returns whether it's full.
     pub fn update(&mut self, link: &mut Link, now: Instant) -> bool {
         let full = link.full(now);
-        let held = if full { link.streams() } else { 0 };
-        if held != self.held {
-            self.held = held;
-            publish(self.id, held);
+        let busy = link.streams();
+        let state = (if full { busy } else { 0 }, busy);
+        if state != self.state {
+            self.state = state;
+            publish(self.id, state);
         }
         full
     }
@@ -256,21 +260,30 @@ impl Default for Viewer {
 
 impl Drop for Viewer {
     fn drop(&mut self) {
-        if self.held != 0 {
-            publish(self.id, 0);
+        if self.state != (0, 0) {
+            publish(self.id, (0, 0));
         }
     }
 }
 
-fn publish(id: u64, held: u8) {
+fn publish(id: u64, state: (u8, u8)) {
     let mut viewers = VIEWERS.lock().unwrap();
     let viewers = viewers.get_or_insert_with(Default::default);
-    if held == 0 {
+    if state == (0, 0) {
         viewers.remove(&id);
     } else {
-        viewers.insert(id, held);
+        viewers.insert(id, state);
     }
-    HELD.store(viewers.values().fold(0, |m, h| m | h), Ordering::Relaxed);
+    HELD.store(viewers.values().fold(0, |m, s| m | s.0), Ordering::Relaxed);
+    BUSY.store(viewers.values().fold(0, |m, s| m | s.1), Ordering::Relaxed);
+}
+
+/// No viewer has a frame of `stream` still on its way: the link is idle, so a frame that
+/// only refines a still picture won't queue ahead of the next real change.
+// Only the Mac's capture refines a still screen.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn idle(stream: u8) -> bool {
+    BUSY.load(Ordering::Relaxed) & 1 << (stream as usize).min(MAX_STREAMS - 1) == 0
 }
 
 /// Capture of `stream` should wait: a viewer's link is full. (A keyframe someone is
@@ -382,6 +395,34 @@ pub(crate) mod tests {
         assert!(worst > Duration::from_secs(3), "worst delay {worst:?}");
     }
 
+    /// A still screen refined with 20 KB re-encodes every 83 ms over 1 Mbps / 160 ms, then a
+    /// change at 2 s: how long until that change arrives.
+    fn change_after_refreshes(only_when_idle: bool) -> Duration {
+        let t0 = Instant::now();
+        let mut link = SimLink::new(1_000_000.0, Duration::from_millis(160), t0);
+        let mut l = Link::default();
+        let mut id = 0;
+        let mut now = t0;
+        while now < t0 + Duration::from_secs(2) {
+            l.drained(link.outstanding(now), now);
+            if !only_when_idle || !l.busy() {
+                link.send(20_000, now);
+                l.sent(0, id, 20_000, now);
+                id += 1;
+            }
+            now += Duration::from_millis(83);
+        }
+        link.send(6_000, now) - now
+    }
+
+    #[test]
+    fn refreshes_wait_for_an_idle_link() {
+        // Back to back, refreshes queue (1.9 Mbps into 1 Mbps) and the change waits behind
+        // them; one at a time, it waits for one at most.
+        assert!(change_after_refreshes(false) > Duration::from_millis(1500));
+        assert!(change_after_refreshes(true) < Duration::from_millis(350));
+    }
+
     #[test]
     fn a_frame_is_gone_once_its_last_byte_has_left() {
         let t0 = Instant::now();
@@ -463,15 +504,15 @@ pub(crate) mod tests {
         let mut l = Link::default();
         let mut v = Viewer::new();
         for id in 0..3 {
-            l.sent(3, id, 1_000, t0);
+            l.sent(1, id, 1_000, t0);
         }
         assert!(v.update(&mut l, t0 + ms(10)));
-        assert!(held(3));
+        assert!(held(1));
         // A hidden tab: these will never be confirmed, and it isn't the link's doing.
         l.forget();
         assert!(!l.busy());
         assert!(!v.update(&mut l, t0 + ms(20)));
-        assert!(!held(3));
+        assert!(!held(1));
     }
 
     #[test]
@@ -482,6 +523,7 @@ pub(crate) mod tests {
         l.sent(2, 0, 1_000, t0);
         assert!(v.update(&mut l, t0 + Duration::from_millis(500)));
         assert!(held(2), "full: its stream is held");
+        assert!(!idle(2) && idle(3));
         assert!(!v.update(&mut l, t0 + Duration::from_secs(5)));
         assert!(!held(2), "stuck: released");
         // Still stalled while frames pile up; caught up, it counts again.
@@ -494,5 +536,6 @@ pub(crate) mod tests {
         assert!(v.update(&mut l, t0 + Duration::from_millis(7700)));
         drop(v);
         assert!(!held(2), "gone: released");
+        assert!(idle(2));
     }
 }

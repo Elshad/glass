@@ -54,20 +54,27 @@ pub struct FrameState {
     /// The newest image was skipped (by the frame-rate ceiling, or held while a viewer's
     /// link is full) and still needs sending.
     unsent: std::sync::atomic::AtomicBool,
-    /// Idle refreshes done since the screen went still, and how many came out tiny.
+    /// Idle refreshes done since the screen went still, how many came out tiny, and the
+    /// bytes they took.
     refreshes: std::sync::atomic::AtomicU32,
     tiny: std::sync::atomic::AtomicU32,
+    refresh_bytes: std::sync::atomic::AtomicU64,
+    /// When the picture last changed (capture time of the last real frame encoded).
+    changed_us: std::sync::atomic::AtomicU64,
     queue: dispatch2::DispatchRetained<DispatchQueue>,
     /// ScreenCaptureKit ended the stream (e.g. its display slept); it won't resume by itself.
     stopped: std::sync::atomic::AtomicBool,
 }
 
 /// A still screen is re-encoded this often for a while, so it sharpens to near-lossless
-/// after motion (each pass refines the previous one).
+/// after motion (each pass refines the previous one). How many, and how many bytes they
+/// may take, follows the bitrate (rate::refresh_budget); they stop after 3 tiny outputs
+/// (already sharp), and wait while a frame is still on its way to a viewer (crate::flow),
+/// so a refinement never queues ahead of the next real change.
 const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(83);
-/// At most this many refreshes (3 s), and stop after 3 tiny outputs (already sharp).
-const MAX_REFRESHES: u32 = 36;
 const TINY_FRAME: u64 = 1024;
+/// Refining starts once the picture has been still this long (voxl waits 150 ms too).
+const STILL_FOR_US: u64 = 150_000;
 
 impl FrameState {
     /// `refresh`: the image was encoded before (only refining it), not a new one.
@@ -78,6 +85,9 @@ impl FrameState {
         let now = now_us();
         self.last_encoded_us
             .store(now, std::sync::atomic::Ordering::Relaxed);
+        if !refresh {
+            self.changed_us.store(now, std::sync::atomic::Ordering::Relaxed);
+        }
         self.encoder
             .encode(&image, unsafe { CMTime::new(now as i64, 1_000_000) }, now, refresh);
     }
@@ -116,14 +126,31 @@ impl FrameState {
             if state.unsent.swap(false, Relaxed) {
                 state.encode_last(false);
             } else {
-                if state.encoder.last_frame_size() < TINY_FRAME {
-                    state.tiny.fetch_add(1, Relaxed);
-                }
-                if state.refreshes.fetch_add(1, Relaxed) >= MAX_REFRESHES
-                    || state.tiny.load(Relaxed) >= 3
-                {
+                // Not yet still for long enough, or a frame is still on its way: later.
+                let still = now_us().saturating_sub(state.changed_us.load(Relaxed));
+                if still < STILL_FOR_US {
+                    state.schedule_check(std::time::Duration::from_micros(STILL_FOR_US - still));
                     return;
                 }
+                if !crate::flow::idle(state.stream) {
+                    state.schedule_check(crate::flow::POLL);
+                    return;
+                }
+                let done = state.refreshes.load(Relaxed);
+                if done > 0 {
+                    // The last refresh has come out by now: count it.
+                    let size = state.encoder.last_frame_size();
+                    state.refresh_bytes.fetch_add(size, Relaxed);
+                    if size < TINY_FRAME {
+                        state.tiny.fetch_add(1, Relaxed);
+                    }
+                }
+                let fps = state.fps_cap.load(Relaxed);
+                let (count, bytes) = crate::rate::refresh_budget(state.encoder.bitrate(), fps);
+                if done >= count || state.refresh_bytes.load(Relaxed) >= bytes || state.tiny.load(Relaxed) >= 3 {
+                    return;
+                }
+                state.refreshes.fetch_add(1, Relaxed);
                 state.encode_last(true);
             }
             state.schedule_idle_check();
@@ -196,6 +223,7 @@ define_class!(
             state.generation.fetch_add(1, Relaxed);
             state.refreshes.store(0, Relaxed);
             state.tiny.store(0, Relaxed);
+            state.refresh_bytes.store(0, Relaxed);
             // Over the frame-rate ceiling, or a viewer's link is full: keep the image, and
             // send it later if it's the last (a held one goes as soon as there's room).
             let fps = state.fps_cap.load(Relaxed);
@@ -207,6 +235,7 @@ define_class!(
             } else {
                 state.unsent.store(false, Relaxed);
                 state.last_encoded_us.store(capture_us, Relaxed);
+                state.changed_us.store(capture_us, Relaxed);
                 state.encoder.encode(&image, pts, capture_us, false);
             }
             *state.last.lock().unwrap() = LastFrame(Some(image), capture_us);
@@ -882,6 +911,8 @@ pub fn start(
         unsent: Default::default(),
         refreshes: Default::default(),
         tiny: Default::default(),
+        refresh_bytes: Default::default(),
+        changed_us: Default::default(),
         queue: queue.clone(),
         stopped: Default::default(),
     });
