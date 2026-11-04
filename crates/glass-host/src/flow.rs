@@ -32,6 +32,9 @@ const STUCK: Duration = Duration::from_secs(4);
 /// viewer even if what's "in flight" can't be confirmed (an acknowledgement or a last frame
 /// lost with nothing after it to show it, a decoder sitting on its last frame).
 const MAX_HOLD: Duration = Duration::from_millis(750);
+/// A frame unconfirmed this long no longer keeps the link from counting as idle: a refresh
+/// is what would show its loss (or get a decoder to give up its last frame).
+const IDLE_AFTER: Duration = Duration::from_secs(1);
 /// The least round trip seen over this long is the link's own (the rest is queue).
 const BASE_WINDOW: Duration = Duration::from_secs(10);
 /// Frame interval the frame-count limit assumes (the fastest common rate).
@@ -213,6 +216,14 @@ impl Link {
         self.inflight.len() >= max_frames || age.as_secs_f64() * 1000.0 > rtt + SLACK_MS || too_many_bytes
     }
 
+    /// The streams with a frame on its way lately, as a bit mask.
+    fn recent_streams(&self, now: Instant) -> u8 {
+        self.inflight
+            .iter()
+            .filter(|f| now.saturating_duration_since(f.at) < IDLE_AFTER)
+            .fold(0, |m, f| m | 1 << (f.stream as usize).min(MAX_STREAMS - 1))
+    }
+
     /// The streams with frames in flight, as a bit mask.
     fn streams(&self) -> u8 {
         self.inflight.iter().fold(0, |m, f| m | 1 << (f.stream as usize).min(MAX_STREAMS - 1))
@@ -242,8 +253,7 @@ impl Viewer {
     /// Re-evaluates `link` and publishes the result if it changed. Returns whether it's full.
     pub fn update(&mut self, link: &mut Link, now: Instant) -> bool {
         let full = link.full(now);
-        let busy = link.streams();
-        let state = (if full { busy } else { 0 }, busy);
+        let state = (if full { link.streams() } else { 0 }, link.recent_streams(now));
         if state != self.state {
             self.state = state;
             publish(self.id, state);
@@ -495,6 +505,17 @@ pub(crate) mod tests {
         // ...and then it's held again.
         l.sent(0, 1, 1_000, t0 + ms(750));
         assert!(l.full(t0 + ms(1000)));
+    }
+
+    #[test]
+    fn a_frame_never_confirmed_doesnt_block_refreshes_for_long() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut l = Link::default();
+        l.sent(0, 0, 1_000, t0);
+        assert_eq!(l.recent_streams(t0 + ms(999)), 1);
+        assert_eq!(l.recent_streams(t0 + ms(1000)), 0);
+        assert!(l.busy(), "still tracked, in case it's confirmed");
     }
 
     #[test]
