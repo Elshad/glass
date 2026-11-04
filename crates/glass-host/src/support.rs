@@ -107,6 +107,27 @@ pub struct Session {
     pub http_port: u16,
     /// Why there's no code, if there isn't.
     pub code_error: Option<String>,
+    /// Set when the session goes through Glass's own background service instead of a host
+    /// of its own (see [`Session::start_via_service`]).
+    service: Option<Service>,
+    /// `dir` is the session's own temporary config, deleted when it stops. False on the
+    /// service, where `dir` is the service's real config: never deleted, however many
+    /// times `stop` runs (it runs again on drop).
+    owns_dir: bool,
+}
+
+/// A session riding on the running background service: what to undo when it ends.
+struct Service {
+    /// The codes of the links made for the helper (one per code handed out).
+    links: Vec<String>,
+    /// Remote access was off before, so it goes off again.
+    remote_was_off: bool,
+}
+
+/// Glass's background service is running here, for this user. Called before
+/// GLASS_CONFIG_DIR is pointed at a session's own directory.
+pub fn service_running() -> bool {
+    crate::status::read().is_some_and(|s| s.is_fresh()) && crate::ipc::call(&crate::ipc::Request::Viewers).is_ok()
 }
 
 impl Session {
@@ -137,10 +158,46 @@ impl Session {
             url: String::new(),
             http_port,
             code_error: None,
+            service: None,
+            owns_dir: true,
         };
         session.runner = Some(spawn_host(&dir, http_port, wt_port, test)?);
         session.wait_for_host()?;
-        session.url = new_link(&key)?;
+        session.url = new_link(&key)?.0;
+        session.register();
+        Ok(session)
+    }
+
+    /// Quick support through the background service that's already running, instead of a
+    /// second host: two processes capturing the same screen interrupt each other's
+    /// ScreenCaptureKit streams (seen on macOS: whichever started first stops delivering
+    /// frames). The helper gets the same asking, one-time link, on the service; stopping
+    /// revokes the code, the link and the passes it let in, and nothing else, so the
+    /// owner's own devices stay connected.
+    pub fn start_via_service() -> Result<Self> {
+        let policy = crate::policy::load();
+        policy.require("support")?;
+        policy.require("remote")?;
+        let remote_was_off = !crate::remote::enabled();
+        crate::remote::set_enabled(true)?;
+        let key = crate::remote::HostKey::load_or_create()?;
+        let http_port = crate::status::read()
+            .and_then(|s| s.url)
+            .and_then(|u| u.rsplit_once(':').and_then(|(_, p)| p.trim_end_matches('/').parse().ok()))
+            .unwrap_or(0);
+        let (url, code) = new_link(&key)?;
+        let mut session = Self {
+            dir: crate::config_dir(),
+            runner: None,
+            base: crate::remote::base().trim_end_matches('/').to_string(),
+            code: None,
+            cancel: None,
+            url,
+            http_port,
+            code_error: None,
+            service: Some(Service { links: vec![code], remote_was_off }),
+            owns_dir: false,
+        };
         session.register();
         Ok(session)
     }
@@ -180,7 +237,11 @@ impl Session {
     /// A new code (and link), say after the first was used or mistyped too often.
     pub fn new_code(&mut self) -> Result<()> {
         self.revoke_code();
-        self.url = new_link(&crate::remote::HostKey::load_or_create()?)?;
+        let (url, code) = new_link(&crate::remote::HostKey::load_or_create()?)?;
+        self.url = url;
+        if let Some(service) = &mut self.service {
+            service.links.push(code);
+        }
         self.register();
         Ok(())
     }
@@ -217,6 +278,15 @@ impl Session {
 
     /// Ends the helper's session (they can ask again with a new code).
     pub fn end_sessions(&self) -> Result<()> {
+        // On the service, only the helper goes: its passes end, and the guest check closes
+        // its connection within seconds. Everyone else stays.
+        if let Some(service) = &self.service {
+            let file = crate::access::file_for(&crate::default_token_file());
+            for code in &service.links {
+                crate::access::revoke_link(&file, code, false)?;
+            }
+            return Ok(());
+        }
         crate::ipc::call(&crate::ipc::Request::Disconnect { id: None })?;
         Ok(())
     }
@@ -224,6 +294,19 @@ impl Session {
     /// Ends everything: the code, the host, and the session's files.
     pub fn stop(&mut self) {
         self.revoke_code();
+        if let Some(service) = self.service.take() {
+            // The service's own config: undo what the session added, never delete it.
+            let file = crate::access::file_for(&crate::default_token_file());
+            for code in &service.links {
+                if let Err(e) = crate::access::revoke_link(&file, code, true) {
+                    tracing::warn!("support: couldn't revoke the helper's link: {e:#}");
+                }
+            }
+            if service.remote_was_off {
+                let _ = crate::remote::set_enabled(false);
+            }
+            return;
+        }
         match self.runner.take() {
             Some(Runner::Child(mut c)) => {
                 // A moment to stop on its own. Windows has no SIGTERM to ask with, and the
@@ -253,7 +336,9 @@ impl Session {
             }
             None => {}
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if self.owns_dir {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -281,10 +366,11 @@ fn free_port(udp: bool) -> Result<u16> {
 
 /// A link for the helper: works once, within the hour, from anywhere; the person is asked
 /// before it lets anyone in.
-fn new_link(key: &crate::remote::HostKey) -> Result<String> {
+/// Returns the URL and the link's code (to revoke it later).
+fn new_link(key: &crate::remote::HostKey) -> Result<(String, String)> {
     let scope = crate::access::Scope { ask: true, ..Default::default() };
     let link = crate::access::create_link_for(&crate::access::file_for(&crate::default_token_file()), CODE_TTL, GRANT, scope)?;
-    Ok(crate::remote::link_url(key, &link.code))
+    Ok((crate::remote::link_url(key, &link.code), link.code))
 }
 
 fn agent() -> ureq::Agent {
@@ -540,5 +626,36 @@ mod tests {
         assert!(p.contains("<string>/tmp/a b/glass</string><string>--http-port</string>"));
         assert!(p.contains("<key>GLASS_CONFIG_DIR</key><string>/tmp/x&amp;y</string>"));
         assert!(p.contains("<key>KeepAlive</key><false/>"));
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    /// Stopping a session on the background service, even twice (explicitly, then on
+    /// drop), must never delete the service's config: it once did, wiping ~/.config/glass.
+    #[test]
+    fn stopping_a_service_session_keeps_the_services_config() {
+        let dir = std::env::temp_dir().join(format!("glass-support-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("token"), "keep me").unwrap();
+        let mut session = Session {
+            dir: dir.clone(),
+            runner: None,
+            base: String::new(),
+            code: None,
+            cancel: None,
+            url: String::new(),
+            http_port: 0,
+            code_error: None,
+            service: Some(Service { links: vec![], remote_was_off: false }),
+            owns_dir: false,
+        };
+        session.stop();
+        session.stop();
+        drop(session);
+        assert!(dir.join("token").exists(), "the service's config was deleted");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

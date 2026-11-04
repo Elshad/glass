@@ -156,6 +156,10 @@ struct Pass {
     /// deprovisioning that account (SCIM) revokes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     account: Option<String>,
+    /// The link that let it in (its hash), so ending quick support revokes exactly the
+    /// helper's passes ([`revoke_link`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link: Option<String>,
 }
 
 /// A WebAuthn credential (ES256) bound to a guest pass.
@@ -273,6 +277,7 @@ pub fn grant_pass_for(
             device: device.to_string(),
             passkey: None,
             account: account.map(|a| a.to_ascii_lowercase()),
+            link: None,
         });
     })?;
     Ok(Granted {
@@ -341,6 +346,7 @@ pub fn redeem_link(path: &Path, code: &str, device: &str, ip: std::net::IpAddr) 
             }
         };
         let scope = link.scope;
+        let from = link.hash.clone();
         store.passes.push(Pass {
             hash: fingerprint(&pass),
             expires,
@@ -349,6 +355,7 @@ pub fn redeem_link(path: &Path, code: &str, device: &str, ip: std::net::IpAddr) 
             device: device.to_string(),
             passkey: None,
             account: None,
+            link: Some(from),
         });
         granted = Some(Granted {
             pass: pass.clone(),
@@ -452,6 +459,23 @@ pub fn revoke(path: &Path, id: &str) -> Result<bool> {
         if let [i] = matches[..] {
             store.passes.remove(i);
             removed = true;
+        }
+    })?;
+    Ok(removed)
+}
+
+/// Removes the passes the link with this code let in, and with `and_link` the link itself
+/// (so nobody else can open it); returns how many passes went. Their sessions end at the
+/// next guest check.
+pub fn revoke_link(path: &Path, code: &str, and_link: bool) -> Result<usize> {
+    let hash = fingerprint(code);
+    let mut removed = 0;
+    update(path, |store| {
+        let before = store.passes.len();
+        store.passes.retain(|p| p.link.as_deref() != Some(hash.as_str()));
+        removed = before - store.passes.len();
+        if and_link {
+            store.links.retain(|l| l.hash != hash);
         }
     })?;
     Ok(removed)
@@ -592,6 +616,28 @@ mod tests {
         }
         assert_eq!(revoke_all(&path).unwrap(), 1);
         assert!(pass_expiry(&path, &granted.pass).is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn revoking_a_link_takes_only_its_own_passes() {
+        let path = temp().with_file_name("by-link.json");
+        let helper = create_link_for(&path, Duration::from_secs(3600), Duration::from_secs(3600), Scope { ask: true, ..Scope::default() }).unwrap();
+        let mine = create_link(&path, Duration::from_secs(3600), Scope::default()).unwrap();
+        let h = redeem_link(&path, &helper.code, "Chrome on Linux", ip()).unwrap().unwrap();
+        // The same device again (another browser): a second pass from the same link.
+        let h2 = redeem_link(&path, &helper.code, "Firefox on Linux", ip()).unwrap().unwrap();
+        let m = redeem_link(&path, &mine.code, "Safari on iPhone", ip()).unwrap().unwrap();
+
+        // Ending the helper's sessions keeps the link (they can come back on it)...
+        assert_eq!(revoke_link(&path, &helper.code, false).unwrap(), 2);
+        assert!(pass_expiry(&path, &h.pass).is_none());
+        assert!(pass_expiry(&path, &h2.pass).is_none());
+        assert!(pass_expiry(&path, &m.pass).is_some(), "other links' passes stay");
+        // ...ending support removes it too.
+        assert_eq!(revoke_link(&path, &helper.code, true).unwrap(), 0);
+        assert!(redeem_link(&path, &helper.code, "Chrome on Linux", ip()).unwrap().is_none());
+        assert!(pass_expiry(&path, &m.pass).is_some());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
