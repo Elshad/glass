@@ -9,6 +9,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 - Letting someone in after more than 10 seconds no longer leaves them with a picture but no mouse or keyboard.
 - `glass support` on a computer already running Glass shares through it, instead of starting a second copy that fought it for the screen (the picture froze in one of them). Ending support removes the helper's access and nothing else.
 - If `glass support` is closed without ending the session (killed, crashed), Glass removes the helper's access within seconds.
+- Viewers whose browser can't take WebRTC video (a Tesla's, for one) on a slow or relayed connection get a steadier picture: Glass keeps about a tenth of a second of video waiting and lowers the bitrate to what the link carries, instead of queuing most of a second and dropping frames in bursts.
 
 ## 0.13.1
 

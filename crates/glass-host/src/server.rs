@@ -2316,6 +2316,12 @@ fn apply_rate_report(shared: &Shared, report: crate::rate::Report) {
 static REMOTE_CAPS: Mutex<Option<std::collections::HashMap<u64, u32>>> = Mutex::new(None);
 static APPLIED_BPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The encoders' bitrate now (0 before it's first set): the WebRTC bridge sizes its queue
+/// by it.
+pub fn applied_bitrate() -> u32 {
+    APPLIED_BPS.load(Ordering::Relaxed)
+}
+
 /// Sets (or with `None` removes) a remote viewer's bitrate cap.
 pub fn set_remote_cap(viewer: u64, bps: Option<u32>) {
     {
