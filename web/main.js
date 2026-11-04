@@ -18,6 +18,7 @@ import { createAgent } from './agent.js';
 import { createPush } from './push.js';
 import { createDevice } from './device.js';
 import { createFiles } from './files.js';
+import { createCursor } from './cursor.js';
 
 // Shortcuts iPadOS keeps for itself (no web page or app can capture them), sent as one tap.
 const CMD = K.MetaLeft;
@@ -307,7 +308,16 @@ const input = attachInput({
     annotator.invalidate();
     document.getElementById('zoom-pill').classList.toggle('hidden', s === 1);
     document.getElementById('zoom-level').textContent = `${s.toFixed(1)}×`;
+    cursor.refresh();
   },
+  onResize: () => cursor.refresh(),
+});
+// The host's pointer, drawn here rather than in the video (where the host supports it).
+const cursor = createCursor({
+  screens,
+  overlay: document.getElementById('remote-cursor'),
+  contentRect: (el) => input.contentRect(el),
+  onWanted: (on) => worker.postMessage({ type: 'localCursor', on }),
 });
 document.getElementById('zoom-reset').addEventListener('click', () => input.resetZoom());
 let micContext;
@@ -692,6 +702,9 @@ const transfers = new Map(); // id -> toast
 
 worker.onmessage = ({ data }) => {
   switch (data.type) {
+    case 'cursor':
+      cursor.setPosition(data.pos);
+      break;
     case 'connected':
       reloadIfUpdated('reconnect');
       if (rtpVideo) checkRtpVideoArrives();
@@ -770,6 +783,8 @@ function onControl(msg) {
   switch (msg.t) {
     case 'welcome':
       thumbs.setConnected(true);
+      cursor.reset();
+      cursor.setHostSupports(Boolean(msg.features?.cursor));
       agent.reset();
       agent.setOwner(Boolean(msg.perms ? msg.perms.owner : !msg.guest));
       machineFailures = 0;
@@ -853,6 +868,9 @@ function onControl(msg) {
       // A reload or reconnect: the host put the displays back when the session ended.
       if (resolutionMode.startsWith('fit:') && !guest) sendFit();
       log('info', 'welcome', { displays: displays.length, streams: msg.streams.map((d) => d.id), audio: msg.audio });
+      break;
+    case 'cursor':
+      cursor.setShape(msg);
       break;
     case 'layout':
       // The host's current displays (a fit adds a virtual one and hides the one it mirrors).
@@ -1266,6 +1284,7 @@ function onLayout(streams) {
   annotator.invalidate();
   input.setStreams(streams);
   input.refreshCursor();
+  cursor.setStreams(streams);
   for (const d of streams) if (!streamedWindows.has(d.id) && !displays.some((x) => x.id === d.id)) displays.push(d);
   // The host orders streams as arranged in macOS; lay them out the same way.
   screens.dataset.arrange = arrangement(streams);
@@ -1679,6 +1698,8 @@ let trackpadOn = touchScreen && (storage((s) => s.getItem(TRACKPAD_KEY)) ?? (pho
 function setTrackpad(on, chosen = false) {
   trackpadOn = on;
   input.setTrackpad(on);
+  // Trackpad mode draws its own pointer (#tp-cursor): the host's goes back in the video.
+  cursor.setWanted(!on);
   ui.setTrackpad({ available: touchScreen, on });
   if (!chosen) return;
   storage((s) => s.setItem(TRACKPAD_KEY, on ? '1' : '0'));

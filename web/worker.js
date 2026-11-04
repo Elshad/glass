@@ -2,8 +2,7 @@
 // so none of the video path touches the main thread.
 
 import {
-  AUDIO_HEADER_LEN, KIND_AUDIO, KIND_AUDIO_OPUS, KIND_KEYFRAME_REQUEST, KIND_PONG, KIND_VIDEO,
-  micPacket, ping, readAudioHeader, readPong, readVideoHeader,
+  AUDIO_HEADER_LEN, KIND_AUDIO, KIND_AUDIO_OPUS, KIND_KEYFRAME_REQUEST, KIND_PONG, KIND_VIDEO, micPacket, ping, readAudioHeader, readPong, readVideoHeader, KIND_CURSOR, readCursor,
 } from './proto.js';
 import { VideoStream, probeCodecs, probeDecoders, setDecoderStep } from './video-stream.js';
 import { RtcTransport } from './rtc-transport.js';
@@ -35,6 +34,8 @@ let rtcPort; // remote access: WebRTC over the main thread instead of WebTranspo
 let link; // magic link code; traded for a guest pass on first sign-in
 let pass; // guest pass
 let wideColor = false; // the screen shows Display P3: draw video in it
+// This viewer draws the host's pointer itself (cursor.js), offered in hello.
+let localCursor = false;
 let codecs = ['h264']; // what this browser decodes, offered in hello (HEVC if hardware, Opus)
 let rejected = false;
 let controlWriter;
@@ -82,6 +83,7 @@ function videoStream(index) {
 self.onmessage = async ({ data }) => {
   if (data.type === 'init') {
     ({ url, certHash, token, link, pass, rtcPort, device } = data);
+    localCursor = Boolean(data.localCursor);
     wideColor = Boolean(data.wideColor);
     setDecoderStep(data.decoderStep ?? 0);
     await probeDecoders(log);
@@ -101,6 +103,10 @@ self.onmessage = async ({ data }) => {
     inputWriter?.write(data.bytes).catch(() => {});
   } else if (data.type === 'control') {
     sendControl(data.msg);
+  } else if (data.type === 'localCursor') {
+    if (localCursor === data.on) return;
+    localCursor = data.on;
+    sendControl({ t: 'localCursor', on: localCursor });
   } else if (data.type === 'sendFile') {
     sendFile(data.file, data.dir).catch((e) => log('error', `send file failed: ${e.message ?? e}`));
   } else if (data.type === 'sendClipboard') {
@@ -233,7 +239,7 @@ async function connect() {
   // Control stream first: the host ignores everything else until hello is accepted.
   const control = await transport.createBidirectionalStream();
   controlWriter = control.writable.getWriter();
-  sendControl({ t: 'hello', token, link, pass, device, codecs, ua: navigator.userAgent });
+  sendControl({ t: 'hello', token, link, pass, device, codecs, ua: navigator.userAgent, cursor: localCursor });
   if (audioOn) sendControl({ t: 'audio', on: true });
   if (micOn) sendControl({ t: 'mic', on: true });
   if (!visible) sendControl({ t: 'video', on: false });
@@ -271,6 +277,7 @@ async function connect() {
     else if (kind === KIND_AUDIO) onAudio(view, value);
     else if (kind === KIND_AUDIO_OPUS) onOpus(view, value);
     else if (kind === KIND_PONG) onPong(view);
+    else if (kind === KIND_CURSOR && value.byteLength >= 16) self.postMessage({ type: 'cursor', pos: readCursor(view) });
   }
 }
 

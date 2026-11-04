@@ -7,6 +7,7 @@ pub mod ax;
 pub mod capture;
 pub mod clipboard;
 pub mod clock;
+pub mod cursor;
 pub mod encode;
 pub mod front;
 pub mod input;

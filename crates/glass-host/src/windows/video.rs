@@ -1,5 +1,6 @@
 //! Captures each display with DXGI Desktop Duplication (one thread per display), draws the
-//! pointer in (duplication leaves it out), and encodes each on its own thread: on the GPU
+//! pointer in (duplication leaves it out; viewers that draw their own go without, see
+//! `crate::cursor`), and encodes each on its own thread: on the GPU
 //! through Media Foundation where there's a hardware encoder, else with OpenH264. A single
 //! window is streamed by cropping its display's picture to it each frame (so it has to be
 //! on screen; what's in front of it shows). Coordinates are physical pixels: the process
@@ -191,6 +192,13 @@ struct Pointer {
 
 static POINTER: Mutex<Pointer> = Mutex::new(Pointer { shape: None });
 
+/// Draw the pointer into the picture (`crate::cursor` decides). The secure-desktop helper
+/// is its own process and never hears otherwise: it always does.
+static CURSOR_BAKED: AtomicBool = AtomicBool::new(true);
+/// When the pointer last went back into the picture: pictures from before then (an
+/// agent's screenshot) don't have it.
+static BAKED_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
 struct PointerShape {
     kind: u32,
     width: usize,
@@ -270,6 +278,8 @@ struct Duplicator {
     pointer: Option<(i32, i32)>,
     /// The staging copy holds a desktop image (not just a pointer move) yet.
     has_image: bool,
+    /// Whether the picture last sent has the pointer in it.
+    sent_pointer: bool,
 }
 
 impl Duplicator {
@@ -315,6 +325,7 @@ impl Duplicator {
                 sent: None,
                 pointer: None,
                 has_image: false,
+                sent_pointer: true,
             })
         }
     }
@@ -333,9 +344,10 @@ impl Duplicator {
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                     // Nothing new on screen, but what's sent may have to change: another
                     // window (or the whole display again), or a resized window settling.
+                    // Or the pointer went in or out of the picture.
                     let crop = self.crop(window);
                     if self.has_image
-                        && crop != self.sent
+                        && (crop != self.sent || self.sent_pointer != CURSOR_BAKED.load(Ordering::Relaxed))
                         && let Some(crop) = crop
                     {
                         self.copy_out(tx, now_us(), crop)?;
@@ -375,6 +387,7 @@ impl Duplicator {
     /// into the staging texture. Whether anything visible changed.
     unsafe fn take(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO, resource: Option<IDXGIResource>) -> windows::core::Result<bool> {
         let mut changed = false;
+        let baked = CURSOR_BAKED.load(Ordering::Relaxed);
         if info.PointerShapeBufferSize > 0 {
             let mut data = vec![0u8; info.PointerShapeBufferSize as usize];
             let (mut needed, mut shape) = (0u32, DXGI_OUTDUPL_POINTER_SHAPE_INFO::default());
@@ -387,12 +400,13 @@ impl Duplicator {
                 pitch: shape.Pitch as usize,
                 data,
             }));
-            changed = true;
+            changed = baked;
         }
         if info.LastMouseUpdateTime != 0 {
             let p = info.PointerPosition;
             let at = p.Visible.as_bool().then_some((p.Position.x, p.Position.y));
-            changed |= at != self.pointer;
+            // Without the pointer in the picture, moving it changes nothing to encode.
+            changed |= baked && at != self.pointer;
             self.pointer = at;
         }
         if info.LastPresentTime != 0
@@ -451,8 +465,11 @@ impl Duplicator {
         unsafe { self.context.Unmap(staging, 0) };
         // Duplication gives the pointer's position and shape the way the desktop is seen
         // (upright), so it's drawn after turning the picture.
+        self.sent_pointer = CURSOR_BAKED.load(Ordering::Relaxed);
         let shape = POINTER.lock().unwrap().shape.clone();
-        if let (Some((x, y)), Some(shape)) = (self.pointer, shape) {
+        if self.sent_pointer
+            && let (Some((x, y)), Some(shape)) = (self.pointer, shape)
+        {
             draw_pointer(&mut pixels, width, height, width * 4, &shape, x - crop.x as i32, y - crop.y as i32);
         }
         tx.0.put(
@@ -1089,9 +1106,20 @@ impl VideoSource for Video {
             let monitors = self.monitors.lock().unwrap();
             let m = monitors.as_ref()?.get(id as usize).filter(|m| m.present.load(Ordering::Relaxed))?;
             let thumb = m.thumb.lock().unwrap();
-            thumb.as_ref()?.1.clone()
+            let (at, frame) = thumb.as_ref()?;
+            // An agent's screenshot wants the pointer: wait for a picture with it in.
+            if BAKED_SINCE.lock().unwrap().is_some_and(|since| *at < since) {
+                return None;
+            }
+            frame.clone()
         };
         crate::thumbs::downscale(&frame.bgra, frame.width, frame.height, frame.width * 4, false, max)
+    }
+    fn set_cursor_baked(&self, on: bool) {
+        if CURSOR_BAKED.swap(on, Ordering::Relaxed) != on {
+            // The capture loops send a picture with (or without) it on their next pass.
+            *BAKED_SINCE.lock().unwrap() = on.then(Instant::now);
+        }
     }
     fn frame_generation(&self, stream: u8) -> Option<u64> {
         let monitors = self.monitors.lock().unwrap();

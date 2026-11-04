@@ -11,6 +11,7 @@ mod approval;
 mod browse;
 mod codec;
 mod connlog;
+mod cursor;
 mod elements;
 mod control;
 mod files;

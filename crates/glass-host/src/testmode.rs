@@ -485,6 +485,7 @@ impl InputSink for FakeInput {
     fn handle(&mut self, ev: InputEvent) {
         let json = match ev {
             InputEvent::MouseMove { x, y, stream } => {
+                *POINTER.lock().unwrap() = Some(PointerAt::Stream(stream, x, y));
                 serde_json::json!({"t": "move", "x": x, "y": y, "stream": stream})
             }
             InputEvent::MouseDown { button } => serde_json::json!({"t": "down", "button": button}),
@@ -516,12 +517,51 @@ impl InputSink for FakeInput {
     fn set_displays(&mut self, _displays: &[u32]) {}
 
     fn move_on_display(&mut self, display: u32, x: f32, y: f32) {
+        *POINTER.lock().unwrap() = Some(PointerAt::Display(display, x, y));
         INPUT.lock().unwrap().events.push(serde_json::json!({"t": "move", "x": x, "y": y, "display": display}));
     }
 
     fn type_text(&mut self, text: &str) -> bool {
         INPUT.lock().unwrap().events.push(serde_json::json!({"t": "text", "text": text}));
         true
+    }
+}
+
+// ---- Pointer: wherever input last put it, as an 8×8 square ----
+
+#[derive(Clone, Copy, PartialEq)]
+enum PointerAt {
+    Stream(u8, f32, f32),
+    Display(u32, f32, f32),
+}
+
+static POINTER: Mutex<Option<PointerAt>> = Mutex::new(None);
+
+#[derive(Default)]
+pub struct CursorPoller {
+    shown: bool,
+}
+
+impl crate::cursor::Poll for CursorPoller {
+    fn poll(&mut self, shared: &crate::server::Shared) -> Option<crate::cursor::Sample> {
+        let at = (*POINTER.lock().unwrap())?;
+        let (d, x, y) = match at {
+            PointerAt::Stream(s, x, y) => (shared.video.streams().get(s as usize).cloned()?, x, y),
+            PointerAt::Display(id, x, y) => (shared.video.displays().ok()?.into_iter().find(|d| d.id == id)?, x, y),
+        };
+        let image = (!std::mem::replace(&mut self.shown, true)).then(|| crate::cursor::Image {
+            width: 8,
+            height: 8,
+            hot_x: 0,
+            hot_y: 0,
+            scale: 1.0,
+            rgba: [0, 0, 0, 255].repeat(64),
+        });
+        Some(crate::cursor::Sample {
+            at: (d.x + x as f64 * d.points_width, d.y + y as f64 * d.points_height),
+            visible: true,
+            image,
+        })
     }
 }
 

@@ -7,6 +7,11 @@ export const KIND_KEYFRAME_REQUEST = 4;
 export const KIND_AUDIO = 5;
 export const KIND_MIC = 6;
 export const KIND_AUDIO_OPUS = 7; // system audio as one Opus packet, same header as KIND_AUDIO
+export const KIND_CURSOR = 9;
+export const CURSOR_VISIBLE = 1;
+export const CURSOR_YOURS = 2;
+export const CURSOR_BAKED = 4;
+export const CURSOR_OFF_STREAM = 0xff;
 export const AUDIO_HEADER_LEN = 16;
 export const FLAG_KEYFRAME = 1;
 export const FLAG_HEVC = 2;
@@ -53,6 +58,17 @@ export function readVideoHeader(view) {
     checksum: view.getUint16(6, true),
     frameId: view.getUint32(8, true),
     captureUs: Number(view.getBigUint64(12, true)),
+  };
+}
+
+/** Where the host's pointer is (glass_proto::CursorPos): x, y 0..1 of `stream`. */
+export function readCursor(view) {
+  return {
+    stream: view.getUint8(1),
+    flags: view.getUint8(2),
+    shape: view.getUint32(4, true),
+    x: view.getFloat32(8, true),
+    y: view.getFloat32(12, true),
   };
 }
 

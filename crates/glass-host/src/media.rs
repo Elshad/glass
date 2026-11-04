@@ -116,6 +116,8 @@ pub trait VideoSource: Send + Sync {
     }
     /// Capture in full colour (BGRA), so `raw_frame` has pictures to send losslessly.
     fn set_full_colour(&self, _on: bool) {}
+    /// Draw the pointer into the picture (`crate::cursor` decides), or leave it out.
+    fn set_cursor_baked(&self, _on: bool) {}
     /// Can this source provide raw frames at all?
     fn supports_lossless(&self) -> bool {
         false

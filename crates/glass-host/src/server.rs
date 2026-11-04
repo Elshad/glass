@@ -103,6 +103,7 @@ pub async fn run(
     };
     info!("WebTransport listening on {wt_where} udp/{wt_port}");
     crate::remote::watch(wt_port, listen.wt_dial());
+    crate::cursor::start(shared.clone());
     // Fleet's scripts and the microphone belong to a signed-in user, not the sign-in screen.
     if !crate::signin::active() {
         crate::fleet::watch();
@@ -373,6 +374,11 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let video_on = Arc::new(AtomicBool::new(true));
     let perms = Arc::new(std::sync::OnceLock::new());
     let mic_on = Arc::new(AtomicBool::new(false));
+    // Draws the pointer itself (crate::cursor): gets its position as datagrams. Who it is
+    // when it moves the pointer, to tell it whether the pointer is where its mouse is.
+    let local_cursor = Arc::new(AtomicBool::new(false));
+    let driver = crate::cursor::new_driver();
+    let mut cursor = crate::cursor::subscribe();
     let mut audio = shared.audio.subscribe();
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<ServerMsg>();
     let mut ctl_rx = Some(ctl_rx);
@@ -420,6 +426,13 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                     } else {
                         // Keep ids moving so a resumed client sees a gap and waits for a keyframe.
                         *next_id = next_id.wrapping_add(1);
+                    }
+                }
+                changed = cursor.changed(), if local_cursor.load(Ordering::Relaxed) => {
+                    // (The sender lives as long as the host.)
+                    if changed.is_ok() && authed.load(Ordering::Relaxed) && video_on.load(Ordering::Relaxed) {
+                        let pos = *cursor.borrow_and_update();
+                        conn.send_datagram(pos.datagram(driver))?;
                     }
                 }
                 packet = audio.recv() => {
@@ -472,6 +485,8 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         relayed: relayed.clone(),
                         perms: perms.clone(),
                         mic_on: mic_on.clone(),
+                        local_cursor: local_cursor.clone(),
+                        driver,
                     };
                     tokio::spawn(async move {
                         if let Err(e) = control(ctx, send, recv, rx).await {
@@ -491,6 +506,8 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         relayed: relayed.clone(),
                         perms: perms.clone(),
                         mic_on: mic_on.clone(),
+                        local_cursor: local_cursor.clone(),
+                        driver,
                     };
                     tokio::spawn(async move {
                         if let Err(e) = uni_stream(ctx, stream).await {
@@ -530,6 +547,10 @@ struct SessionCtx {
     /// What it may do, set once signed in.
     perms: Arc<std::sync::OnceLock<control::Perms>>,
     mic_on: Arc<AtomicBool>,
+    /// Draws the pointer itself (crate::cursor).
+    local_cursor: Arc<AtomicBool>,
+    /// Who this session is when it moves the pointer (`crate::cursor::moved_by`).
+    driver: u64,
 }
 
 async fn control(
@@ -560,7 +581,7 @@ async fn control(
         return Ok(());
     }
     let hello_ok = matches!(hello, Ok(Some(ClientMsg::Hello { .. })));
-    let (token, link, pass, hello_device, codecs, ua) = match hello {
+    let (token, link, pass, hello_device, codecs, ua, hello_cursor) = match hello {
         Ok(Some(ClientMsg::Hello {
             token,
             link,
@@ -568,8 +589,9 @@ async fn control(
             device,
             codecs,
             ua,
-        })) => (token, link, pass, device, codecs, ua),
-        _ => (None, None, None, None, Vec::new(), None),
+            cursor,
+        })) => (token, link, pass, device, codecs, ua, cursor),
+        _ => (None, None, None, None, Vec::new(), None, false),
     };
     let mut device = crate::viewers::clean_device(hello_device.as_deref());
     let remote = ctx.relayed.is_some();
@@ -974,6 +996,7 @@ async fn control(
         fit: cfg!(target_os = "macos") || crate::testmode::enabled(),
         support: crate::support::is_host()
             || matches!(&auth, Auth::Guest { scope, .. } if scope.support),
+        cursor: crate::cursor::active(),
     };
     // Someone other than the owner is in: worth a notification on the owner's devices.
     if !perms.owner {
@@ -1030,6 +1053,14 @@ async fn control(
         .await?;
     }
 
+    // Until it says it draws the pointer itself, this viewer needs it in the video.
+    let mut cursor_viewer = crate::cursor::Viewer::new(hello_cursor, ctx.local_cursor.clone());
+    if ctx.local_cursor.load(Ordering::Relaxed)
+        && let Some(shape) = crate::cursor::current_shape()
+    {
+        control::write_json(&mut send, &shape).await?;
+    }
+    let local_cursor = ctx.local_cursor.clone();
     let mut events = shared.events.subscribe();
     tokio::spawn(async move {
         loop {
@@ -1043,6 +1074,10 @@ async fn control(
             };
             // A link without clipboard access never sees the host's clipboard.
             if matches!(msg, ServerMsg::Clipboard { .. }) && !perms.clipboard {
+                continue;
+            }
+            // Pointer images only to viewers that draw it (they're up to 350 KB of JSON).
+            if matches!(msg, ServerMsg::Cursor { .. }) && !local_cursor.load(Ordering::Relaxed) {
                 continue;
             }
             if control::write_json(&mut send, &msg).await.is_err() {
@@ -1068,6 +1103,16 @@ async fn control(
         };
         match msg {
             ClientMsg::Hello { .. } | ClientMsg::Passkey(_) => {}
+            ClientMsg::LocalCursor { on } => {
+                let was = ctx.local_cursor.load(Ordering::Relaxed);
+                cursor_viewer.set(on);
+                if !was
+                    && ctx.local_cursor.load(Ordering::Relaxed)
+                    && let Some(shape) = crate::cursor::current_shape()
+                {
+                    let _ = ctx.ctl_tx.send(shape);
+                }
+            }
             ClientMsg::SelectDisplay { id } => set_layout(&ctx, Layout::Single(Some(id))).await?,
             ClientMsg::ShowAll => set_layout(&ctx, Layout::All).await?,
             ClientMsg::Clipboard { .. } if !perms.clipboard => {
@@ -2044,6 +2089,9 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
                         // A person clicking, typing or scrolling: agents wait for them.
                         if matches!(ev, InputEvent::MouseDown { .. } | InputEvent::KeyDown { .. } | InputEvent::Scroll { .. }) {
                             crate::computer::human_input();
+                        }
+                        if matches!(ev, InputEvent::MouseMove { .. } | InputEvent::MouseMoveBy { .. }) {
+                            crate::cursor::moved_by(ctx.driver);
                         }
                         match ev {
                             InputEvent::KeyDown { keycode } => _ = keys.insert(keycode),

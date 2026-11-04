@@ -235,6 +235,8 @@ const AGENT_HOLD: Duration = Duration::from_secs(20);
 /// Waits while paused or while a person is using the computer (just looking doesn't wait
 /// for them); refuses when stopped.
 pub(crate) async fn may_act(look: bool) -> Result<(), Refused> {
+    // Screenshots taken from the stream (Windows) need the pointer in it.
+    crate::cursor::agent_acted();
     let start = Instant::now();
     let hold = if matches!(crate::grants::current(), crate::grants::Actor::Agent(_)) { AGENT_HOLD } else { PAUSE_WAIT };
     let mut said = false;
@@ -339,6 +341,9 @@ fn inject(events: impl IntoIterator<Item = InputEvent>) -> Result<(), Refused> {
         let (x, y) = POINTER.lock().unwrap().unwrap_or((0.0, 0.0));
         check_input(Target::Point(x, y)).map_err(Refused)?;
     }
+    if events.iter().any(|e| matches!(e, InputEvent::MouseMove { .. } | InputEvent::MouseMoveBy { .. })) {
+        crate::cursor::moved_by(crate::cursor::AGENT);
+    }
     let shared = shared()?;
     let mut sink = shared.injector.lock().unwrap();
     for ev in events {
@@ -351,6 +356,7 @@ fn move_to(d: &DisplayInfo, x: f32, y: f32) -> Result<(), Refused> {
     let at = (d.x + x as f64 * d.points_width, d.y + y as f64 * d.points_height);
     crate::grants::check_input(crate::grants::Target::Point(at.0, at.1)).map_err(Refused)?;
     *POINTER.lock().unwrap() = Some(at);
+    crate::cursor::moved_by(crate::cursor::AGENT);
     shared()?.injector.lock().unwrap().move_on_display(d.id, x, y);
     Ok(())
 }

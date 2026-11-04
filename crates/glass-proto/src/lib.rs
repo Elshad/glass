@@ -9,6 +9,7 @@
 //!   client -> host  KEYFRAME_REQUEST  [kind, stream] after the client detects loss
 //!   host -> client  AUDIO  5 ms of 48 kHz s16 PCM (only to sessions that enabled audio)
 //!   host -> client  AUDIO_OPUS  one Opus packet instead, to viewers whose hello offered "opus"
+//!   host -> client  CURSOR where the pointer is (only to sessions that draw it themselves)
 //!
 //! Input travels client -> host on one reliable unidirectional stream as fixed-size
 //! [`InputEvent`] records, so a lost key-up can never leave a key stuck down. Text (IME,
@@ -25,6 +26,8 @@ pub const KIND_MIC: u8 = 6;
 /// host -> client: system audio as one Opus packet (48 kHz stereo), same 16-byte header as
 /// AUDIO, for viewers that can decode it (hello `codecs` has "opus").
 pub const KIND_AUDIO_OPUS: u8 = 7;
+/// host -> client: where the pointer is, for a viewer that draws it itself (see [`CursorPos`]).
+pub const KIND_CURSOR: u8 = 9;
 
 /// 5 ms at 48 kHz: one packet fits a datagram (16 + 240 * 2 ch * 2 B = 976 bytes).
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
@@ -197,6 +200,56 @@ pub fn fletcher16(data: &[u8]) -> u16 {
         b %= 255;
     }
     ((b << 8) | a) as u16
+}
+
+pub const CURSOR_LEN: usize = 16;
+/// The pointer is showing (apps hide it, e.g. while typing or playing video).
+pub const CURSOR_VISIBLE: u8 = 1;
+/// This viewer moved it last: its own mouse is where the pointer is.
+pub const CURSOR_YOURS: u8 = 2;
+/// The pointer is in the video for now (another viewer needs it there, or a recording):
+/// don't draw a second one.
+pub const CURSOR_BAKED: u8 = 4;
+/// `stream` when the pointer is on no display being streamed.
+pub const CURSOR_OFF_STREAM: u8 = 0xff;
+
+/// kind u8 | stream u8 | flags u8 | reserved u8 | shape u32 | x f32 | y f32
+///
+/// `x`, `y`: 0..1 of display stream `stream`. `shape`: the id of the image (sent on the
+/// control stream as `cursor`) the pointer has now.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CursorPos {
+    pub stream: u8,
+    pub flags: u8,
+    pub shape: u32,
+    pub x: f32,
+    pub y: f32,
+}
+
+impl CursorPos {
+    pub fn write(&self) -> [u8; CURSOR_LEN] {
+        let mut out = [0u8; CURSOR_LEN];
+        out[0] = KIND_CURSOR;
+        out[1] = self.stream;
+        out[2] = self.flags;
+        out[4..8].copy_from_slice(&self.shape.to_le_bytes());
+        out[8..12].copy_from_slice(&self.x.to_le_bytes());
+        out[12..16].copy_from_slice(&self.y.to_le_bytes());
+        out
+    }
+
+    pub fn read(buf: &[u8]) -> Option<Self> {
+        if buf.len() < CURSOR_LEN || buf[0] != KIND_CURSOR {
+            return None;
+        }
+        Some(Self {
+            stream: buf[1],
+            flags: buf[2],
+            shape: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            x: f32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            y: f32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        })
+    }
 }
 
 /// PING: kind u8 | pad [u8; 7] | client_ms f64
@@ -531,6 +584,16 @@ mod tests {
         // The kinds stay distinct from every other datagram's.
         let kinds = [KIND_VIDEO, KIND_PING, KIND_PONG, KIND_KEYFRAME_REQUEST, KIND_AUDIO, KIND_MIC, KIND_AUDIO_OPUS];
         assert!(kinds.iter().enumerate().all(|(i, k)| !kinds[..i].contains(k)));
+    }
+
+    #[test]
+    fn cursor_roundtrip_and_layout() {
+        let c = CursorPos { stream: 1, flags: CURSOR_VISIBLE | CURSOR_YOURS, shape: 7, x: 0.25, y: 0.5 };
+        let b = c.write();
+        // Same bytes as web/proto.js's readCursor expects (tests/unit/proto.test.mjs).
+        assert_eq!(&b[..8], &[KIND_CURSOR, 1, 3, 0, 7, 0, 0, 0]);
+        assert_eq!(CursorPos::read(&b), Some(c));
+        assert_eq!(CursorPos::read(&b[..15]), None);
     }
 
     #[test]

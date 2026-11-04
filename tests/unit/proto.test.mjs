@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  fletcher16, inputEvent, penEvent, textEvents, Input, INPUT_EVENT_LEN, MAX_TEXT_BYTES, TEXT_CHUNK, ping, readPong, readVideoHeader, KIND_PING, KIND_PONG, VIDEO_HEADER_LEN,
+  fletcher16, inputEvent, penEvent, textEvents, Input, INPUT_EVENT_LEN, MAX_TEXT_BYTES, TEXT_CHUNK, ping, readPong, readVideoHeader, KIND_PING, KIND_PONG, VIDEO_HEADER_LEN, readCursor, KIND_CURSOR, CURSOR_VISIBLE, CURSOR_YOURS,
 } from '../../web/proto.js';
 
 test('fletcher16 matches the Rust implementation', () => {
@@ -126,4 +126,14 @@ test('text events hold whole characters and put back together', () => {
   const pieces = join(textEvents(long));
   assert.ok(pieces.length >= 2 && pieces.every((p) => new TextEncoder().encode(p).length <= MAX_TEXT_BYTES));
   assert.equal(pieces.join(''), long);
+});
+
+test('cursor positions match glass_proto::CursorPos byte for byte', () => {
+  // Same bytes as the Rust test cursor_roundtrip_and_layout.
+  const b = new Uint8Array(16);
+  b.set([KIND_CURSOR, 1, CURSOR_VISIBLE | CURSOR_YOURS, 0, 7, 0, 0, 0]);
+  const v = new DataView(b.buffer);
+  v.setFloat32(8, 0.25, true);
+  v.setFloat32(12, 0.5, true);
+  assert.deepEqual(readCursor(v), { stream: 1, flags: 3, shape: 7, x: 0.25, y: 0.5 });
 });

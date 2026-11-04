@@ -42,7 +42,14 @@ pub enum ClientMsg {
         /// The browser's user agent, for device posture checks.
         #[serde(default)]
         ua: Option<String>,
+        /// The viewer draws the pointer itself (`cursor` messages, KIND_CURSOR datagrams)
+        /// rather than needing it in the video. See `crate::cursor`.
+        #[serde(default)]
+        cursor: bool,
     },
+    /// The viewer now draws the pointer itself, or (trackpad mode, which has its own) wants
+    /// it back in the video.
+    LocalCursor { on: bool },
     /// The browser's answer to a `passkey` request (WebAuthn), all fields base64url.
     Passkey(crate::passkey::Response),
     /// A chat message to the host and the other viewers.
@@ -286,6 +293,18 @@ pub enum ServerMsg {
         name: String,
         path: String,
     },
+    /// The pointer's image (to viewers drawing it themselves): `id` is what datagrams name,
+    /// `w`×`h` straight RGBA (base64) at `scale` pixels to a point, hotspot `hx`, `hy` in
+    /// pixels.
+    Cursor {
+        id: u32,
+        w: u32,
+        h: u32,
+        hx: u32,
+        hy: u32,
+        scale: f32,
+        rgba: String,
+    },
     Error {
         msg: String,
     },
@@ -348,6 +367,8 @@ pub struct Features {
     pub fit: bool,
     /// A quick-support session (`glass support`): the viewer is someone helping.
     pub support: bool,
+    /// The viewer may draw the pointer itself (`localCursor`).
+    pub cursor: bool,
 }
 
 /// Header that follows the `STREAM_FILE` tag in either direction.

@@ -39,7 +39,7 @@ const MODIFIER_KEYCODES = new Set(MODIFIER_CODES.map((c) => MAC_KEYCODES[c]));
  */
 export function attachInput({
   screens, keySink, send: sendNow, control, nextClipboard, onMacCopy = () => {}, onPaste, onLocalShortcut, swapCmdOption = false,
-  ctrlAsCmd = true, pcKeyboard = false, onZoom,
+  ctrlAsCmd = true, pcKeyboard = false, onZoom, onResize = () => {},
 }) {
   // With iPadOS set to turn the physical ⌘ key into ⌥ (so it can't claim ⌘Tab etc.),
   // swap them back here so the Mac gets the keys the user actually pressed.
@@ -80,6 +80,7 @@ export function attachInput({
   const resize = new ResizeObserver(() => {
     rects.clear();
     drawCursor();
+    onResize();
   });
   const streamOf = (canvas) => Number(canvas.dataset.stream);
   // A display is a canvas (WebTransport) or a <video> (remote, over WebRTC).
@@ -746,6 +747,8 @@ export function attachInput({
 
   return {
     setTrackpad,
+    /** A display's picture in client pixels (letterboxed), or undefined before its size is known. */
+    contentRect,
     /** The displays changed size or layout: keep the trackpad cursor on a picture. */
     refreshCursor() {
       if (!trackpad) return;

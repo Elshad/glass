@@ -89,6 +89,8 @@ pub struct Video {
     full_colour: AtomicBool,
     /// The frame rate viewers want (crate::refresh): 60, or up to 120 for fast screens.
     max_fps: std::sync::atomic::AtomicU32,
+    /// Draw the pointer into the picture (crate::cursor decides).
+    cursor: AtomicBool,
 }
 
 impl Video {
@@ -110,6 +112,7 @@ impl Video {
             rext: AtomicBool::new(false),
             full_colour: AtomicBool::new(false),
             max_fps: std::sync::atomic::AtomicU32::new(crate::refresh::DEFAULT),
+            cursor: AtomicBool::new(true),
         }
     }
 
@@ -272,6 +275,7 @@ impl Video {
             audio,
             self.full_colour.load(Ordering::Relaxed),
             p3,
+            self.cursor.load(Ordering::Relaxed),
         )?;
         let id = info.id;
         let window = matches!(target, Target::Window(_));
@@ -386,6 +390,13 @@ impl VideoSource for Video {
         if self.full_colour.swap(on, Ordering::Relaxed) != on {
             self.restart_all("full colour");
             info!("capture colour: {}", if on { "BGRA (lossless refresh)" } else { "4:2:0" });
+        }
+    }
+    fn set_cursor_baked(&self, on: bool) {
+        if self.cursor.swap(on, Ordering::Relaxed) != on {
+            for s in self.streams.lock().unwrap().iter() {
+                s.capture.set_shows_cursor(on);
+            }
         }
     }
     fn picture(&self, id: u32, max: [u32; 2]) -> Option<crate::lossless::RawFrame> {

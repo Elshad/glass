@@ -31,6 +31,8 @@ pub struct Recording {
     /// The first file; later parts sit next to it.
     pub path: PathBuf,
     state: Arc<Mutex<Option<Recorder>>>,
+    /// The file records the video as sent: the pointer has to be in it.
+    _cursor: crate::cursor::Bake,
 }
 
 impl Drop for Recording {
@@ -60,6 +62,8 @@ pub fn start(who: &str) -> Result<Recording> {
         warned_hevc: false,
     };
     let state = Arc::new(Mutex::new(Some(recorder)));
+    // Before the first keyframe is asked for, so the recording starts with the pointer in.
+    let cursor = crate::cursor::bake();
     let mut frames = shared.frames.subscribe();
     shared.video.request_keyframe(Some(0));
     let thread_state = state.clone();
@@ -91,7 +95,7 @@ pub fn start(who: &str) -> Result<Recording> {
             }
         })?;
     tracing::info!("recording to {}", path.display());
-    Ok(Recording { path, state })
+    Ok(Recording { path, state, _cursor: cursor })
 }
 
 struct Recorder {

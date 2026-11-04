@@ -250,6 +250,15 @@ impl Capture {
             self.stream.updateConfiguration_completionHandler(&self.config, None);
         }
     }
+
+    /// Draws the pointer into the picture from now on, or leaves it out (`crate::cursor`),
+    /// without restarting the stream.
+    pub fn set_shows_cursor(&self, on: bool) {
+        unsafe {
+            self.config.setShowsCursor(on);
+            self.stream.updateConfiguration_completionHandler(&self.config, None);
+        }
+    }
 }
 
 /// A display's refresh rate (60 when it doesn't say).
@@ -605,6 +614,8 @@ pub fn start(
     bgra: bool,
     // Capture in Display P3 (a wide-colour display) instead of sRGB.
     p3: bool,
+    // Draw the pointer in; viewers that draw their own leave it out (`crate::cursor`).
+    shows_cursor: bool,
 ) -> Result<Capture> {
     let captures_audio = audio.is_some();
     let (filter, source_id) = match source {
@@ -638,7 +649,7 @@ pub fn start(
         if p3 {
             config.setColorSpaceName(objc2_core_graphics::kCGColorSpaceDisplayP3);
         }
-        config.setShowsCursor(true);
+        config.setShowsCursor(shows_cursor);
         // One buffer is held as the last frame, so leave the pool room for new ones.
         config.setQueueDepth(4);
         config.setCapturesAudio(captures_audio);
