@@ -57,14 +57,19 @@ fn note_skipped_frame() {
     }
 }
 
-/// The average target, plus a loose ceiling of twice that over any second, so a runaway
-/// burst can't swamp a slow link. Tighter limits make the encoder drop frames outright
-/// (a frozen picture) instead of lowering quality, so the adaptive rate does the rest.
-fn set_rate(session: &VTCompressionSession, bps: u32) {
+/// The average target, plus two ceilings: twice that over any second, so a runaway burst
+/// can't swamp a slow link, and about two frames' worth over two frame intervals
+/// (`rate::short_window`), so one frame can't take most of a second's bits and queue
+/// everything behind it. The encoder meets that by coarsening the frame, which the loose
+/// QP cap at low rates allows (a keyframe it can't fit is asked for again).
+fn set_rate(session: &VTCompressionSession, bps: u32, fps: u32) {
     let bytes_per_sec = bps as f64 / 8.0;
+    let (short_bytes, short_secs) = crate::rate::short_window(bps, fps);
     let limits = [
         CFNumber::new_f64(bytes_per_sec * 2.0),
         CFNumber::new_f64(1.0),
+        CFNumber::new_f64(short_bytes),
+        CFNumber::new_f64(short_secs),
     ];
     let limits = CFArray::from_retained_objects(&limits);
     let average = CFNumber::new_i32(bps as i32);
@@ -211,7 +216,7 @@ impl Encoder {
                 kVTCompressionPropertyKey_MaxKeyFrameInterval,
                 &CFNumber::new_i32(MAX_GOP_FRAMES),
             );
-            set_rate(&session, bitrate as u32);
+            set_rate(&session, bitrate as u32, fps.max(1) as u32);
             session.prepare_to_encode_frames();
         }
 
@@ -233,7 +238,7 @@ impl Encoder {
     /// ceiling for capture (at most `max_fps`: what the display and viewers can show).
     pub fn apply_policy(&self, bps: u32, max_fps: u32) -> u32 {
         let (fps, qp) = crate::rate::sharp_policy(bps, max_fps);
-        set_rate(&self.session, bps);
+        set_rate(&self.session, bps, fps);
         self.set(
             unsafe { kVTCompressionPropertyKey_ExpectedFrameRate },
             fps as i32,
@@ -301,6 +306,7 @@ impl Encoder {
             CFDictionary::<CFString, CFType>::from_slices(&keys, &[CFBoolean::new(true)])
         });
         let on_frame = self.on_frame.clone();
+        let force_keyframe = self.force_keyframe.clone();
         let hevc = self.hevc;
         let (bytes, last_size) = (self.bytes.clone(), self.last_size.clone());
         let handler = RcBlock::new(
@@ -311,7 +317,11 @@ impl Encoder {
                 }
                 if sample.is_null() {
                     // Dropped by rate control to stay within the limits: count, don't shout.
+                    // A keyframe someone is waiting for is asked for again.
                     note_skipped_frame();
+                    if keyframe {
+                        force_keyframe.store(true, Ordering::Relaxed);
+                    }
                     return;
                 }
                 if let Some(frame) = unsafe { annex_b(&*sample, hevc) } {

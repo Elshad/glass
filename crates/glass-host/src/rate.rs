@@ -24,8 +24,14 @@ const HOLD_AFTER_DECREASE: Duration = Duration::from_secs(2);
 const LATENCY_SLACK_MS: f64 = 40.0;
 /// Recent latency samples used to estimate the uncongested baseline.
 const BASELINE_WINDOW: usize = 30;
-/// Below this the picture becomes unusable; hold here instead.
-const MIN_FRACTION: f64 = 0.08;
+/// The least the rate goes to: still a picture, if a slow one. An absolute floor, not a
+/// share of the maximum: 8% of a 30 Mbps maximum (2.4 Mbps) was more than a 1 Mbps link
+/// carries, so the queue grew without end and nothing decoded.
+pub const MIN_BPS: u32 = 250_000;
+/// The short-window limit: a frame interval's worth of the target, this many intervals...
+const SHORT_WINDOW_FRAMES: f64 = 2.0;
+/// ...with this much slack (so a frame may be about three average frames, no more).
+const SHORT_WINDOW_SLACK: f64 = 1.5;
 
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 pub struct Report {
@@ -104,7 +110,7 @@ impl RateControl {
             .received_bps
             .is_none_or(|bps| bps >= self.target as f64 * USED_FOR_INCREASE);
 
-        let min = (self.max as f64 * MIN_FRACTION) as u32;
+        let min = MIN_BPS.min(self.max);
         let next = if congested {
             self.last_decrease = Some(now);
             self.ceiling = Some(self.target);
@@ -175,6 +181,16 @@ pub fn split(total: u32, activity: &[u64]) -> Vec<u32> {
         .collect()
 }
 
+/// The most an encoder may spend over a short window, as (bytes, seconds): about two frames
+/// at the target, with some slack. Without it, a limit over a whole second let one frame
+/// take most of the second's bits; on a slow link that one frame is a queue everything
+/// after it waits behind. Encoders meet it by coarsening the frame (see [`motion_policy`]:
+/// the QP cap is loose at low rates so they can).
+pub fn short_window(bps: u32, fps: u32) -> (f64, f64) {
+    let secs = SHORT_WINDOW_FRAMES / fps.max(1) as f64;
+    (bps as f64 / 8.0 * secs * SHORT_WINDOW_SLACK, secs)
+}
+
 /// What a display's encoder does at a given bitrate to keep text sharp: a frame-rate
 /// ceiling, and a cap on how coarse a frame may get (QP; lower is sharper). When bits run
 /// short it sends fewer, sharp frames rather than many blurry ones; a still screen keeps
@@ -209,8 +225,10 @@ fn motion_policy(bps: u32, max_fps: u32) -> (u32, u32) {
         b if b >= 8_000_000 => (60, 30),
         b if b >= 5_000_000 => (45, 30),
         b if b >= 3_000_000 => (30, 30),
-        b if b >= 1_500_000 => (15, 28),
-        _ => (10, 28),
+        // Under 3 Mbps a tight cap only forced frames bigger than the link (or skipped
+        // ones, with the short-window limit): let them coarsen, and sharpen once still.
+        b if b >= 1_500_000 => (15, 36),
+        _ => (10, 42),
     };
     (fps.min(max_fps.max(1)), qp)
 }
@@ -339,7 +357,36 @@ mod tests {
         for _ in 0..50 {
             rc.report(lossy(), t0);
         }
-        assert_eq!(rc.target(), (MAX as f64 * MIN_FRACTION) as u32);
+        assert_eq!(rc.target(), MIN_BPS);
+    }
+
+    #[test]
+    fn a_slow_link_can_take_the_rate_down_to_a_quarter_megabit() {
+        // WebTransport over a 1 Mbps link with a 30 Mbps maximum: congestion every second
+        // brings it under the link within a dozen seconds, and it can go lower still.
+        let mut rc = RateControl::new(MAX);
+        let t0 = Instant::now();
+        let under = (0..20u64)
+            .position(|i| {
+                rc.report(lossy(), t0 + Duration::from_secs(i));
+                rc.target() < 1_000_000
+            })
+            .expect("gets under the link");
+        assert!(under < 12, "{under} s");
+        for i in 20..40 {
+            rc.report(lossy(), t0 + Duration::from_secs(i));
+        }
+        assert_eq!(rc.target(), 250_000);
+    }
+
+    #[test]
+    fn no_frame_is_much_more_than_its_share() {
+        // 1 Mbps at 10 fps: 12.5 KB a frame; 37.5 KB over two frame intervals at most.
+        let (bytes, secs) = short_window(1_000_000, 10);
+        assert!((bytes - 37_500.0).abs() < 1e-6 && (secs - 0.2).abs() < 1e-9, "{bytes} {secs}");
+        let (bytes, secs) = short_window(20_000_000, 60);
+        assert!((bytes / (20_000_000.0 / 8.0 / 60.0) - 3.0).abs() < 1e-9, "three frames' worth");
+        assert!((secs - 2.0 / 60.0).abs() < 1e-9);
     }
 
     #[test]
@@ -369,15 +416,20 @@ mod tests {
     }
 
     #[test]
-    fn less_bitrate_means_fewer_frames_never_coarser_ones() {
+    fn less_bitrate_means_fewer_frames_and_coarser_only_when_slow() {
         let mut last_fps = u32::MAX;
         for bps in [
-            20_000_000, 10_000_000, 6_000_000, 4_000_000, 2_000_000, 1_000_000,
+            20_000_000, 10_000_000, 6_000_000, 4_000_000, 3_000_000, 2_000_000, 1_000_000,
         ] {
             let (fps, qp) = policy(bps, false, 60);
             assert!(fps <= last_fps);
-            assert!(qp <= 30, "QP cap never loosens past 30");
+            if bps >= 3_000_000 {
+                assert!(qp <= 30, "{bps}: the QP cap holds at 30 from 3 Mbps up");
+            }
             last_fps = fps;
         }
+        // Under 3 Mbps frames may coarsen so they fit the link.
+        assert!(policy(2_000_000, false, 60).1 > 30);
+        assert!(policy(1_000_000, false, 60).1 > policy(2_000_000, false, 60).1);
     }
 }
