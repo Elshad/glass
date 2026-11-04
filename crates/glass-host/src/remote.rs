@@ -113,9 +113,7 @@ impl LinkMeter {
 
     /// Once a second or so. Returns the new cap when it changes (`Some(None)`: lifted).
     /// `outstanding`: the whole send buffer; `queued`: the part behind what's in flight.
-    /// `held`: capture was held for this link much of the second (crate::flow), so the
-    /// queue stayed short only because fewer frames were made: backed up all the same.
-    fn tick(&mut self, outstanding: usize, queued: usize, dropped: bool, held: bool, budget: usize, elapsed: Duration) -> Option<Option<u32>> {
+    fn tick(&mut self, outstanding: usize, queued: usize, dropped: bool, budget: usize, elapsed: Duration) -> Option<Option<u32>> {
         let secs = elapsed.as_secs_f64().max(0.001);
         // What left the queue: what went in, less how much it grew.
         let drained = self.sent as i64 - (outstanding as i64 - self.last_outstanding as i64);
@@ -123,7 +121,7 @@ impl LinkMeter {
         self.sent = 0;
         self.last_outstanding = outstanding;
         let before = self.cap;
-        if dropped || held || queued > budget / 2 {
+        if dropped || queued > budget / 2 {
             // Backed up, so what drained is about what the link carries, at best: video is
             // unreliable, so messages the relay throws away leave the buffer too and look
             // delivered. So while frames keep being dropped, back off further each second
@@ -841,6 +839,7 @@ async fn bridge(
     let endpoint = wtransport::Endpoint::client(config)?;
     let (bridge_id, viewer, _registration) = register_bridge();
     let rtp_video = video.is_some();
+    let watching = viewer.watching.clone();
     let url = format!(
         "https://{}:{wt_port}/rtc?peer={peer}&b={bridge_id}{}&k={}",
         crate::listen::host(dial),
@@ -881,7 +880,6 @@ async fn bridge(
     // aren't made only to be dropped here. The gate stays as a safety net.
     let mut link = crate::flow::Link::default();
     let mut flow = crate::flow::Viewer::new();
-    let mut pressure = crate::flow::Pressure::default();
     let mut flow_poll = tokio::time::interval(crate::flow::POLL);
     flow_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -939,7 +937,7 @@ async fn bridge(
                             meter_drops += 1;
                         }
                     }
-                    pressure.note(flow.update(&mut link, now), now);
+                    flow.update(&mut link, now);
                     // Tell the bitrate controller: the browser can't see these drops.
                     if gate.dropped_frames > 0 && last_congestion_report.elapsed() >= Duration::from_secs(1) {
                         crate::server::bridge_congestion(std::mem::take(&mut gate.dropped_frames));
@@ -985,7 +983,11 @@ async fn bridge(
                 if let Some(dc) = &datagram_channel {
                     let now = std::time::Instant::now();
                     link.drained(dc.outstanding_bytes().await.unwrap_or(0), now);
-                    pressure.note(flow.update(&mut link, now), now);
+                    // Paused: what's in flight says nothing about the link.
+                    if !*watching.borrow() {
+                        link.forget();
+                    }
+                    flow.update(&mut link, now);
                 }
             }
             _ = meter_tick.tick(), if !rtp_video => {
@@ -994,8 +996,7 @@ async fn bridge(
                     let budget = video_backlog(crate::server::applied_bitrate());
                     let queued = inflight.queued(outstanding);
                     inflight.tick(crate::server::applied_bitrate());
-                    let held = pressure.take(std::time::Instant::now());
-                    if let Some(cap) = meter.tick(outstanding, queued, meter_drops > 0, held, budget, last_tick.elapsed()) {
+                    if let Some(cap) = meter.tick(outstanding, queued, meter_drops > 0, budget, last_tick.elapsed()) {
                         match cap {
                             Some(bps) => debug!("remote peer ({peer}): link carries ~{:.1} Mbps of video", bps as f64 / 1e6),
                             None => debug!("remote peer ({peer}): link cap lifted"),
@@ -1208,28 +1209,24 @@ mod tests {
         let mut m = LinkMeter::default();
         // Keeping up: no cap.
         m.sent(100_000);
-        assert_eq!(m.tick(0, 0, false, false, budget, sec), None);
+        assert_eq!(m.tick(0, 0, false, budget, sec), None);
         // Backed up: 300 KB handed over, the queue grew by 150 KB, so ~150 KB/s (1.2 Mbps)
         // got through; video gets 85% of it.
         m.sent(300_000);
-        assert_eq!(m.tick(150_000, 150_000, true, false, budget, sec), Some(Some(1_020_000)));
+        assert_eq!(m.tick(150_000, 150_000, true, budget, sec), Some(Some(1_020_000)));
         // Still dropping though it seems to drain as fast: backs off 15% more anyway
         // (dropped messages look delivered).
         m.sent(150_000);
-        assert_eq!(m.tick(150_000, 150_000, true, false, budget, sec), Some(Some(867_000)));
+        assert_eq!(m.tick(150_000, 150_000, true, budget, sec), Some(Some(867_000)));
         // Draining slowly: the cap follows the link down, not below the floor.
         m.sent(0);
-        assert_eq!(m.tick(140_000, 140_000, true, false, budget, sec), Some(Some(MIN_LINK_CAP)));
+        assert_eq!(m.tick(140_000, 140_000, true, budget, sec), Some(Some(MIN_LINK_CAP)));
         // Calm: held for two seconds, then raised 15% a second.
         m.sent(10_000);
-        assert_eq!(m.tick(0, 0, false, false, budget, sec), None);
-        assert_eq!(m.tick(0, 0, false, false, budget, sec), None);
-        assert_eq!(m.tick(0, 0, false, false, budget, sec), Some(Some(287_500)));
-        assert_eq!(m.tick(0, 0, false, false, budget, sec), Some(Some(330_625)));
-        // Held (crate::flow): the queue stayed short only because capture waited; what
-        // drained (40 KB, 320 kbps) is what the link carries.
-        m.sent(40_000);
-        assert_eq!(m.tick(0, 0, false, true, budget, sec), Some(Some(272_000)));
+        assert_eq!(m.tick(0, 0, false, budget, sec), None);
+        assert_eq!(m.tick(0, 0, false, budget, sec), None);
+        assert_eq!(m.tick(0, 0, false, budget, sec), Some(Some(287_500)));
+        assert_eq!(m.tick(0, 0, false, budget, sec), Some(Some(330_625)));
     }
 
     #[test]

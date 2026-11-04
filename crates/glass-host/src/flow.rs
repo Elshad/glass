@@ -28,6 +28,10 @@ const SLACK_MS: f64 = 120.0;
 const DEFAULT_RTT_MS: f64 = 40.0;
 /// A frame unconfirmed this long: the viewer is stuck, and stops holding the others.
 const STUCK: Duration = Duration::from_secs(4);
+/// A hold never lasts longer than this: one frame goes anyway. The newest picture reaches a
+/// viewer even if what's "in flight" can't be confirmed (an acknowledgement or a last frame
+/// lost with nothing after it to show it, a decoder sitting on its last frame).
+const MAX_HOLD: Duration = Duration::from_millis(750);
 /// The least round trip seen over this long is the link's own (the rest is queue).
 const BASE_WINDOW: Duration = Duration::from_secs(10);
 /// Frame interval the frame-count limit assumes (the fastest common rate).
@@ -62,6 +66,8 @@ pub struct Link {
     base: Option<(f64, Instant)>,
     /// Stuck: frames still go, but it holds no one up until it has caught up.
     stalled: bool,
+    /// When a frame last went.
+    last_sent: Option<Instant>,
     /// Bytes out of the buffer (`total` less what's still queued), at the last look.
     out: u64,
     /// The delivery sample open now: the delivery it started at (when, and `out` then).
@@ -73,6 +79,7 @@ pub struct Link {
 impl Link {
     /// A video fragment (or a whole frame) of `bytes` was handed to the transport.
     pub fn sent(&mut self, stream: u8, id: u32, bytes: usize, now: Instant) {
+        self.last_sent = Some(now);
         self.total += bytes as u64;
         match self.inflight.back_mut() {
             Some(last) if last.stream == stream && last.id == id => last.end = self.total,
@@ -83,6 +90,14 @@ impl Link {
                 self.inflight.push_back(Sent { stream, id, at: now, end: self.total });
             }
         }
+    }
+
+    /// Video stopped (a hidden tab pauses it, and its decoder is given up): what's in flight
+    /// will never be confirmed, and says nothing about the link.
+    pub fn forget(&mut self) {
+        self.inflight.clear();
+        self.stalled = false;
+        self.window = None;
     }
 
     /// Something other than video went through the same buffer.
@@ -182,7 +197,7 @@ impl Link {
             );
             self.stalled = true;
         }
-        if self.stalled {
+        if self.stalled || self.last_sent.is_none_or(|at| now.saturating_duration_since(at) >= MAX_HOLD) {
             return false;
         }
         let rtt = self.rtt_ms();
@@ -201,34 +216,6 @@ impl Link {
     /// The streams with frames in flight, as a bit mask.
     fn streams(&self) -> u8 {
         self.inflight.iter().fold(0, |m, f| m | 1 << (f.stream as usize).min(MAX_STREAMS - 1))
-    }
-}
-
-/// How long a link has been full lately. Holding alone only lowers the frame rate: held for
-/// a good part of a second means the bitrate is more than the link carries, which the rate
-/// controller has to hear (each frame is then too big for the link).
-#[derive(Default)]
-pub struct Pressure {
-    full_for: Duration,
-    last: Option<(Instant, bool)>,
-}
-
-/// Full this long in a second counts as congestion.
-const PRESSURE: Duration = Duration::from_millis(250);
-
-impl Pressure {
-    pub fn note(&mut self, full: bool, now: Instant) {
-        if let Some((at, true)) = self.last {
-            self.full_for += now.saturating_duration_since(at);
-        }
-        self.last = Some((now, full));
-    }
-
-    /// About once a second: whether it was full for a good part of the time since; resets.
-    pub fn take(&mut self, now: Instant) -> bool {
-        let full = self.last.is_some_and(|(_, f)| f);
-        self.note(full, now);
-        std::mem::take(&mut self.full_for) >= PRESSURE
     }
 }
 
@@ -455,18 +442,36 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pressure_is_time_spent_full() {
+    fn a_hold_never_stops_frames_for_long() {
         let t0 = Instant::now();
         let ms = Duration::from_millis;
-        let mut p = Pressure::default();
-        p.note(true, t0);
-        p.note(false, t0 + ms(100));
-        p.note(true, t0 + ms(900));
-        assert!(!p.take(t0 + ms(1000)), "full for 200 ms");
-        // Still full from 900 ms on.
-        assert!(p.take(t0 + ms(2000)), "full for the whole second");
-        p.note(false, t0 + ms(2000));
-        assert!(!p.take(t0 + ms(3000)));
+        let mut l = Link::default();
+        l.set_rtt(ms(40), t0);
+        l.sent(0, 0, 1_000, t0);
+        // Never confirmed: full once old, but one frame goes after a while...
+        assert!(l.full(t0 + ms(700)));
+        assert!(!l.full(t0 + ms(750)));
+        // ...and then it's held again.
+        l.sent(0, 1, 1_000, t0 + ms(750));
+        assert!(l.full(t0 + ms(1000)));
+    }
+
+    #[test]
+    fn pausing_video_forgets_what_was_in_flight() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut l = Link::default();
+        let mut v = Viewer::new();
+        for id in 0..3 {
+            l.sent(3, id, 1_000, t0);
+        }
+        assert!(v.update(&mut l, t0 + ms(10)));
+        assert!(held(3));
+        // A hidden tab: these will never be confirmed, and it isn't the link's doing.
+        l.forget();
+        assert!(!l.busy());
+        assert!(!v.update(&mut l, t0 + ms(20)));
+        assert!(!held(3));
     }
 
     #[test]
@@ -475,7 +480,7 @@ pub(crate) mod tests {
         let mut l = Link::default();
         let mut v = Viewer::new();
         l.sent(2, 0, 1_000, t0);
-        assert!(v.update(&mut l, t0 + Duration::from_secs(1)));
+        assert!(v.update(&mut l, t0 + Duration::from_millis(500)));
         assert!(held(2), "full: its stream is held");
         assert!(!v.update(&mut l, t0 + Duration::from_secs(5)));
         assert!(!held(2), "stuck: released");
@@ -484,7 +489,9 @@ pub(crate) mod tests {
         assert!(!v.update(&mut l, t0 + Duration::from_secs(6)));
         l.drained(0, t0 + Duration::from_secs(6));
         l.sent(2, 2, 1_000, t0 + Duration::from_secs(6));
-        assert!(v.update(&mut l, t0 + Duration::from_secs(8)));
+        l.drained(0, t0 + Duration::from_secs(6));
+        l.sent(2, 3, 1_000, t0 + Duration::from_secs(7));
+        assert!(v.update(&mut l, t0 + Duration::from_millis(7700)));
         drop(v);
         assert!(!held(2), "gone: released");
     }

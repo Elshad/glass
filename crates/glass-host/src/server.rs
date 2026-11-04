@@ -399,8 +399,6 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let datagram_capacity = conn.quic_connection().datagram_send_buffer_space();
     let mut link = crate::flow::Link::default();
     let mut flow = crate::flow::Viewer::new();
-    let mut pressure = crate::flow::Pressure::default();
-    let mut last_pressure_check = std::time::Instant::now();
     let mut flow_poll = tokio::time::interval(crate::flow::POLL);
     flow_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -411,19 +409,11 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                     let now = std::time::Instant::now();
                     link.set_rtt(conn.rtt(), now);
                     link.drained(datagrams_queued(&conn, datagram_capacity), now);
-                    pressure.note(flow.update(&mut link, now), now);
-                    // Held much of the last second: frames are bigger than the link takes.
-                    if now.duration_since(last_pressure_check) >= Duration::from_secs(1) {
-                        last_pressure_check = now;
-                        if pressure.take(now) {
-                            apply_rate_report(&shared, crate::rate::Report {
-                                dropped: 1,
-                                frames: 1,
-                                latency_ms: None,
-                                received_bps: None,
-                            });
-                        }
+                    // Paused: what's in flight says nothing about the link.
+                    if !video_on.load(Ordering::Relaxed) {
+                        link.forget();
                     }
+                    flow.update(&mut link, now);
                 }
                 _ = quiet_check.tick() => {
                     if last_heard.elapsed() > QUIET_LIMIT {
@@ -456,7 +446,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         if bytes > 0 {
                             link.sent(frame.stream, id, bytes, now);
                         }
-                        pressure.note(flow.update(&mut link, now), now);
+                        flow.update(&mut link, now);
                     } else {
                         // Keep ids moving so a resumed client sees a gap and waits for a keyframe.
                         *next_id = next_id.wrapping_add(1);
@@ -466,7 +456,9 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                     // (The sender lives as long as the host.)
                     if changed.is_ok() && authed.load(Ordering::Relaxed) && video_on.load(Ordering::Relaxed) {
                         let pos = *cursor.borrow_and_update();
-                        conn.send_datagram(pos.datagram(driver))?;
+                        let dgram = pos.datagram(driver);
+                        link.other(dgram.len());
+                        conn.send_datagram(dgram)?;
                     }
                 }
                 packet = audio.recv() => {
