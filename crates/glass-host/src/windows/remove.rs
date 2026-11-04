@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_DWORD, REG_SZ, RegDeleteTreeW, RegSetKeyValueW};
 use windows::core::HSTRING;
 
-use super::firewall::{self, Inbound};
+use super::firewall;
 use super::ps_string as ps;
 
 const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Glass";
@@ -70,7 +70,7 @@ pub fn register() -> Result<()> {
 pub fn everything() -> Result<()> {
     let exe = std::env::current_exe()?;
     let service = matches!(super::service::status(), Ok(Some(_)));
-    let rule = firewall::inbound(&exe) == Some(Inbound::Allowed);
+    let rule = firewall::named_rule_present(&exe) == Some(true);
     if service || rule {
         let mut admin = String::from("$ErrorActionPreference = 'Continue'; ");
         if service {

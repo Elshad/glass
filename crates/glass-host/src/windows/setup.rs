@@ -109,7 +109,7 @@ fn firewall_step() -> Result<()> {
     if firewall::in_sync(&exe, remote) == Some(true) {
         log::success(firewall::ready_sentence(remote))?;
     } else {
-        log::warning("The firewall rule wasn't updated. If the new rule could not be added, the previous Glass rule is put back. Run `glass setup` again.")?;
+        log::warning("The firewall rule wasn't updated, so an existing Glass rule was left as it was. Run `glass setup` again.")?;
     }
     Ok(())
 }
@@ -126,9 +126,9 @@ pub fn prepare_unattended() -> Vec<crate::setup::Need> {
         Ok(remote) if firewall::in_sync(&exe, remote) == Some(true) => None,
         Ok(remote) if firewall::add_rule_quietly(&exe) && firewall::in_sync(&exe, remote) == Some(true) => None,
         Ok(remote) => Some(match remote {
-            Remote::Tailscale => "Limit Glass's own firewall rule to Tailscale (100.64.0.0/10 and fd7a:115c:a1e0::/48). Run `glass setup`. If the new rule cannot be added, the previous one is put back.".into(),
+            Remote::Tailscale => "Limit Glass's own firewall rule to Tailscale (100.64.0.0/10 and fd7a:115c:a1e0::/48). Run `glass setup`.".into(),
             Remote::Loopback => "Remove Glass's inbound firewall rule (it only listens on this computer). Run `glass setup`.".into(),
-            Remote::Any => "Allow Glass through Windows Defender Firewall on private networks. Run `glass setup` (asks for administrator approval once). If the new rule cannot be added, the previous one is put back.".into(),
+            Remote::Any => "Allow Glass through Windows Defender Firewall on private networks. Run `glass setup` (asks for administrator approval once).".into(),
         }),
     };
     if let Some(action) = action {
