@@ -68,6 +68,21 @@ pub async fn run(
     client_log: PathBuf,
     extra_routes: Option<axum::Router>,
 ) -> Result<()> {
+    // Quick support's helper links outlive a `glass support` that was killed: take them,
+    // and the access they gave, away once it's gone.
+    {
+        let file = crate::access::file_for(&shared.token_file);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                match crate::access::reap_orphaned_support(&file, crate::platform::process_alive) {
+                    Ok(0) => {}
+                    Ok(n) => info!("support: removed {n} helper link(s) left by an ended glass support"),
+                    Err(e) => warn!("support: couldn't clean up helper links: {e:#}"),
+                }
+            }
+        });
+    }
     let identity = match &tls {
         Some(t) => Identity::load_pemfiles(&t.cert, &t.key).await?,
         None => self_signed_identity(wt_host.as_deref()).await?,
@@ -602,8 +617,18 @@ async fn control(
     // A policy can turn guest links (or, in its own host, quick support) off: new links and
     // devices already let in by one are refused.
     let policy = crate::policy::load();
+    // Quick support's helper, in its own host or on the running service (its link says so).
+    let support_guest = crate::support::is_host()
+        || link
+            .as_deref()
+            .and_then(|l| crate::access::link_scope(&access_file, l))
+            .is_some_and(|s| s.support)
+        || pass
+            .as_deref()
+            .and_then(|p| crate::access::check_pass(&access_file, p))
+            .is_some_and(|v| v.scope.support);
     if auth.is_none()
-        && !policy.allows(if crate::support::is_host() { "support" } else { "links" })
+        && !policy.allows(if support_guest { "support" } else { "links" })
         && (link.is_some()
             || pass
                 .as_deref()
@@ -934,7 +959,8 @@ async fn control(
         browse: perms.owner && perms.files,
         extend: cfg!(target_os = "macos") || crate::testmode::enabled(),
         fit: cfg!(target_os = "macos") || crate::testmode::enabled(),
-        support: crate::support::is_host(),
+        support: crate::support::is_host()
+            || matches!(&auth, Auth::Guest { scope, .. } if scope.support),
     };
     // Someone other than the owner is in: worth a notification on the owner's devices.
     if !perms.owner {

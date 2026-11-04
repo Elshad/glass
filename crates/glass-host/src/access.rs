@@ -46,6 +46,11 @@ pub struct Scope {
     /// The device must register a passkey when it opens the link, and use it every time.
     #[serde(default)]
     pub passkey: bool,
+    /// Quick support's helper link: the "support" policy applies to it rather than
+    /// "links", and the viewer shows that it's helping. Set on the link, so the running
+    /// service can tell the helper's session from other guests'.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub support: bool,
 }
 
 fn yes() -> bool {
@@ -60,6 +65,7 @@ impl Default for Scope {
             clipboard: true,
             ask: false,
             passkey: false,
+            support: false,
         }
     }
 }
@@ -102,6 +108,11 @@ struct Link {
     /// again in another browser (see [`redeem_link`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     used: Option<Used>,
+    /// The `glass support` process the link belongs to: when it's gone without cleaning up
+    /// (killed, crashed), the running service removes the link and its passes
+    /// ([`reap_orphaned_support`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<u32>,
 }
 
 /// A link's first use: who opened it, so only the same device can reopen it.
@@ -232,6 +243,11 @@ pub fn create_link(path: &Path, grant: Duration, scope: Scope) -> Result<NewLink
 
 /// A link that stays usable for `ttl` (quick support waits up to an hour for the helper).
 pub fn create_link_for(path: &Path, ttl: Duration, grant: Duration, scope: Scope) -> Result<NewLink> {
+    create_owned_link(path, ttl, grant, scope, None)
+}
+
+/// A link that goes away with process `owner` (quick support's helper link).
+pub fn create_owned_link(path: &Path, ttl: Duration, grant: Duration, scope: Scope, owner: Option<u32>) -> Result<NewLink> {
     let grant = grant.clamp(MIN_GRANT, MAX_GRANT);
     let code = random_code()?;
     let expires = now() + ttl.as_secs();
@@ -242,6 +258,7 @@ pub fn create_link_for(path: &Path, ttl: Duration, grant: Duration, scope: Scope
             grant_secs: grant.as_secs(),
             scope,
             used: None,
+            owner,
         });
     })?;
     Ok(NewLink {
@@ -366,6 +383,17 @@ pub fn redeem_link(path: &Path, code: &str, device: &str, ip: std::net::IpAddr) 
     Ok(granted)
 }
 
+/// An unexpired link's scope, without using it up (to apply the right policy first).
+pub fn link_scope(path: &Path, code: &str) -> Option<Scope> {
+    let hash = fingerprint(code);
+    let now = now();
+    load(path)
+        .links
+        .iter()
+        .find(|l| l.expires > now && crate::control::token_matches(&l.hash, &hash))
+        .map(|l| l.scope)
+}
+
 /// When the pass stops working, if it's valid now.
 pub fn pass_expiry(path: &Path, pass: &str) -> Option<u64> {
     check_pass(path, pass).map(|v| v.expires)
@@ -481,6 +509,25 @@ pub fn revoke_link(path: &Path, code: &str, and_link: bool) -> Result<usize> {
     Ok(removed)
 }
 
+/// Removes links whose owner process is gone, and the passes they let in; returns how
+/// many links went. The safety net for `glass support` ending without cleaning up.
+pub fn reap_orphaned_support(path: &Path, alive: impl Fn(u32) -> bool) -> Result<usize> {
+    let orphaned: Vec<String> = load(path)
+        .links
+        .iter()
+        .filter(|l| l.owner.is_some_and(|pid| !alive(pid)))
+        .map(|l| l.hash.clone())
+        .collect();
+    if orphaned.is_empty() {
+        return Ok(0);
+    }
+    update(path, |store| {
+        store.passes.retain(|p| !p.link.as_ref().is_some_and(|h| orphaned.contains(h)));
+        store.links.retain(|l| !orphaned.contains(&l.hash));
+    })?;
+    Ok(orphaned.len())
+}
+
 fn short_id(hash: &str) -> String {
     hash.chars().take(8).collect()
 }
@@ -505,14 +552,25 @@ fn load(path: &Path) -> Store {
 /// Loads, drops whatever has expired, applies `f`, and saves atomically with mode 0600.
 fn update(path: &Path, f: impl FnOnce(&mut Store)) -> Result<()> {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    // Across processes too: `glass support` writes the running service's file while the
+    // service redeems links in it. Released when `_lock` drops.
+    let _lock = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let file = opts.open(path.with_extension("lock"))?;
+        file.lock()?;
+        file
+    };
     let mut store = load(path);
     let now = now();
     store.links.retain(|l| l.expires > now);
     store.passes.retain(|p| p.expires > now);
     f(&mut store);
-    let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     {
         use std::io::Write;
@@ -616,6 +674,26 @@ mod tests {
         }
         assert_eq!(revoke_all(&path).unwrap(), 1);
         assert!(pass_expiry(&path, &granted.pass).is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_dead_owners_support_link_and_passes_are_reaped() {
+        let path = temp().with_file_name("reap.json");
+        let ttl = Duration::from_secs(3600);
+        let support = Scope { ask: true, support: true, ..Scope::default() };
+        let dead = create_owned_link(&path, ttl, ttl, support, Some(111)).unwrap();
+        let live = create_owned_link(&path, ttl, ttl, support, Some(222)).unwrap();
+        let plain = create_link(&path, ttl, Scope::default()).unwrap();
+        let d = redeem_link(&path, &dead.code, "Chrome on Linux", ip()).unwrap().unwrap();
+        let l = redeem_link(&path, &live.code, "Chrome on Linux", ip()).unwrap().unwrap();
+        let p = redeem_link(&path, &plain.code, "Safari on iPhone", ip()).unwrap().unwrap();
+        assert!(link_scope(&path, &live.code).unwrap().support);
+        assert_eq!(reap_orphaned_support(&path, |pid| pid == 222).unwrap(), 1);
+        assert!(pass_expiry(&path, &d.pass).is_none(), "the dead owner's helper is out");
+        assert!(pass_expiry(&path, &l.pass).is_some());
+        assert!(pass_expiry(&path, &p.pass).is_some());
+        assert_eq!(reap_orphaned_support(&path, |pid| pid == 222).unwrap(), 0);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

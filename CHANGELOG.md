@@ -8,6 +8,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 - If macOS's screen capture service stops answering (it can after Glass restarts), Glass restarts it and carries on, instead of hanging with no picture until someone restarts the Mac. Tailscale commands Glass runs at startup time out instead of holding it up.
 - Letting someone in after more than 10 seconds no longer leaves them with a picture but no mouse or keyboard.
 - `glass support` on a computer already running Glass shares through it, instead of starting a second copy that fought it for the screen (the picture froze in one of them). Ending support removes the helper's access and nothing else.
+- If `glass support` is closed without ending the session (killed, crashed), Glass removes the helper's access within seconds.
 
 ## 0.13.1
 

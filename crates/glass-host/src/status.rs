@@ -25,6 +25,10 @@ pub struct Status {
     pub remote: String,
     /// Unix seconds of the last write; a stale value means the host isn't running.
     pub updated: u64,
+    /// Quick support can go through this host: it tags passes with their link and cleans
+    /// up after a `glass support` that's gone. Older hosts don't, so support runs its own.
+    #[serde(default)]
+    pub support_links: bool,
 }
 
 pub fn path() -> PathBuf {
@@ -67,6 +71,7 @@ pub fn start(url: Option<String>) {
         version: env!("CARGO_PKG_VERSION").into(),
         pid: std::process::id(),
         url,
+        support_links: true,
         ..Default::default()
     });
     std::thread::spawn(|| {

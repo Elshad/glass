@@ -526,6 +526,7 @@ fn acl_cli(action: Option<&AclCommand>, json: bool) -> Result<()> {
                     clipboard: !*no_clipboard,
                     ask: *ask,
                     passkey: false,
+                    support: false,
                 },
                 duration_secs: grant.map(|d| d.as_secs()),
             };
@@ -965,6 +966,7 @@ async fn async_main(args: Args) -> Result<()> {
                 clipboard: !*no_clipboard,
                 ask: *ask,
                 passkey: *passkey,
+                support: false,
             },
         ),
         Some(Command::Config { key, value }) => config_cli(key.as_deref(), value.as_deref()),
