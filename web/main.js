@@ -1074,7 +1074,7 @@ function renderHud(d) {
       `${d.fps} fps  ${d.mbps.toFixed(1)} Mbps` + (targetMbps ? ` (target ${targetMbps.toFixed(0)})` : '') + `  dropped ${d.dropped}`,
     ),
   ];
-  if (d.audioPackets) lines.push(hudLine(`audio ${d.audioPackets} pkt/s  lost ${d.audioLost}`));
+  if (d.audioPackets) lines.push(hudLine(`audio ${d.audioPackets} pkt/s  lost ${d.audioLost}  ${d.audioCodec}`));
   hud.replaceChildren(...lines);
 }
 

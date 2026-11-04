@@ -6,6 +6,7 @@ export const KIND_PONG = 3;
 export const KIND_KEYFRAME_REQUEST = 4;
 export const KIND_AUDIO = 5;
 export const KIND_MIC = 6;
+export const KIND_AUDIO_OPUS = 7; // system audio as one Opus packet, same header as KIND_AUDIO
 export const AUDIO_HEADER_LEN = 16;
 export const FLAG_KEYFRAME = 1;
 export const FLAG_HEVC = 2;
@@ -25,6 +26,16 @@ export function micPacket(seq, captureUs, channels, pcm) {
   view.setBigUint64(8, BigInt(Math.max(0, Math.floor(captureUs))), true);
   for (let i = 0; i < pcm.length; i++) view.setInt16(AUDIO_HEADER_LEN + i * 2, pcm[i], true);
   return new Uint8Array(buf);
+}
+
+/** The header of an audio datagram (KIND_AUDIO, KIND_AUDIO_OPUS, KIND_MIC). */
+export function readAudioHeader(view) {
+  return {
+    kind: view.getUint8(0),
+    channels: view.getUint8(1),
+    seq: view.getUint32(4, true),
+    captureUs: Number(view.getBigUint64(8, true)),
+  };
 }
 
 export const STREAM_SHIFT = 4;

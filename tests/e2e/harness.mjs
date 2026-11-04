@@ -186,6 +186,7 @@ export async function stats(page) {
     fps: num(/(\d+) fps/),
     dropped: num(/dropped (\d+)/),
     audioPackets: num(/audio (\d+) pkt\/s/),
+    audioCodec: hud.match(/audio \d+ pkt\/s .* (pcm|opus)/)?.[1],
     connected: /connected/.test(hud.split('\n')[0]),
   };
 }

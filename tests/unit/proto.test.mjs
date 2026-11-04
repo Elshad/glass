@@ -67,6 +67,16 @@ test('mic packets match the host audio layout', async () => {
   assert.ok(micPacket(0, 0, 1, new Int16Array(240)).length <= 1200);
 });
 
+test('opus audio datagrams match glass_proto::opus_packet', async () => {
+  const { readAudioHeader, KIND_AUDIO_OPUS, KIND_AUDIO, KIND_MIC, AUDIO_HEADER_LEN } = await import('../../web/proto.js');
+  assert.equal(KIND_AUDIO_OPUS, 7);
+  assert.equal(new Set([KIND_AUDIO, KIND_MIC, KIND_AUDIO_OPUS, KIND_PING, KIND_PONG]).size, 5);
+  // Same bytes as the Rust test opus_packet_layout.
+  const p = new Uint8Array([7, 2, 0, 0, 0xd4, 0xc3, 0xb2, 0xa1, 0x87, 0xd6, 0x12, 0, 0, 0, 0, 0, 0xfc, 1, 2, 3]);
+  assert.deepEqual(readAudioHeader(new DataView(p.buffer)), { kind: KIND_AUDIO_OPUS, channels: 2, seq: 0xa1b2c3d4, captureUs: 1234567 });
+  assert.deepEqual([...p.subarray(AUDIO_HEADER_LEN)], [0xfc, 1, 2, 3]);
+});
+
 test('gamepad events carry pad, index and value', () => {
   const e = inputEvent(Input.PAD_AXIS, { button: 2, keycode: 3, a: -0.5 });
   const v = new DataView(e.buffer);
