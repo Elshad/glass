@@ -169,7 +169,7 @@ impl GlassApp {
     fn make_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let f = &self.link;
         let grant = Duration::from_secs(GRANTS[f.grant].1);
-        let scope = Scope { view_only: !f.control, files: f.files, clipboard: f.clipboard, ask: f.ask, passkey: f.passkey };
+        let scope = Scope { view_only: !f.control, files: f.files, clipboard: f.clipboard, ask: f.ask, passkey: f.passkey, support: false };
         let anywhere = f.anywhere;
         self.link.busy = true;
         cx.notify();

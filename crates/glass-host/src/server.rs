@@ -68,6 +68,21 @@ pub async fn run(
     client_log: PathBuf,
     extra_routes: Option<axum::Router>,
 ) -> Result<()> {
+    // Quick support's helper links outlive a `glass support` that was killed: take them,
+    // and the access they gave, away once it's gone.
+    {
+        let file = crate::access::file_for(&shared.token_file);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                match crate::access::reap_orphaned_support(&file, crate::platform::process_alive) {
+                    Ok(0) => {}
+                    Ok(n) => info!("support: removed {n} helper link(s) left by an ended glass support"),
+                    Err(e) => warn!("support: couldn't clean up helper links: {e:#}"),
+                }
+            }
+        });
+    }
     let identity = match &tls {
         Some(t) => Identity::load_pemfiles(&t.cert, &t.key).await?,
         None => self_signed_identity(wt_host.as_deref()).await?,
@@ -602,8 +617,18 @@ async fn control(
     // A policy can turn guest links (or, in its own host, quick support) off: new links and
     // devices already let in by one are refused.
     let policy = crate::policy::load();
+    // Quick support's helper, in its own host or on the running service (its link says so).
+    let support_guest = crate::support::is_host()
+        || link
+            .as_deref()
+            .and_then(|l| crate::access::link_scope(&access_file, l))
+            .is_some_and(|s| s.support)
+        || pass
+            .as_deref()
+            .and_then(|p| crate::access::check_pass(&access_file, p))
+            .is_some_and(|v| v.scope.support);
     if auth.is_none()
-        && !policy.allows(if crate::support::is_host() { "support" } else { "links" })
+        && !policy.allows(if support_guest { "support" } else { "links" })
         && (link.is_some()
             || pass
                 .as_deref()
@@ -934,7 +959,8 @@ async fn control(
         browse: perms.owner && perms.files,
         extend: cfg!(target_os = "macos") || crate::testmode::enabled(),
         fit: cfg!(target_os = "macos") || crate::testmode::enabled(),
-        support: crate::support::is_host(),
+        support: crate::support::is_host()
+            || matches!(&auth, Auth::Guest { scope, .. } if scope.support),
     };
     // Someone other than the owner is in: worth a notification on the owner's devices.
     if !perms.owner {
@@ -1919,7 +1945,11 @@ fn record_auth_failure(shared: &Shared, peer: std::net::IpAddr) {
     entry.0 += 1;
 }
 
-const AUTH_WAIT: Duration = Duration::from_secs(10);
+/// How long a stream opened before sign-in finishes waits for it. Covers the person at the
+/// computer answering "let them in?" (up to `approval::TIMEOUT`), not just a tailnet whois:
+/// a viewer's input stream opens right after hello, and dropping it after a shorter wait
+/// left an approved viewer seeing the screen with no mouse or keyboard.
+const AUTH_WAIT: Duration = Duration::from_secs(crate::approval::TIMEOUT.as_secs() + 10);
 
 /// Input streams open right now, across viewers.
 static INPUT_STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1929,12 +1959,19 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
     stream.read_exact(&mut tag).await?;
     // Streams opened right after hello can arrive while auth is still in progress
     // (a tailnet whois takes tens of ms); wait for it rather than dropping them.
-    let deadline = tokio::time::Instant::now() + AUTH_WAIT;
-    while !ctx.authed.load(Ordering::Relaxed) {
-        if tokio::time::Instant::now() > deadline {
-            return Ok(());
+    let signed_in = async {
+        while !ctx.authed.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    tokio::select! {
+        waited = tokio::time::timeout(AUTH_WAIT, signed_in) => {
+            if waited.is_err() {
+                return Ok(());
+            }
+        }
+        // Turned away or gone: stop waiting now, not at the deadline.
+        _ = ctx.conn.closed() => return Ok(()),
     }
     let perms = ctx.perms.get().copied().unwrap_or(control::Perms {
         input: false,
@@ -2278,6 +2315,12 @@ fn apply_rate_report(shared: &Shared, report: crate::rate::Report) {
 /// Each remote (RTP) viewer's congestion-control estimate, as a cap on the shared encoders.
 static REMOTE_CAPS: Mutex<Option<std::collections::HashMap<u64, u32>>> = Mutex::new(None);
 static APPLIED_BPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The encoders' bitrate now (0 before it's first set): the WebRTC bridge sizes its queue
+/// by it.
+pub fn applied_bitrate() -> u32 {
+    APPLIED_BPS.load(Ordering::Relaxed)
+}
 
 /// Sets (or with `None` removes) a remote viewer's bitrate cap.
 pub fn set_remote_cap(viewer: u64, bps: Option<u32>) {

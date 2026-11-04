@@ -526,6 +526,7 @@ fn acl_cli(action: Option<&AclCommand>, json: bool) -> Result<()> {
                     clipboard: !*no_clipboard,
                     ask: *ask,
                     passkey: false,
+                    support: false,
                 },
                 duration_secs: grant.map(|d| d.as_secs()),
             };
@@ -819,10 +820,14 @@ fn main() -> Result<()> {
     };
     #[cfg(not(windows))]
     let args = Args::parse();
-    // Quick support keeps everything in its own temporary config, chosen before anything
-    // (or any thread) reads the environment.
+    // Quick support goes through the background service when it's running here, so only
+    // one process captures the screen. Otherwise it runs a host of its own, keeping
+    // everything in a temporary config chosen before anything (or any thread) reads the
+    // environment.
+    let support_via_service =
+        matches!(&args.command, Some(Command::Support { test: false, .. })) && support::service_running();
     let support_dir = match &args.command {
-        Some(Command::Support { .. }) => {
+        Some(Command::Support { .. }) if !support_via_service => {
             let dir = support::new_dir()?;
             // SAFETY: still single-threaded; nothing has read the environment yet.
             unsafe { std::env::set_var("GLASS_CONFIG_DIR", &dir) };
@@ -831,14 +836,17 @@ fn main() -> Result<()> {
         _ => None,
     };
     let rt = tokio::runtime::Runtime::new()?;
-    if let (Some(dir), Some(Command::Support { no_window, json, test })) = (support_dir, &args.command) {
+    if let Some(Command::Support { no_window, json, test }) = &args.command {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let session = match support::Session::start(dir.clone(), *test) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                return Err(e);
-            }
+        let session = match support_dir {
+            None => support::Session::start_via_service()?,
+            Some(dir) => match support::Session::start(dir.clone(), *test) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err(e);
+                }
+            },
         };
         // On the computer's own screen: a window. Over SSH, with --no-window or --json: here.
         #[cfg(any(target_os = "macos", windows))]
@@ -958,6 +966,7 @@ async fn async_main(args: Args) -> Result<()> {
                 clipboard: !*no_clipboard,
                 ask: *ask,
                 passkey: *passkey,
+                support: false,
             },
         ),
         Some(Command::Config { key, value }) => config_cli(key.as_deref(), value.as_deref()),

@@ -15,8 +15,10 @@ pub(crate) fn cli() -> &'static str {
     CLI.get_or_init(|| {
         let on_path = std::process::Command::new("tailscale")
             .arg("version")
-            .output()
-            .is_ok_and(|o| o.status.success());
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok_and(|child| exited_ok(child, CLI_TIMEOUT));
         if on_path || !std::path::Path::new(BUNDLED).exists() {
             "tailscale"
         } else {
@@ -25,11 +27,34 @@ pub(crate) fn cli() -> &'static str {
     })
 }
 
+/// How long a `tailscale` command may take. Startup waits on some of them, and the Mac
+/// app's CLI talks to the GUI app, so a busy or hung app mustn't hold Glass up.
+const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Waits for a child up to `limit`, killing it if it runs over; true if it exited cleanly.
+fn exited_ok(mut child: std::process::Child, limit: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 async fn json(args: &[&str]) -> Result<Value> {
-    let out = tokio::process::Command::new(cli())
+    let run = tokio::process::Command::new(cli())
         .args(args)
-        .output()
-        .await?;
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(CLI_TIMEOUT, run)
+        .await
+        .map_err(|_| anyhow::anyhow!("tailscale {} didn't answer in {}s", args[0], CLI_TIMEOUT.as_secs()))??;
     anyhow::ensure!(
         out.status.success(),
         "tailscale {}: {}",
@@ -234,10 +259,13 @@ pub async fn serves_https_to(port: u16) -> bool {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub async fn serve_https_to(port: u16) -> Result<()> {
     let target = format!("https+insecure://localhost:{port}");
-    let out = tokio::process::Command::new(cli())
+    let run = tokio::process::Command::new(cli())
         .args(["serve", "--bg", &target])
-        .output()
-        .await?;
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(CLI_TIMEOUT, run)
+        .await
+        .map_err(|_| anyhow::anyhow!("tailscale serve didn't answer in {}s", CLI_TIMEOUT.as_secs()))??;
     anyhow::ensure!(
         out.status.success(),
         "tailscale serve: {}",
@@ -318,8 +346,10 @@ pub async fn probe() -> Probe {
     let Ok(status) = json(&["status", "--json"]).await else {
         let installed = std::process::Command::new(cli())
             .arg("version")
-            .output()
-            .is_ok();
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok_and(|child| exited_ok(child, CLI_TIMEOUT));
         return if installed {
             Probe::NotRunning
         } else {
@@ -361,16 +391,23 @@ pub async fn ensure_cert(
     let cert = dir.join(format!("{name}.crt"));
     let key = dir.join(format!("{name}.key"));
     // `tailscale cert` only contacts Let's Encrypt when the cert is missing or near expiry.
-    let out = tokio::process::Command::new(cli())
+    // Longer than other commands: it may have to get a certificate from Let's Encrypt.
+    let run = tokio::process::Command::new(cli())
         .arg("cert")
         .arg("--cert-file")
         .arg(&cert)
         .arg("--key-file")
         .arg(&key)
         .arg(&name)
-        .output()
-        .await
-        .ok()?;
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(Duration::from_secs(90), run).await {
+        Ok(out) => out.ok()?,
+        Err(_) => {
+            tracing::warn!("tailscale cert didn't answer in 90s");
+            return None;
+        }
+    };
     if !out.status.success() {
         tracing::warn!(
             "tailscale cert: {}",
