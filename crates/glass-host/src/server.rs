@@ -1919,7 +1919,11 @@ fn record_auth_failure(shared: &Shared, peer: std::net::IpAddr) {
     entry.0 += 1;
 }
 
-const AUTH_WAIT: Duration = Duration::from_secs(10);
+/// How long a stream opened before sign-in finishes waits for it. Covers the person at the
+/// computer answering "let them in?" (up to `approval::TIMEOUT`), not just a tailnet whois:
+/// a viewer's input stream opens right after hello, and dropping it after a shorter wait
+/// left an approved viewer seeing the screen with no mouse or keyboard.
+const AUTH_WAIT: Duration = Duration::from_secs(crate::approval::TIMEOUT.as_secs() + 10);
 
 /// Input streams open right now, across viewers.
 static INPUT_STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1929,12 +1933,19 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
     stream.read_exact(&mut tag).await?;
     // Streams opened right after hello can arrive while auth is still in progress
     // (a tailnet whois takes tens of ms); wait for it rather than dropping them.
-    let deadline = tokio::time::Instant::now() + AUTH_WAIT;
-    while !ctx.authed.load(Ordering::Relaxed) {
-        if tokio::time::Instant::now() > deadline {
-            return Ok(());
+    let signed_in = async {
+        while !ctx.authed.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    tokio::select! {
+        waited = tokio::time::timeout(AUTH_WAIT, signed_in) => {
+            if waited.is_err() {
+                return Ok(());
+            }
+        }
+        // Turned away or gone: stop waiting now, not at the deadline.
+        _ = ctx.conn.closed() => return Ok(()),
     }
     let perms = ctx.perms.get().copied().unwrap_or(control::Perms {
         input: false,
