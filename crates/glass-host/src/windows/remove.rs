@@ -78,11 +78,12 @@ pub fn everything() -> Result<()> {
         }
         if rule {
             admin += &format!(
-                "Get-NetFirewallApplicationFilter -Program {} | Get-NetFirewallRule | Where-Object DisplayName -eq 'Glass' | Remove-NetFirewallRule; ",
+                "Get-NetFirewallApplicationFilter -Program {} | Get-NetFirewallRule | Where-Object {{ $_.DisplayName -eq 'Glass' -or $_.DisplayName -eq 'Glass-new' }} | Remove-NetFirewallRule; ",
                 ps(&exe.display().to_string())
             );
         }
-        admin += "Remove-ItemProperty -Path 'HKLM:\\SOFTWARE\\Glass' -Name FirewallScope -ErrorAction SilentlyContinue; ";
+        // A missing value is success. Any other failure fails this step.
+        admin += "try { Remove-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Glass' -Name FirewallScope -ErrorAction Stop } catch { $id = [string]$_.FullyQualifiedErrorId; if ($id -notlike '*PathNotFound*' -and $id -notlike '*ItemNotFound*' -and $id -notlike 'System.Management.Automation.PSArgumentException*') { Write-Error 'Could not remove HKLM\\SOFTWARE\\Glass FirewallScope.'; exit 1 } }; ";
         let done = if super::service::is_elevated() {
             super::powershell(&admin).status().is_ok_and(|s| s.success())
         } else {
@@ -91,12 +92,12 @@ pub fn everything() -> Result<()> {
         if !done {
             eprintln!("The secure-desktop service, firewall rule, and saved firewall scope weren't removed (administrator approval was declined?). Remove the service later with: glass service uninstall");
         }
-    } else if firewall::machine_scope().is_some() {
-        if super::service::is_elevated() {
-            firewall::clear_machine_scope();
-        } else {
-            eprintln!("The saved firewall scope wasn't removed. That needs administrator.");
+    } else if super::service::is_elevated() {
+        if let Err(e) = firewall::clear_machine_scope() {
+            eprintln!("{e}");
         }
+    } else if firewall::machine_scope().is_some() {
+        eprintln!("The saved firewall scope wasn't removed. That needs administrator.");
     }
 
     let _ = std::fs::remove_file(start_menu_link());

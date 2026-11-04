@@ -140,11 +140,6 @@ pub fn delete_rule_args(exe: &Path) -> String {
     delete_named_args(exe, "Glass")
 }
 
-/// The add command, but under a temporary name so a later delete of `Glass` leaves it.
-fn pending_add(add: &str) -> String {
-    add.replacen("name=\"Glass\"", "name=\"Glass-new\"", 1)
-}
-
 /// netsh arguments for Glass's allow, or `None` when loopback needs no allow.
 pub fn add_rule_args(exe: &Path, remote: Remote) -> Option<String> {
     let base = format!(
@@ -166,31 +161,101 @@ fn netsh(args: &str) -> bool {
     cmd.status().is_ok_and(|s| s.success())
 }
 
-/// Adds the rule `remote` asks for, then removes the previous Glass rules. Already admin.
-/// The new rule is added as `Glass-new` first, so a delete of `Glass` cannot remove it.
-/// Loopback only deletes. A missing rule counts as deleted. Success is the firewall then matching `remote`.
+/// Deletes Glass's rules (and a leftover `Glass-new`), then adds the one `remote` asks for.
+/// If that add fails, the Glass rules listed beforehand are put back. Already admin.
 fn replace_rule(exe: &Path, remote: Remote) -> bool {
-    let Some(add) = add_rule_args(exe, remote) else {
-        return remove_rule_quietly(exe);
+    let Some(listed) = program_rules(exe) else {
+        log_scope("Couldn't list the firewall rules, so the Glass rule was left unchanged.");
+        return false;
     };
-    if !netsh(&pending_add(&add)) {
+    let plan = replace_plan(exe, remote, &listed);
+    for cmd in &plan.delete {
+        let _ = netsh(cmd);
+    }
+    if program_rules(exe).is_none_or(|rs| rs.iter().any(|r| our_name(&r.name))) {
+        log_scope("Couldn't remove the existing Glass firewall rule, so it was left unchanged.");
         return false;
     }
-    if !remove_rule_quietly(exe) {
-        let _ = netsh(&delete_named_args(exe, "Glass-new"));
-        return false;
+    let Some(add) = plan.add else { return true };
+    if netsh(&add) && in_sync(exe, remote) == Some(true) {
+        return true;
     }
-    let renamed = netsh(&format!(
-        "advfirewall firewall set rule name=\"Glass-new\" program=\"{}\" new name=\"Glass\"",
-        program(exe)
-    ));
-    if !renamed && !netsh(&add) {
-        return false;
+    log_scope("Couldn't add the Glass firewall rule; putting the previous one back.");
+    if plan.restore.iter().any(|cmd| !netsh(cmd)) {
+        log_scope("Couldn't put the previous Glass firewall rule back.");
     }
-    if !renamed {
-        let _ = netsh(&delete_named_args(exe, "Glass-new"));
+    false
+}
+
+/// `Glass` and a leftover `Glass-new` from an interrupted update.
+fn our_name(name: &str) -> bool {
+    let name = name.trim();
+    name.eq_ignore_ascii_case("Glass") || name.eq_ignore_ascii_case("Glass-new")
+}
+
+struct ReplacePlan {
+    delete: Vec<String>,
+    add: Option<String>,
+    restore: Vec<String>,
+}
+
+/// Delete both names, then add. `restore` is the previous `Glass` rules, used only if the add fails.
+/// A leftover `Glass-new` is deleted and not put back.
+fn replace_plan(exe: &Path, remote: Remote, previous: &[Rule]) -> ReplacePlan {
+    let delete = vec![delete_named_args(exe, "Glass-new"), delete_rule_args(exe)];
+    let add = add_rule_args(exe, remote);
+    let restore = if add.is_none() {
+        Vec::new()
+    } else {
+        previous.iter().filter(|r| r.name.trim().eq_ignore_ascii_case("Glass")).map(|r| restore_add(exe, r)).collect()
+    };
+    ReplacePlan { delete, add, restore }
+}
+
+fn restore_add(exe: &Path, rule: &Rule) -> String {
+    let dir = if rule.inbound { "in" } else { "out" };
+    let action = if rule.allow { "allow" } else { "block" };
+    let enable = if rule.enabled { "yes" } else { "no" };
+    let mut cmd = format!(
+        "advfirewall firewall add rule name=\"Glass\" dir={dir} action={action} program=\"{}\" enable={enable} profile={}",
+        program(exe),
+        profile_arg(rule.profiles)
+    );
+    let remote = rule.remote.trim();
+    if !remote.is_empty() && !remote.eq_ignore_ascii_case("*") && !remote.eq_ignore_ascii_case("any") {
+        cmd.push_str(&format!(" remoteip=\"{remote}\""));
     }
-    in_sync(exe, remote) == Some(true)
+    cmd
+}
+
+fn profile_arg(profiles: i32) -> String {
+    use windows::Win32::NetworkManagement::WindowsFirewall::{NET_FW_PROFILE2_ALL, NET_FW_PROFILE2_DOMAIN, NET_FW_PROFILE2_PUBLIC};
+    if profiles == NET_FW_PROFILE2_ALL.0 {
+        return "any".into();
+    }
+    let mut parts = Vec::new();
+    if profiles & NET_FW_PROFILE2_DOMAIN.0 != 0 {
+        parts.push("domain");
+    }
+    if profiles & NET_FW_PROFILE2_PRIVATE.0 != 0 {
+        parts.push("private");
+    }
+    if profiles & NET_FW_PROFILE2_PUBLIC.0 != 0 {
+        parts.push("public");
+    }
+    if parts.is_empty() { "any".into() } else { parts.join(",") }
+}
+
+/// Commands actually run: the deletes, the add, and the restore when the add fails.
+fn commands_after(plan: &ReplacePlan, add_ok: bool) -> Vec<String> {
+    let mut out = plan.delete.clone();
+    if let Some(add) = &plan.add {
+        out.push(add.clone());
+        if !add_ok {
+            out.extend(plan.restore.clone());
+        }
+    }
+    out
 }
 
 /// Replaces Glass's rule from the saved bind. `false` leaves any existing rule as it is.
@@ -214,21 +279,17 @@ pub fn apply_known(exe: &Path, remote: Remote) -> bool {
     true
 }
 
-/// Removes Glass's rule for `exe`. `true` when no rule of that name remains for it,
+/// Removes Glass's rule for `exe`, and a leftover `Glass-new`. `true` when neither name remains,
 /// including when there was nothing to delete.
 pub fn remove_rule_quietly(exe: &Path) -> bool {
+    let _ = netsh(&delete_named_args(exe, "Glass-new"));
     let _ = netsh(&delete_rule_args(exe));
-    glass_named(exe) == Some(false)
+    program_rules(exe).is_some_and(|rs| !rs.iter().any(|r| our_name(&r.name)))
 }
 
 /// Every rule named Glass for `exe`, whatever its profile. `None` if the firewall can't be listed.
 fn glass_rules(exe: &Path) -> Option<Vec<Rule>> {
     Some(rules()?.into_iter().filter(|r| r.name.trim().eq_ignore_ascii_case("Glass") && same_program(&r.program, exe)).collect())
-}
-
-/// Any rule named Glass for `exe`, enabled or not. `None` if the firewall can't be listed.
-fn glass_named(exe: &Path) -> Option<bool> {
-    Some(!glass_rules(exe)?.is_empty())
 }
 
 /// Hidden argument: relaunch this program elevated and run [`apply_from_arg`].
@@ -329,15 +390,22 @@ pub fn machine_scope() -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// Removes the machine-wide scope. A missing value is fine. Needs administrator.
-pub fn clear_machine_scope() {
-    let _ = unsafe {
+/// Removes only the FirewallScope value. A missing key or value is success.
+pub fn clear_machine_scope() -> Result<(), String> {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
+    // SAFETY: deletes one value. A missing key or value is success.
+    let err = unsafe {
         windows::Win32::System::Registry::RegDeleteKeyValueW(
             windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
             &HSTRING::from(SCOPE_KEY),
             &HSTRING::from(SCOPE_VALUE),
         )
     };
+    if err == ERROR_SUCCESS || err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(format!("Couldn't remove HKLM\\SOFTWARE\\Glass FirewallScope ({}).", err.0))
+    }
 }
 
 fn store_scope(remote: Remote) -> bool {
@@ -395,7 +463,11 @@ pub fn program_rules(exe: &Path) -> Option<Vec<Rule>> {
 }
 
 /// Whether the rules named Glass in `rules` are exactly what `remote` asks for.
+/// A leftover `Glass-new` means not in sync, including for loopback.
 pub fn glass_matches(rules: &[Rule], remote: Remote) -> bool {
+    if rules.iter().any(|r| r.name.trim().eq_ignore_ascii_case("Glass-new")) {
+        return false;
+    }
     let glass: Vec<Rule> = rules.iter().filter(|r| r.name.trim().eq_ignore_ascii_case("Glass")).cloned().collect();
     rules_match(&glass, remote)
 }
@@ -485,11 +557,32 @@ mod tests {
         assert!(tailscale.contains("remoteip=\"100.64.0.0/10,fd7a:115c:a1e0::/48\""));
         assert!(tailscale.ends_with("edge=no"));
         assert!(add_rule_args(exe, Remote::Loopback).is_none());
-        let pending = pending_add(&tailscale);
-        assert!(pending.contains("name=\"Glass-new\""));
-        assert!(!pending.contains("name=\"Glass\""));
-        assert!(delete_rule_args(exe).contains("name=\"Glass\""));
-        assert!(!delete_rule_args(exe).contains("Glass-new"));
+    }
+
+    #[test]
+    fn replace_deletes_a_stale_temp_rule_and_restores_on_add_failure() {
+        let exe = Path::new(r"C:\Program Files\Glass\glass.exe");
+        let mut stale = rule(r"C:\Program Files\Glass\glass.exe", true, NET_FW_PROFILE2_PRIVATE.0);
+        stale.name = "Glass-new".into();
+        stale.remote = "*".into();
+        let mut old = rule(r"C:\Program Files\Glass\glass.exe", true, NET_FW_PROFILE2_PRIVATE.0);
+        old.name = "Glass".into();
+        old.remote = "*".into();
+        assert!(!glass_matches(&[stale.clone(), old.clone()], Remote::Tailscale));
+        assert!(!glass_matches(&[stale.clone()], Remote::Loopback), "loopback is not done while Glass-new remains");
+        let plan = replace_plan(exe, Remote::Tailscale, &[stale, old]);
+        assert!(plan.delete.iter().any(|c| c.contains("name=\"Glass-new\"")));
+        assert!(plan.restore.iter().all(|c| c.contains("name=\"Glass\"") && !c.contains("Glass-new")));
+        assert_eq!(plan.restore.len(), 1);
+        assert!(!plan.restore[0].contains("remoteip"), "the previous any-address rule is what gets put back");
+        let failed = commands_after(&plan, false);
+        assert!(failed[0].contains("name=\"Glass-new\""));
+        assert!(failed[1].contains("name=\"Glass\"") && !failed[1].contains("Glass-new"));
+        assert!(failed[2].contains("remoteip="), "the new rule is added after both deletes");
+        assert_eq!(failed.last().unwrap(), &plan.restore[0]);
+        let loopback = replace_plan(exe, Remote::Loopback, &[]);
+        assert!(loopback.add.is_none() && loopback.restore.is_empty());
+        assert!(commands_after(&loopback, false).iter().any(|c| c.contains("Glass-new")));
     }
 
     #[test]

@@ -77,6 +77,8 @@ fn firewall_step() -> Result<()> {
         log::warning("Couldn't read the firewall's rules; Windows may ask about Glass when it starts.")?;
         return Ok(());
     };
+    // Before any skip, failure, or success line, so other allows are named either way.
+    warn_other_allows(&listed)?;
     let state = firewall::decide(&listed, |_| true);
     // A loopback bind needs no inbound allow, so a block rule is not something to tick Private for.
     if state == Inbound::Blocked && remote != Remote::Loopback {
@@ -89,12 +91,12 @@ fn firewall_step() -> Result<()> {
     }
     if firewall::glass_matches(&listed, remote) {
         log::success(firewall::ready_sentence(remote))?;
-        return warn_other_allows(&listed);
+        return Ok(());
     }
     let missing = state == Inbound::Missing;
     let (title, body, question, skip) = match (remote, missing) {
         (Remote::Loopback, _) => ("Glass only listens on this computer", "It doesn't need an inbound firewall rule, so Glass can remove the one named Glass for this program. Windows asks for administrator approval once.", "Remove the inbound rule now?", "Skipped: the firewall rule was left in place."),
-        (Remote::Tailscale, _) => ("Only Tailscale can connect", "Glass listens on Tailscale, so its firewall rule can allow only 100.64.0.0/10 and fd7a:115c:a1e0::/48. Windows asks for administrator approval once.", "Update the firewall rule now?", "Skipped: the firewall rule was left as it is."),
+        (Remote::Tailscale, _) => ("Limit Glass's own rule to Tailscale", "Glass's own firewall rule can allow only 100.64.0.0/10 and fd7a:115c:a1e0::/48. Any other allow for this program is left as it is. Windows asks for administrator approval once.", "Update Glass's firewall rule now?", "Skipped: Glass's firewall rule was left as it is."),
         (Remote::Any, true) => ("Let your other devices connect", "Windows Defender Firewall blocks incoming connections until a program is allowed.\nGlass can add a rule for itself on private networks (home, work and Tailscale),\nnot public ones like a café's. Windows asks for administrator approval once.", "Add the rule now?", "Skipped: Windows will ask when Glass first starts. Choose Allow there."),
         (Remote::Any, false) => ("Let your other devices connect", "Glass can update its firewall rule so private networks (home, work and Tailscale) can connect, not public ones like a café's. Windows asks for administrator approval once.", "Update the firewall rule now?", "Skipped: the firewall rule was left as it is."),
     };
@@ -106,11 +108,8 @@ fn firewall_step() -> Result<()> {
     let _ = firewall::add_rule_elevated(&exe);
     if firewall::in_sync(&exe, remote) == Some(true) {
         log::success(firewall::ready_sentence(remote))?;
-        if let Some(listed) = firewall::program_rules(&exe) {
-            warn_other_allows(&listed)?;
-        }
     } else {
-        log::warning("The firewall rule wasn't updated. Run `glass setup` again; it adds the new Glass rule before removing the old one.")?;
+        log::warning("The firewall rule wasn't updated. If the new rule could not be added, the previous Glass rule is put back. Run `glass setup` again.")?;
     }
     Ok(())
 }
@@ -127,9 +126,9 @@ pub fn prepare_unattended() -> Vec<crate::setup::Need> {
         Ok(remote) if firewall::in_sync(&exe, remote) == Some(true) => None,
         Ok(remote) if firewall::add_rule_quietly(&exe) && firewall::in_sync(&exe, remote) == Some(true) => None,
         Ok(remote) => Some(match remote {
-            Remote::Tailscale => "Limit Glass's firewall rule to Tailscale (100.64.0.0/10 and fd7a:115c:a1e0::/48). Run `glass setup`; it adds the Tailscale rule before removing the old one.".into(),
+            Remote::Tailscale => "Limit Glass's own firewall rule to Tailscale (100.64.0.0/10 and fd7a:115c:a1e0::/48). Run `glass setup`. If the new rule cannot be added, the previous one is put back.".into(),
             Remote::Loopback => "Remove Glass's inbound firewall rule (it only listens on this computer). Run `glass setup`.".into(),
-            Remote::Any => "Allow Glass through Windows Defender Firewall on private networks. Run `glass setup` (asks for administrator approval once); it adds the new rule before removing the old one.".into(),
+            Remote::Any => "Allow Glass through Windows Defender Firewall on private networks. Run `glass setup` (asks for administrator approval once). If the new rule cannot be added, the previous one is put back.".into(),
         }),
     };
     if let Some(action) = action {
