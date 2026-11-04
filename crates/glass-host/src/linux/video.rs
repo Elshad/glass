@@ -321,8 +321,11 @@ fn encode_loop(
     let mut encoder: Option<VideoEncoder> = None;
     let mut applied_bitrate = bitrate;
     let mut last: Option<(Frame, u64)> = None;
+    // The latest picture hasn't been encoded yet (held while a viewer's link is full).
+    let mut unsent = false;
     loop {
-        let fresh = match rx.recv_timeout(IDLE_POLL) {
+        let wait = if unsent { crate::flow::POLL } else { IDLE_POLL };
+        let fresh = match rx.recv_timeout(wait) {
             Ok(f) => Some(f),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
@@ -353,9 +356,10 @@ fn encode_loop(
         if slot < 0 {
             continue;
         }
+        unsent |= has_fresh;
         let wants_key = monitor.keyframe.load(Ordering::Relaxed);
         // Nothing new: only re-encode the last frame to answer a keyframe request.
-        if !has_fresh && !wants_key {
+        if !unsent && !wants_key {
             continue;
         }
         let Some((frame, captured_us)) = last.as_ref() else {
@@ -409,7 +413,13 @@ fn encode_loop(
                 }));
             }
         }
-        let capture_us = if has_fresh { *captured_us } else { now_us() };
+        // A viewer's link is still busy (crate::flow): keep the picture and look again
+        // shortly; the next frame carries every change since.
+        if !wants_key && crate::flow::held(slot as u8) {
+            continue;
+        }
+        let capture_us = if unsent { *captured_us } else { now_us() };
+        unsent = false;
         match encoder.as_mut().unwrap().encode(frame, force) {
             Ok(Some((data, keyframe))) => {
                 let _ = frames.send(Arc::new(EncodedFrame {

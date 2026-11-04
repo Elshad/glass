@@ -394,9 +394,37 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let mut last_heard = std::time::Instant::now();
     let mut quiet_check = tokio::time::interval(QUIET_CHECK);
 
+    // Flow control (crate::flow): frames still in QUIC's datagram buffer hold capture
+    // back, so a slow link gets fewer frames instead of a growing queue.
+    let datagram_capacity = conn.quic_connection().datagram_send_buffer_space();
+    let mut link = crate::flow::Link::default();
+    let mut flow = crate::flow::Viewer::new();
+    let mut pressure = crate::flow::Pressure::default();
+    let mut last_pressure_check = std::time::Instant::now();
+    let mut flow_poll = tokio::time::interval(crate::flow::POLL);
+    flow_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     let result: Result<()> = async {
         loop {
             tokio::select! {
+                _ = flow_poll.tick(), if link.busy() => {
+                    let now = std::time::Instant::now();
+                    link.set_rtt(conn.rtt(), now);
+                    link.drained(datagrams_queued(&conn, datagram_capacity), now);
+                    pressure.note(flow.update(&mut link, now), now);
+                    // Held much of the last second: frames are bigger than the link takes.
+                    if now.duration_since(last_pressure_check) >= Duration::from_secs(1) {
+                        last_pressure_check = now;
+                        if pressure.take(now) {
+                            apply_rate_report(&shared, crate::rate::Report {
+                                dropped: 1,
+                                frames: 1,
+                                latency_ms: None,
+                                received_bps: None,
+                            });
+                        }
+                    }
+                }
                 _ = quiet_check.tick() => {
                     if last_heard.elapsed() > QUIET_LIMIT {
                         bail!("viewer went quiet for {}s", QUIET_LIMIT.as_secs());
@@ -422,7 +450,13 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                     }
                     let Some(next_id) = next_frame_id.get_mut(frame.stream as usize) else { continue };
                     if authed.load(Ordering::Relaxed) && video_on.load(Ordering::Relaxed) {
-                        send_frame(&conn, &frame, next_id)?;
+                        let now = std::time::Instant::now();
+                        link.drained(datagrams_queued(&conn, datagram_capacity), now);
+                        let (id, bytes) = send_frame(&conn, &frame, next_id)?;
+                        if bytes > 0 {
+                            link.sent(frame.stream, id, bytes, now);
+                        }
+                        pressure.note(flow.update(&mut link, now), now);
                     } else {
                         // Keep ids moving so a resumed client sees a gap and waits for a keyframe.
                         *next_id = next_id.wrapping_add(1);
@@ -438,6 +472,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                 packet = audio.recv() => {
                     match packet {
                         Ok(p) if audio_tap.wants(&p) => {
+                            link.other(p.len());
                             conn.send_datagram(p.as_slice())?;
                         }
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -453,6 +488,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                     match dgram.first() {
                         Some(&KIND_PING) => {
                             if let Some(pong) = glass_proto::pong(&dgram, now_us()) {
+                                link.other(pong.len());
                                 conn.send_datagram(pong)?;
                             }
                         }
@@ -2156,17 +2192,18 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
 }
 
 /// Frame ids are per session so the client sees a gap only when this session lost a frame.
+/// Returns the frame's id and the bytes sent (0 if test mode dropped it).
 fn send_frame(
     conn: &wtransport::Connection,
     frame: &EncodedFrame,
     next_id: &mut u32,
-) -> Result<()> {
+) -> Result<(u32, usize)> {
     let max = conn.max_datagram_size().unwrap_or(1200);
     let id = *next_id;
     *next_id = next_id.wrapping_add(1);
     // Test-mode fault injection: a dropped frame leaves a gap in the ids.
     if crate::testmode::take_drop() {
-        return Ok(());
+        return Ok((id, 0));
     }
     let flags = if frame.keyframe {
         glass_proto::FLAG_KEYFRAME
@@ -2192,10 +2229,17 @@ fn send_frame(
     {
         *byte ^= 0xff;
     }
+    let mut bytes = 0;
     for dgram in dgrams {
+        bytes += dgram.len();
         conn.send_datagram(dgram)?;
     }
-    Ok(())
+    Ok((id, bytes))
+}
+
+/// Bytes waiting in a session's datagram send buffer (`capacity`: its space when empty).
+fn datagrams_queued(conn: &wtransport::Connection, capacity: usize) -> usize {
+    capacity.saturating_sub(conn.quic_connection().datagram_send_buffer_space())
 }
 
 #[derive(serde::Serialize, Clone)]

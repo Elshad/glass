@@ -270,6 +270,7 @@ impl Video {
         ));
         let capture = capture::start(
             target.source(),
+            index,
             width,
             height,
             fps as i32,

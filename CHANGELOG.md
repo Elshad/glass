@@ -18,6 +18,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 - Sound from the computer takes about a tenth of the bandwidth: browsers that can decode Opus (Chrome, Edge, Firefox, Safari 26) get it as Opus at 96 kbps instead of 1.5 Mbps of raw audio, so on a slow or relayed connection (a car's browser) sound no longer crowds out the picture. Older Safari keeps getting raw audio.
 - Scrolling keeps up with your fingers on a phone or tablet: two-finger and wheel scrolling move the remote content as far as they move it on your screen, whatever size the remote display is shown at (before, a Mac shown at a quarter size scrolled about four times too slowly). On a Mac, slow trackpad scrolling no longer gets lost to rounding, and apps scroll as smoothly as with a trackpad.
 - Chinese, Japanese and Korean input methods, emoji, and accented letters from a phone or tablet keyboard now type on the remote computer (before, they were dropped). On Linux hosts, characters a US keyboard doesn't have still can't be typed.
+- On a slow or lossy link, the picture no longer sticks waiting for a keyframe: while a viewer's connection is still busy with the last frames, Glass waits before capturing the next one, and that frame then carries everything that changed. Fewer frames get through, but none are dropped.
 
 ## 0.13.1
 

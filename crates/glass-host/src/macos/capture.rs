@@ -41,6 +41,8 @@ unsafe impl Send for LastFrame {}
 
 pub struct FrameState {
     encoder: Arc<Encoder>,
+    /// Its stream number, for flow control (crate::flow).
+    stream: u8,
     last: std::sync::Mutex<LastFrame>,
     /// Frame-rate ceiling from the sharpness policy (fewer, sharper frames on a slow link).
     fps_cap: Arc<std::sync::atomic::AtomicU32>,
@@ -49,7 +51,8 @@ pub struct FrameState {
     /// Bumped on every new image; a pending check that sees it unchanged knows the screen
     /// has gone still.
     generation: std::sync::atomic::AtomicU64,
-    /// The newest image was skipped by the frame-rate ceiling and still needs sending.
+    /// The newest image was skipped (by the frame-rate ceiling, or held while a viewer's
+    /// link is full) and still needs sending.
     unsent: std::sync::atomic::AtomicBool,
     /// Idle refreshes done since the screen went still, and how many came out tiny.
     refreshes: std::sync::atomic::AtomicU32,
@@ -79,12 +82,23 @@ impl FrameState {
             .encode(&image, unsafe { CMTime::new(now as i64, 1_000_000) }, now, refresh);
     }
 
+    /// Capture should wait: a viewer's link is still busy (crate::flow). A keyframe someone
+    /// is waiting for goes anyway.
+    fn held(&self) -> bool {
+        crate::flow::held(self.stream) && !self.encoder.keyframe_pending()
+    }
+
     /// After a frame (sent or skipped): if nothing newer arrives, send what was skipped,
     /// then keep refining the still picture for a while.
     fn schedule_idle_check(self: &Arc<Self>) {
         use std::sync::atomic::Ordering::Relaxed;
         let fps = self.fps_cap.load(Relaxed).max(1);
         let wait = REFRESH_INTERVAL.max(std::time::Duration::from_micros(1_000_000 / fps as u64));
+        self.schedule_check(wait);
+    }
+
+    fn schedule_check(self: &Arc<Self>, wait: std::time::Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
         let generation = self.generation.load(Relaxed);
         let state = self.clone();
         let Ok(when) = dispatch2::DispatchTime::try_from(wait) else {
@@ -93,6 +107,11 @@ impl FrameState {
         let _ = self.queue.after(when, move || {
             if state.generation.load(Relaxed) != generation {
                 return; // newer frames took over
+            }
+            // Held: look again shortly, and send the newest picture once the link has room.
+            if state.held() {
+                state.schedule_check(crate::flow::POLL);
+                return;
             }
             if state.unsent.swap(false, Relaxed) {
                 state.encode_last(false);
@@ -177,11 +196,13 @@ define_class!(
             state.generation.fetch_add(1, Relaxed);
             state.refreshes.store(0, Relaxed);
             state.tiny.store(0, Relaxed);
-            // Over the frame-rate ceiling: keep the image, send it later if it's the last.
+            // Over the frame-rate ceiling, or a viewer's link is full: keep the image, and
+            // send it later if it's the last (a held one goes as soon as there's room).
             let fps = state.fps_cap.load(Relaxed);
             let since = capture_us.saturating_sub(state.last_encoded_us.load(Relaxed));
             let too_soon = fps > 0 && since < 900_000 / fps as u64;
-            if too_soon && !state.encoder.keyframe_pending() {
+            let held = state.held();
+            if (too_soon && !state.encoder.keyframe_pending()) || held {
                 state.unsent.store(true, Relaxed);
             } else {
                 state.unsent.store(false, Relaxed);
@@ -189,7 +210,11 @@ define_class!(
                 state.encoder.encode(&image, pts, capture_us, false);
             }
             *state.last.lock().unwrap() = LastFrame(Some(image), capture_us);
-            state.schedule_idle_check();
+            if held {
+                state.schedule_check(crate::flow::POLL);
+            } else {
+                state.schedule_idle_check();
+            }
         }
     }
 
@@ -791,6 +816,7 @@ pub fn list_displays() -> Result<Vec<Display>> {
 
 pub fn start(
     source: Source<'_>,
+    stream: u8,
     width: usize,
     height: usize,
     fps: i32,
@@ -848,6 +874,7 @@ pub fn start(
     let queue = DispatchQueue::new("glass.capture", DispatchQueueAttr::SERIAL);
     let state = Arc::new(FrameState {
         encoder,
+        stream,
         last: std::sync::Mutex::new(LastFrame(None, 0)),
         fps_cap,
         last_encoded_us: Default::default(),

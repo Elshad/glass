@@ -959,6 +959,12 @@ fn encode_loop(
         if !wants_key && (!unsent || Instant::now() < next_due) {
             continue;
         }
+        // A viewer's link is still busy (crate::flow): keep the picture and look again
+        // shortly; the next frame carries every change since.
+        if !wants_key && crate::flow::held(slot as u8) {
+            next_due = Instant::now() + crate::flow::POLL;
+            continue;
+        }
         monitor.keyframe.store(false, Ordering::Relaxed);
 
         let size = (frame.width, frame.height);
