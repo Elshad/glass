@@ -5,6 +5,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 ## Unreleased
 
 - Your own tailnet devices connect without a token even when Tailscale isn't ready when Glass starts (common right after signing in to Windows). Glass checks again on the next connection and then remembers the owner. For a minute and a half after startup, a viewer who didn't bring a token or a link reconnects instead of seeing the token screen.
+- If macOS's screen capture service stops answering (it can after Glass restarts), Glass restarts it and carries on, instead of hanging with no picture until someone restarts the Mac. Tailscale commands Glass runs at startup time out instead of holding it up.
 
 ## 0.13.1
 

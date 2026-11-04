@@ -513,9 +513,55 @@ fn shareable_content() -> Result<Retained<SCShareableContent>> {
         let _ = tx.send(result);
     });
     unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
-    rx.recv()?.context(
+    answer(&rx, "listing displays")?.context(
         "Screen Recording permission is required (System Settings → Privacy & Security)",
     )
+}
+
+/// How long ScreenCaptureKit gets to answer a request. It normally takes milliseconds; it
+/// doesn't answer at all when replayd (the system's capture service) is stuck.
+const SCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits for ScreenCaptureKit's completion handler, but not forever: when it doesn't
+/// answer, restarts replayd (see `recover_capture_service`) and fails, so the caller's
+/// retry finds a working service instead of blocking Glass for good.
+fn answer<T>(rx: &mpsc::Receiver<T>, what: &str) -> Result<T> {
+    match rx.recv_timeout(SCK_TIMEOUT) {
+        Ok(v) => Ok(v),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            recover_capture_service();
+            bail!("{what}: ScreenCaptureKit didn't answer in {}s", SCK_TIMEOUT.as_secs())
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => bail!("{what}: ScreenCaptureKit dropped the request"),
+    }
+}
+
+/// Restarts replayd, the per-user daemon behind ScreenCaptureKit, when it has stopped
+/// answering (seen after a host restart: "application connection being interrupted", then
+/// silence). Only this user's copy, at most every 5 minutes; launchd starts a fresh one on
+/// the next request. Other apps recording the screen lose a moment of capture, which
+/// beats a remote desktop that's down until someone at the Mac notices.
+fn recover_capture_service() {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(300)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    // SAFETY: getuid can't fail.
+    let uid = unsafe { libc::getuid() }.to_string();
+    let killed = std::process::Command::new("/usr/bin/pkill")
+        .args(["-KILL", "-x", "-U", &uid, "replayd"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if killed {
+        tracing::warn!("screen capture service (replayd) wasn't answering; restarted it");
+    } else {
+        tracing::warn!("screen capture service (replayd) isn't answering and couldn't be restarted");
+    }
 }
 
 /// All capturable displays, main display first. Sleeping displays are not listed.
@@ -650,7 +696,7 @@ pub fn start(
         let _ = tx.send(unsafe { err.as_ref() }.map(|e| e.localizedDescription().to_string()));
     });
     unsafe { stream.startCaptureWithCompletionHandler(Some(&handler)) };
-    if let Some(err) = rx.recv()? {
+    if let Some(err) = answer(&rx, "starting capture")? {
         bail!("startCapture: {err}");
     }
 
