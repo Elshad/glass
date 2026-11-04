@@ -453,13 +453,28 @@ async function receiveFile(r) {
     got += chunk.byteLength;
     if (performance.now() - lastReport > 200) {
       lastReport = performance.now();
-      self.postMessage({ type: 'fileProgress', id, name: header.name, done: got, total: header.size, direction: 'down' });
+      self.postMessage({ type: 'fileProgress', id, name: header.name, done: got, total: header.streamed ? null : header.size, direction: 'down' });
     }
   }
-  if (got !== header.size) throw new Error(`${header.name}: got ${got} of ${header.size} bytes`);
+  // A folder zipped on the fly has no size up front: it's whole if it ends with the zip's
+  // end record (a broken remote stream just ends early).
+  if (header.streamed ? !endsLikeZip(chunks) : got !== header.size) throw new Error(`${header.name}: cut short after ${got} bytes`);
   const file = new File(chunks, header.name);
   self.postMessage({ type: 'fileReceived', id, file });
   log('info', 'file received', { name: header.name, size: got });
+}
+
+/** The last 22 bytes start the zip's end-of-central-directory record (no comment). */
+function endsLikeZip(chunks) {
+  const tail = new Uint8Array(22);
+  let need = 22;
+  for (let i = chunks.length - 1; i >= 0 && need; i--) {
+    const c = chunks[i];
+    const n = Math.min(need, c.byteLength);
+    tail.set(c.subarray(c.byteLength - n), need - n);
+    need -= n;
+  }
+  return !need && tail[0] === 0x50 && tail[1] === 0x4b && tail[2] === 5 && tail[3] === 6;
 }
 
 function onAudio(view, bytes) {

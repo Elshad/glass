@@ -63,6 +63,7 @@ mod testmode;
 mod thumbs;
 mod update;
 mod viewers;
+mod zipdir;
 #[cfg(any(windows, test))]
 mod win_capture;
 

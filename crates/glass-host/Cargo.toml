@@ -38,6 +38,7 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 rtc = { version = "0.21.1", default-features = false }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 png = "0.17"
+zip = { version = "7", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 gpui-kit = "0.8"

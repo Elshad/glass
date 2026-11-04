@@ -1218,7 +1218,7 @@ async fn control(
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     let result = match crate::browse::resolve(&crate::browse::root(), &path) {
-                        Ok(p) if p.is_dir() => Err(anyhow::anyhow!("folders can't be downloaded; open it and pick files")),
+                        Ok(p) if p.is_dir() => files::send_folder(&ctx.conn, &p).await,
                         Ok(p) => files::send(&ctx.conn, &p).await,
                         Err(e) => Err(e),
                     };
