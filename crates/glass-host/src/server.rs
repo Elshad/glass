@@ -112,6 +112,7 @@ pub async fn run(
         crate::mic::recover();
     }
 
+    crate::origin::start(wt_host.as_deref()).await;
     let cert_hash = cert_hash.map(|h| serde_json::from_str::<Vec<u8>>(&h).unwrap());
     let version_dir = web_dir.clone();
     let client_config = move || {
@@ -174,7 +175,9 @@ pub async fn run(
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
-        ));
+        ))
+        // Before anything else: no other site's page, and no rebound host name.
+        .layer(axum::middleware::from_fn(crate::origin::check));
     // Agents from anywhere: only the OAuth and MCP routes, on this computer alone, for
     // Tailscale Funnel to publish (glass agents public on). This listener is loopback-only
     // and does not follow --bind.
@@ -343,6 +346,13 @@ fn wt_server_config(
 
 async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let request = incoming.await?;
+    // Any site's page may open a session, and the owner's devices sign in by who they are:
+    // only Glass's own pages (this host's, or another of the owner's machines') may.
+    if let Some(why) = crate::origin::refuse_session(request.authority(), request.origin()) {
+        warn!("{}: refused a session: {why}", request.remote_address());
+        request.forbidden().await;
+        return Ok(());
+    }
     // A WebRTC viewer arrives through the local bridge, which vouches for its real address.
     let relayed = crate::remote::relayed_peer(request.path());
     let conn = request.accept().await?;

@@ -33,6 +33,7 @@ mod notify;
 mod now_playing;
 mod pcm;
 mod oidc;
+mod origin;
 mod passkey;
 mod policy;
 mod posture;

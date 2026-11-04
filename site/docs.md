@@ -116,7 +116,7 @@ Tools: `list_machines`, `screenshot`, `list_displays`, `click` (left, right, mid
 
 On a Mac, `snapshot` reads an app's window (and its menu bar) through Accessibility as text: each element's role, name and value, with a ref like `@k3f9:e12` on each one it can act on. `press` (buttons, links, checkboxes, tabs, menu items, rows) and `set_value` (text fields) act on a ref without moving your pointer, even in a window behind others. A ref is good only for the snapshot it came from: if the window changed, nothing happens and the agent is told to take a new snapshot. Password fields never show their contents, and an agent under a grant can't fill one in. Chrome and Electron apps (Slack, VS Code…) show a page's content only while their window is visible, so the agent brings the window to the front first; an app that has just launched may need a moment before it answers. Canvases, games and video don't appear in a snapshot: the agent uses screenshots for those.
 
-Only the computer's owner can drive it: your own tailnet devices, or this computer's token (which `glass mcp` reads by itself on this computer). Guests and links can't. Under the hood it's an HTTP API at `https://<computer>/agent/v1/` (`POST /agent/v1/act` with `{"action": "click", "x": 640, "y": 400}` and so on), if you'd rather call it directly.
+Only the computer's owner can drive it: your own tailnet devices, or this computer's token (which `glass mcp` reads by itself on this computer). Guests and links can't. Under the hood it's an HTTP API at `https://<computer>/agent/v1/` (`POST /agent/v1/act` with `{"action": "click", "x": 640, "y": 400}` and so on, sent as `Content-Type: application/json`), if you'd rather call it directly.
 
 ## Agents from anywhere
 

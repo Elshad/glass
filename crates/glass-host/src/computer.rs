@@ -910,6 +910,10 @@ async fn http_act(peer: Peer, headers: HeaderMap, body: axum::body::Bytes) -> Re
     if let Some(r) = owner(&peer, &headers).await {
         return r;
     }
+    // Never a page elsewhere posting text/plain without asking (no preflight).
+    if let Some(r) = crate::origin::require_json(&headers) {
+        return r;
+    }
     match serde_json::from_slice::<Action>(&body) {
         Ok(action) => reply(act(action).await),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),

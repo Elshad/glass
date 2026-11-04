@@ -10,6 +10,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 - `glass support` on a computer already running Glass shares through it, instead of starting a second copy that fought it for the screen (the picture froze in one of them). Ending support removes the helper's access and nothing else.
 - If `glass support` is closed without ending the session (killed, crashed), Glass removes the helper's access within seconds.
 - Viewers whose browser can't take WebRTC video (a Tesla's, for one) on a slow or relayed connection get a steadier picture: Glass keeps about a tenth of a second of video waiting and lowers the bitrate to what the link carries, instead of queuing most of a second and dropping frames in bursts.
+- Web pages on other sites can no longer drive or read your computer through a browser on one of your devices. Glass answers only for its own names (its tailnet name, IP addresses, localhost; `glass config allowed-hosts` adds more), so a site can't point its own domain at it (DNS rebinding), and it turns away requests and WebTransport sessions from other sites' pages (`glass config allowed-origins` lets one in). A refused request gets a 403 that says why. `POST /agent/v1/act` now needs `Content-Type: application/json`.
 
 ## 0.13.1
 

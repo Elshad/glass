@@ -98,6 +98,24 @@ pub fn self_addresses(status: &Value) -> Result<Vec<IpAddr>> {
     Ok(ips)
 }
 
+/// This machine's tailnet names (its MagicDNS name and the names it has certificates
+/// for), lowercase and without the trailing dot. Empty when Tailscale isn't up.
+pub async fn self_names() -> Vec<String> {
+    json(&["status", "--json"]).await.map(|s| names_from_status(&s)).unwrap_or_default()
+}
+
+fn names_from_status(status: &Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let certs = status["CertDomains"].as_array().into_iter().flatten();
+    for name in std::iter::once(&status["Self"]["DNSName"]).chain(certs).filter_map(Value::as_str) {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 fn login_from_status(status: &Value) -> Result<String> {
     let uid = status["Self"]["UserID"].as_u64().context("no Self.UserID")?;
     status["User"][uid.to_string()]["LoginName"]
@@ -522,6 +540,16 @@ mod tests {
         assert!(err.contains("NeedsLogin"), "{err}");
         let empty = serde_json::json!({"BackendState": "Running", "Self": {"TailscaleIPs": []}});
         assert!(self_addresses(&empty).is_err());
+    }
+
+    #[test]
+    fn reads_self_names() {
+        let status = serde_json::json!({
+            "Self": { "DNSName": "Box.tail1.ts.net." },
+            "CertDomains": ["box.tail1.ts.net", "glass.tail1.ts.net"]
+        });
+        assert_eq!(names_from_status(&status), ["box.tail1.ts.net", "glass.tail1.ts.net"]);
+        assert!(names_from_status(&serde_json::json!({})).is_empty());
     }
 
     #[test]
