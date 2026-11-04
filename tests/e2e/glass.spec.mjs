@@ -347,7 +347,9 @@ test.describe('input', () => {
     await expect.poll(async () => (await host.input('scroll')).events.length).toBeGreaterThan(0);
     const { events } = await host.input();
     expect(events.some((e) => e.t === 'down' && e.button === 2)).toBeTruthy();
-    expect((await host.input('scroll')).events.reduce((sum, e) => sum + e.dy, 0)).toBeCloseTo(120, 0);
+    // In the host's desktop points: the 640-point display is shown at another size.
+    const shown = Math.min(box.width / 640, box.height / 360) * 640;
+    expect((await host.input('scroll')).events.reduce((sum, e) => sum + e.dy, 0)).toBeCloseTo(120 * 640 / shown, 0);
   });
 
   it('sends typed keys as Mac keycodes', async ({ page, host }) => {

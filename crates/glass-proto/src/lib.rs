@@ -219,7 +219,9 @@ pub enum InputEvent {
     MouseMove { x: f32, y: f32, stream: u8 },
     MouseDown { button: u8 },
     MouseUp { button: u8 },
-    /// Pixel deltas, positive = content moves up/left (matches DOM `wheel` sign).
+    /// Deltas in the host's desktop points (the units of a display's `points_width`: macOS
+    /// points, Windows physical pixels, Linux logical pixels), positive = content moves
+    /// up/left (matches DOM `wheel` sign). Fractions count: hosts carry them over.
     Scroll { dx: f32, dy: f32 },
     /// macOS virtual keycode (kVK_*), mapped from `KeyboardEvent.code` by the client.
     KeyDown { keycode: u16 },

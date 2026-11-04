@@ -1263,6 +1263,7 @@ function fitSizes() {
 
 function onLayout(streams) {
   annotator.invalidate();
+  input.setStreams(streams);
   input.refreshCursor();
   for (const d of streams) if (!streamedWindows.has(d.id) && !displays.some((x) => x.id === d.id)) displays.push(d);
   // The host orders streams as arranged in macOS; lay them out the same way.
