@@ -112,6 +112,7 @@ pub async fn run(
         crate::mic::recover();
     }
 
+    crate::origin::start(wt_host.as_deref()).await;
     let cert_hash = cert_hash.map(|h| serde_json::from_str::<Vec<u8>>(&h).unwrap());
     let version_dir = web_dir.clone();
     let client_config = move || {
@@ -174,7 +175,9 @@ pub async fn run(
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
-        ));
+        ))
+        // Before anything else: no other site's page, and no rebound host name.
+        .layer(axum::middleware::from_fn(crate::origin::check));
     // Agents from anywhere: only the OAuth and MCP routes, on this computer alone, for
     // Tailscale Funnel to publish (glass agents public on). This listener is loopback-only
     // and does not follow --bind.
@@ -343,6 +346,13 @@ fn wt_server_config(
 
 async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let request = incoming.await?;
+    // Any site's page may open a session, and the owner's devices sign in by who they are:
+    // only Glass's own pages (this host's, or another of the owner's machines') may.
+    if let Some(why) = crate::origin::refuse_session(request.authority(), request.origin()) {
+        warn!("{}: refused a session: {why}", request.remote_address());
+        request.forbidden().await;
+        return Ok(());
+    }
     // A WebRTC viewer arrives through the local bridge, which vouches for its real address.
     let relayed = crate::remote::relayed_peer(request.path());
     let conn = request.accept().await?;
@@ -359,7 +369,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let rtp_video = relayed.as_ref().is_some_and(|r| r.rtp_video);
 
     let authed = Arc::new(AtomicBool::new(false));
-    let audio_on = Arc::new(AtomicBool::new(false));
+    let audio_tap = Arc::new(crate::opus_audio::AudioTap::default());
     let video_on = Arc::new(AtomicBool::new(true));
     let perms = Arc::new(std::sync::OnceLock::new());
     let mic_on = Arc::new(AtomicBool::new(false));
@@ -414,7 +424,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                 }
                 packet = audio.recv() => {
                     match packet {
-                        Ok(p) if audio_on.load(Ordering::Relaxed) => {
+                        Ok(p) if audio_tap.wants(&p) => {
                             conn.send_datagram(p.as_slice())?;
                         }
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -456,7 +466,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         conn: conn.clone(),
                         shared: shared.clone(),
                         authed: authed.clone(),
-                        audio_on: audio_on.clone(),
+                        audio: audio_tap.clone(),
                         video_on: video_on.clone(),
                         ctl_tx: ctl_tx.clone(),
                         relayed: relayed.clone(),
@@ -475,7 +485,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         conn: conn.clone(),
                         shared: shared.clone(),
                         authed: authed.clone(),
-                        audio_on: audio_on.clone(),
+                        audio: audio_tap.clone(),
                         video_on: video_on.clone(),
                         ctl_tx: ctl_tx.clone(),
                         relayed: relayed.clone(),
@@ -511,7 +521,8 @@ struct SessionCtx {
     conn: wtransport::Connection,
     shared: Arc<Shared>,
     authed: Arc<AtomicBool>,
-    audio_on: Arc<AtomicBool>,
+    /// Which system audio it gets (off, PCM or Opus).
+    audio: Arc<crate::opus_audio::AudioTap>,
     video_on: Arc<AtomicBool>,
     ctl_tx: mpsc::UnboundedSender<ServerMsg>,
     /// The real address of a WebRTC viewer (the connection itself is loopback).
@@ -884,6 +895,8 @@ async fn control(
         ctx.relayed.as_ref().is_some_and(|r| r.rtp_video),
     );
     let _sharp = crate::sharp::joined(session_id, codecs.iter().any(|c| c == "hevc-rext"));
+    // System audio as Opus where the viewer decodes it (WebCodecs); PCM otherwise (Safari < 26).
+    ctx.audio.set_opus(codecs.iter().any(|c| c == "opus"));
     let mut sharp_on = false;
     let thumbs_busy = Arc::new(AtomicBool::new(false));
     let thumbs_sent = Arc::new(std::sync::Mutex::new(crate::thumbs::Sent::default()));
@@ -1179,7 +1192,7 @@ async fn control(
                 apply_rate_report(shared, report);
             }
             ClientMsg::Audio { on } => {
-                ctx.audio_on.store(on, Ordering::Relaxed);
+                ctx.audio.set_on(on);
                 info!("{peer}: audio {}", if on { "on" } else { "off" });
                 #[cfg(windows)]
                 if on && crate::platform::audio::unavailable().is_some() {
@@ -1208,7 +1221,7 @@ async fn control(
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     let result = match crate::browse::resolve(&crate::browse::root(), &path) {
-                        Ok(p) if p.is_dir() => Err(anyhow::anyhow!("folders can't be downloaded; open it and pick files")),
+                        Ok(p) if p.is_dir() => files::send_folder(&ctx.conn, &p).await,
                         Ok(p) => files::send(&ctx.conn, &p).await,
                         Err(e) => Err(e),
                     };

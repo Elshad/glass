@@ -1032,7 +1032,8 @@ impl FrameGate {
             .then(|| glass_proto::VideoHeader::read(datagram))
             .flatten()
         else {
-            // Audio and pings: small; drop only if things are badly backed up.
+            // Audio (Opus where the browser decodes it: ~100 kbps, not 1.5 Mbps of PCM) and
+            // pings: small; drop only if things are badly backed up.
             return if outstanding < DATAGRAM_BACKLOG * 2 {
                 Admit::Send
             } else {
@@ -1245,6 +1246,19 @@ mod tests {
         assert_eq!(g.admit(&video(5, 0, 400, true), 0, DATAGRAM_BACKLOG), Admit::Send);
         assert_eq!(g.admit(&video(6, 0, 3, false), 0, DATAGRAM_BACKLOG), Admit::Send);
         assert_eq!(g.waiting_for_keyframe().count(), 0);
+    }
+
+    #[test]
+    fn audio_keeps_flowing_while_video_backs_off() {
+        let mut g = FrameGate::default();
+        let opus = glass_proto::opus_packet(0, 0, 2, &[0xFC; 120]);
+        let pcm = glass_proto::audio_packet(0, 0, 2, &[0; 480]);
+        // The queue is past what video may use: its frames go, audio of either kind doesn't.
+        assert_eq!(g.admit(&video(1, 0, 3, false), DATAGRAM_BACKLOG, DATAGRAM_BACKLOG), Admit::Drop);
+        assert_eq!(g.admit(&opus, DATAGRAM_BACKLOG, DATAGRAM_BACKLOG), Admit::Send);
+        assert_eq!(g.admit(&pcm, DATAGRAM_BACKLOG, DATAGRAM_BACKLOG), Admit::Send);
+        // Only a badly backed-up link drops it.
+        assert_eq!(g.admit(&opus, DATAGRAM_BACKLOG * 2, DATAGRAM_BACKLOG), Admit::Drop);
     }
 
     #[test]

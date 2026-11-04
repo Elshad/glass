@@ -31,8 +31,10 @@ mod media;
 mod mic;
 mod notify;
 mod now_playing;
+mod opus_audio;
 mod pcm;
 mod oidc;
+mod origin;
 mod passkey;
 mod policy;
 mod posture;
@@ -62,6 +64,7 @@ mod testmode;
 mod thumbs;
 mod update;
 mod viewers;
+mod zipdir;
 #[cfg(any(windows, test))]
 mod win_capture;
 
@@ -1243,8 +1246,11 @@ async fn run_host(args: Args) -> Result<()> {
     }
 
     let (frames, _) = broadcast::channel(8);
-    // ~80 ms of 5 ms packets; a session that falls further behind just skips ahead.
-    let (audio, _) = broadcast::channel(16);
+    // ~80 ms of 5 ms PCM packets and the 10 ms Opus packets made from them; a session that
+    // falls further behind just skips ahead.
+    let (audio, _) = broadcast::channel(24);
+    // One Opus encoder for every viewer that takes it, whichever source fills the channel.
+    opus_audio::start(audio.clone());
     let (events, _) = broadcast::channel(32);
 
     // Windows: link to the SYSTEM secure-desktop helper if the service is installed, so

@@ -63,7 +63,7 @@ pub fn routes() -> axum::Router {
 async fn cors_and_no_store(req: axum::extract::Request, next: axum::middleware::Next) -> Response<Body> {
     let path = req.uri().path().to_string();
     let origin = req.headers().get(header::ORIGIN).and_then(|o| o.to_str().ok()).map(String::from);
-    let open = path.starts_with("/.well-known/") || matches!(path.as_str(), "/oauth/register" | "/oauth/token" | "/oauth/revoke");
+    let open = any_origin(&path);
     let local_origin = origin.as_deref().and_then(split_url).is_some_and(|u| loopback(&u.host));
     let allow = if open { Some("*".to_string()) } else if path == "/mcp" && local_origin { origin.clone() } else { None };
     let mut r = if req.method() == axum::http::Method::OPTIONS && allow.is_some() {
@@ -83,6 +83,12 @@ async fn cors_and_no_store(req: axum::extract::Request, next: axum::middleware::
         h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("www-authenticate, mcp-session-id"));
     }
     r
+}
+
+/// Endpoints any site's page may call (they take no cookies), so origin.rs lets every
+/// origin through to them.
+pub fn any_origin(path: &str) -> bool {
+    path.starts_with("/.well-known/") || matches!(path, "/oauth/register" | "/oauth/token" | "/oauth/revoke")
 }
 
 /// HTTP/2 names the host in the URI (`:authority`), not a Host header: make it one, so
@@ -127,7 +133,9 @@ pub fn serve_public() {
                 return;
             }
         };
-        let app = routes().into_make_service_with_connect_info::<SocketAddr>();
+        let app = routes()
+            .layer(axum::middleware::from_fn(crate::origin::check))
+            .into_make_service_with_connect_info::<SocketAddr>();
         if let Err(e) = axum::serve(listener, app).await {
             warn!("agents: {e}");
         }

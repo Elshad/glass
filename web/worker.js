@@ -2,8 +2,8 @@
 // so none of the video path touches the main thread.
 
 import {
-  AUDIO_HEADER_LEN, KIND_AUDIO, KIND_KEYFRAME_REQUEST, KIND_PONG, KIND_VIDEO,
-  micPacket, ping, readPong, readVideoHeader,
+  AUDIO_HEADER_LEN, KIND_AUDIO, KIND_AUDIO_OPUS, KIND_KEYFRAME_REQUEST, KIND_PONG, KIND_VIDEO,
+  micPacket, ping, readAudioHeader, readPong, readVideoHeader,
 } from './proto.js';
 import { VideoStream, probeCodecs, probeDecoders, setDecoderStep } from './video-stream.js';
 import { RtcTransport } from './rtc-transport.js';
@@ -35,7 +35,7 @@ let rtcPort; // remote access: WebRTC over the main thread instead of WebTranspo
 let link; // magic link code; traded for a guest pass on first sign-in
 let pass; // guest pass
 let wideColor = false; // the screen shows Display P3: draw video in it
-let codecs = ['h264']; // what this browser decodes, offered in hello (HEVC if hardware)
+let codecs = ['h264']; // what this browser decodes, offered in hello (HEVC if hardware, Opus)
 let rejected = false;
 let controlWriter;
 let audioPort; // MessagePort of the main thread's AudioWorkletNode
@@ -46,6 +46,8 @@ let audioLost = 0;
 let lastAudioSeq;
 let audioUnderruns = 0;
 let audioPeak = 0; // 0..32768, since the last stats
+let audioCodec = ''; // 'pcm' or 'opus': what the host sends
+let opusDecoder; // WebCodecs AudioDecoder for KIND_AUDIO_OPUS
 let micOn = false;
 let micSeq = 0;
 let transport;
@@ -84,6 +86,9 @@ self.onmessage = async ({ data }) => {
     setDecoderStep(data.decoderStep ?? 0);
     await probeDecoders(log);
     codecs = await probeCodecs();
+    // Opus system audio (~100 kbps instead of 1.5 Mbps of PCM) where WebCodecs decodes it;
+    // without AudioDecoder (Safari < 26) the host keeps sending PCM.
+    if (await decodesOpus()) codecs.push('opus');
     setInterval(() => datagramWriter?.write(ping(performance.now())).catch(() => {}), PING_INTERVAL_MS);
     setInterval(tick, 1000);
     run();
@@ -264,6 +269,7 @@ async function connect() {
       videoStream(h.stream).onFragment(h, value);
     }
     else if (kind === KIND_AUDIO) onAudio(view, value);
+    else if (kind === KIND_AUDIO_OPUS) onOpus(view, value);
     else if (kind === KIND_PONG) onPong(view);
   }
 }
@@ -453,21 +459,41 @@ async function receiveFile(r) {
     got += chunk.byteLength;
     if (performance.now() - lastReport > 200) {
       lastReport = performance.now();
-      self.postMessage({ type: 'fileProgress', id, name: header.name, done: got, total: header.size, direction: 'down' });
+      self.postMessage({ type: 'fileProgress', id, name: header.name, done: got, total: header.streamed ? null : header.size, direction: 'down' });
     }
   }
-  if (got !== header.size) throw new Error(`${header.name}: got ${got} of ${header.size} bytes`);
+  // A folder zipped on the fly has no size up front: it's whole if it ends with the zip's
+  // end record (a broken remote stream just ends early).
+  if (header.streamed ? !endsLikeZip(chunks) : got !== header.size) throw new Error(`${header.name}: cut short after ${got} bytes`);
   const file = new File(chunks, header.name);
   self.postMessage({ type: 'fileReceived', id, file });
   log('info', 'file received', { name: header.name, size: got });
 }
 
-function onAudio(view, bytes) {
-  if (!audioPort || !audioOn) return;
-  const seq = view.getUint32(4, true);
+/** The last 22 bytes start the zip's end-of-central-directory record (no comment). */
+function endsLikeZip(chunks) {
+  const tail = new Uint8Array(22);
+  let need = 22;
+  for (let i = chunks.length - 1; i >= 0 && need; i--) {
+    const c = chunks[i];
+    const n = Math.min(need, c.byteLength);
+    tail.set(c.subarray(c.byteLength - n), need - n);
+    need -= n;
+  }
+  return !need && tail[0] === 0x50 && tail[1] === 0x4b && tail[2] === 5 && tail[3] === 6;
+}
+
+function countAudio(seq, codec) {
+  if (codec !== audioCodec) lastAudioSeq = undefined;
+  audioCodec = codec;
   if (lastAudioSeq !== undefined && seq !== ((lastAudioSeq + 1) >>> 0)) audioLost++;
   lastAudioSeq = seq;
   audioPackets++;
+}
+
+function onAudio(view, bytes) {
+  if (!audioPort || !audioOn) return;
+  countAudio(view.getUint32(4, true), 'pcm');
   // Copy into a fresh, aligned buffer and hand it over without another copy.
   const pcm = bytes.slice(AUDIO_HEADER_LEN).buffer;
   // The loudest sample since the last stats (silence still comes as packets).
@@ -477,6 +503,61 @@ function onAudio(view, bytes) {
     if (v > audioPeak) audioPeak = v;
   }
   audioPort.postMessage({ pcm, channels: view.getUint8(1) }, [pcm]);
+}
+
+const OPUS_CONFIG = { codec: 'opus', sampleRate: 48000, numberOfChannels: 2 };
+
+async function decodesOpus() {
+  if (typeof AudioDecoder === 'undefined') return false;
+  const { supported } = await AudioDecoder.isConfigSupported(OPUS_CONFIG).catch(() => ({}));
+  return Boolean(supported);
+}
+
+/** One Opus packet: decoded by WebCodecs, played by the same worklet as PCM. */
+function onOpus(view, bytes) {
+  if (!audioPort || !audioOn) return;
+  const h = readAudioHeader(view);
+  countAudio(h.seq, 'opus');
+  if (opusDecoder?.state !== 'configured') {
+    opusDecoder = new AudioDecoder({
+      output: playDecoded,
+      error: (e) => {
+        log('warn', `opus decoder error: ${e.message ?? e}`);
+        // Made afresh on the next packet.
+        opusDecoder = undefined;
+      },
+    });
+    opusDecoder.configure(OPUS_CONFIG);
+  }
+  // A decoder that has fallen behind only adds delay: skip until it catches up.
+  if (opusDecoder.decodeQueueSize > 10) return;
+  try {
+    // Every Opus packet decodes on its own.
+    opusDecoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: h.captureUs, data: bytes.subarray(AUDIO_HEADER_LEN) }));
+  } catch (e) {
+    log('warn', `opus decode failed: ${e.message ?? e}`);
+    opusDecoder = undefined;
+  }
+}
+
+function playDecoded(audio) {
+  const frames = audio.numberOfFrames;
+  // f32-planar is the one format every browser must convert to.
+  const planes = [];
+  for (let c = 0; c < Math.min(audio.numberOfChannels, 2); c++) {
+    const plane = new Float32Array(frames);
+    audio.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+    planes.push(plane);
+  }
+  audio.close();
+  if (!audioPort || !audioOn || !planes.length) return;
+  for (const plane of planes) {
+    for (let i = 0; i < plane.length; i++) {
+      const v = Math.abs(plane[i]) * 32768;
+      if (v > audioPeak) audioPeak = v;
+    }
+  }
+  audioPort.postMessage({ planes }, planes.map((p) => p.buffer));
 }
 
 function onPong(view) {
@@ -523,6 +604,7 @@ function reportStats() {
     audioLost,
     audioUnderruns,
     audioPeak: audioPeak / 32768,
+    audioCodec,
     lossless: stats.lossless,
     // Showing a lossless picture now (until the screen changes).
     holding: streams.some((v) => v?.holding),

@@ -114,6 +114,10 @@ async fn auth(Query(q): Query<AuthQuery>) -> Response<Body> {
         .to
         .filter(|t| t.starts_with("/fwd/") && !t.contains("//") && !t.contains('\\'))
         .unwrap_or_else(|| "/fwd/".into());
+    // Lax, not Strict: a forwarded app's sign-in comes back from its provider by a
+    // cross-site redirect, and links and bookmarks open it from elsewhere; with Strict
+    // those first loads would arrive without the cookie. Lax still keeps it off other
+    // sites' POSTs, frames and fetches, and origin.rs turns those away first anyway.
     let cookie = format!(
         "{COOKIE}={}; Path=/fwd; HttpOnly; SameSite=Lax; Max-Age=2592000",
         cookie_value(&token)

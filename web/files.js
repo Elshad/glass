@@ -1,7 +1,8 @@
 // The file browser (owner only): the computer's folders in a sheet over the screen.
-// Browse, preview, download (or drag a file out), upload into the folder you're in, make
-// folders, rename and move to the Trash. Long folders are virtualized: only the rows in
-// view exist, positioned from a fixed row height, so scrolling never reads layout.
+// Browse, preview, download (or drag a file out; folders come as a zip), upload into the
+// folder you're in, make folders, rename and move to the Trash. Long folders are
+// virtualized: only the rows in view exist, positioned from a fixed row height, so
+// scrolling never reads layout.
 
 import { droppedFiles } from './device.js';
 
@@ -81,6 +82,7 @@ export function createFiles({ control, toast, upload, download, rawUrl, log }) {
       <span class="actions">
         <button type="button" class="act rename" disabled>Rename</button>
         <button type="button" class="act trash" disabled>Move to Trash</button>
+        <button type="button" class="act zip hidden" title="Download this folder as a zip">Download</button>
         <button type="button" class="act open primary" disabled>Download</button>
       </span>
     </footer>
@@ -99,6 +101,7 @@ export function createFiles({ control, toast, upload, download, rawUrl, log }) {
   const promptInput = prompt.querySelector('input');
   const status = $('.status');
   const openButton = $('.open');
+  const zipButton = $('.zip');
   const renameButton = $('.rename');
   const trashButton = $('.trash');
   const viewButton = $('.view');
@@ -232,12 +235,13 @@ export function createFiles({ control, toast, upload, download, rawUrl, log }) {
     el.querySelector('.meta').textContent = meta;
     el.title = e.name;
     if (!e.dir && thumb === undefined && PREVIEWABLE.has(e.kind)) askThumb(full);
-    // Drag a file out onto this device's desktop (Chromium, from the computer's own page).
-    const url = !e.dir && rawUrl(ticket, full);
+    // Drag a file (or a folder, as a zip) out onto this device's desktop (Chromium, from
+    // the computer's own page).
+    const url = rawUrl(ticket, full);
     if (url) {
       el.draggable = true;
       el.addEventListener('dragstart', (ev) => {
-        ev.dataTransfer.setData('DownloadURL', `application/octet-stream:${e.name}:${url}`);
+        ev.dataTransfer.setData('DownloadURL', e.dir ? `application/zip:${e.name}.zip:${url}` : `application/octet-stream:${e.name}:${url}`);
         ev.dataTransfer.effectAllowed = 'copy';
       });
     }
@@ -297,25 +301,31 @@ export function createFiles({ control, toast, upload, download, rawUrl, log }) {
     fetchFile(e, full);
   }
 
+  // Folders (and Mac apps, which are folders) come zipped by the host.
   function fetchFile(e, full) {
     const url = rawUrl(ticket, full);
-    if (url) download(url, e.name);
+    if (url) download(url, e.dir ? `${e.name}.zip` : e.kind === 'app' ? '' : e.name);
     else {
       control({ t: 'filesFetch', path: full });
-      toast({ text: `Getting ${e.name}…`, icon: 'file', timeout: 2500 });
+      toast({ text: `Getting ${e.name}${e.dir ? ' as a zip' : ''}…`, icon: 'file', timeout: 2500 });
     }
-    log('info', 'file browser: download', { size: e.size });
+    log('info', 'file browser: download', { size: e.size, folder: e.dir });
   }
 
   function updateFooter() {
     const e = shown[selected];
     openButton.disabled = renameButton.disabled = trashButton.disabled = !e;
     openButton.textContent = e?.dir ? 'Open' : 'Download';
+    zipButton.classList.toggle('hidden', !e?.dir);
     const count = `${shown.length} item${shown.length === 1 ? '' : 's'}`;
     status.textContent = loading ? 'Loading…' : e ? `${e.name}${e.dir ? '' : ` · ${formatSize(e.size)}`}` : count;
   }
 
   openButton.addEventListener('click', () => open(selected));
+  zipButton.addEventListener('click', () => {
+    const e = shown[selected];
+    if (e?.dir) fetchFile(e, join(path, e.name));
+  });
   renameButton.addEventListener('click', () => {
     const e = shown[selected];
     if (!e) return;

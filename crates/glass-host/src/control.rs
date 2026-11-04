@@ -359,6 +359,10 @@ pub struct FileHeader {
     /// Downloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
+    /// host -> client: a folder zipped as it's sent, so `size` isn't known (0). It's
+    /// complete when the stream ends with the zip's end record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub streamed: bool,
 }
 
 pub async fn read_json<T: for<'de> Deserialize<'de>>(stream: &mut RecvStream) -> Result<Option<T>> {

@@ -1,7 +1,7 @@
 //! The file browser in the viewer (owner only): list a folder under the home folder, fetch
-//! a file, upload into a folder, make folders, rename and move to the Trash, and small
-//! previews of images and PDFs. Paths from the viewer are relative to the home folder and
-//! must stay inside it: no `..`, and no symlink that leads out.
+//! a file or a folder (as a zip), upload into a folder, make folders, rename and move to the
+//! Trash, and small previews of images and PDFs. Paths from the viewer are relative to the
+//! home folder and must stay inside it: no `..`, and no symlink that leads out.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -361,12 +361,23 @@ async fn raw(axum::extract::Query(q): axum::extract::Query<RawQuery>) -> axum::r
     let Ok(path) = resolve(&root(), &q.path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if path.is_dir() {
+        // A folder: zipped as it downloads (no length, so the browser shows no total).
+        let chunks = crate::zipdir::stream(root(), path.clone());
+        let stream = futures_util::stream::unfold(chunks, |mut rx| async move { rx.recv().await.map(|c| (c, rx)) });
+        let name = crate::zipdir::name(&path);
+        return (
+            [
+                (header::CONTENT_TYPE, "application/zip".to_string()),
+                (header::CONTENT_DISPOSITION, format!("attachment; filename*=UTF-8''{}", encode(&name))),
+            ],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response();
+    }
     let Ok(file) = tokio::fs::File::open(&path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if path.is_dir() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
     let body = axum::body::Body::from_stream(tokio_util_stream(file));

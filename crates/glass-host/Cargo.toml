@@ -15,6 +15,8 @@ cliclack = "0.5.6"
 console = "0.16.6"
 glass-proto = { version = "0.13.1", path = "../glass-proto" }
 openh264 = "0.9"
+# Vendored libopus (BSD), built by cmake and linked statically: no system library needed.
+opus = "0.4"
 openh264-sys2 = "0.9"
 ring = "0.17.14"
 qrcode = { version = "0.14.1", default-features = false }
@@ -38,6 +40,7 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 rtc = { version = "0.21.1", default-features = false }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 png = "0.17"
+zip = { version = "7", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 gpui-kit = "0.8"

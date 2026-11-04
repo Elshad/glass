@@ -40,6 +40,11 @@ pub struct Settings {
     pub accent: Option<String>,
     /// A self-hosted introducer for remote access (site/selfhost), instead of glassdesk.dev.
     pub relay: Option<String>,
+    /// More host names the web server answers for (`.example.com` covers its subdomains),
+    /// besides IP addresses, localhost and this computer's own names (see origin.rs).
+    pub allowed_hosts: Vec<String>,
+    /// More sites (`https://app.example.com`) whose pages may call this computer.
+    pub allowed_origins: Vec<String>,
     /// Single sign-on (OpenID Connect): the provider, e.g. https://accounts.google.com.
     pub oidc_issuer: Option<String>,
     pub oidc_client_id: Option<String>,
@@ -212,6 +217,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("name", "name shown in the viewer"),
     ("accent", "viewer accent colour, e.g. #ff8800"),
     ("relay", "self-hosted remote-access server, e.g. https://glass.example.com"),
+    ("allowed-hosts", "more names this computer is opened at, e.g. glass.example.com or .example.com (behind your own proxy)"),
+    ("allowed-origins", "sites whose pages may call this computer, e.g. https://app.example.com"),
     ("oidc-issuer", "single sign-on provider, e.g. https://accounts.google.com"),
     ("oidc-client-id", "the OAuth client id registered with that provider"),
     ("oidc-client-secret", "its client secret (stored separately, owner-only)"),
@@ -304,6 +311,8 @@ impl Settings {
             "name" => self.name.clone().unwrap_or_default(),
             "accent" => self.accent.clone().unwrap_or_default(),
             "relay" => self.relay.clone().unwrap_or_default(),
+            "allowed-hosts" => self.allowed_hosts.join(","),
+            "allowed-origins" => self.allowed_origins.join(","),
             "oidc-issuer" => self.oidc_issuer.clone().unwrap_or_default(),
             "oidc-client-id" => self.oidc_client_id.clone().unwrap_or_default(),
             "oidc-client-secret" => if oidc_secret().is_some() { "(set)" } else { "" }.into(),
@@ -411,6 +420,29 @@ impl Settings {
                 self.oidc_client_id = (!value.is_empty()).then(|| value.to_string());
             }
             "oidc-client-secret" => save_oidc_secret(value)?,
+            "allowed-hosts" => {
+                let hosts = list(value);
+                for h in &hosts {
+                    anyhow::ensure!(
+                        h == "*" || (!h.contains("://") && !h.contains(['/', '@'])),
+                        "{h} isn't a host name; use e.g. glass.example.com or .example.com"
+                    );
+                }
+                self.allowed_hosts = hosts;
+            }
+            "allowed-origins" => {
+                let origins: Vec<String> = list(value).into_iter().map(|o| o.trim_end_matches('/').to_string()).collect();
+                for o in &origins {
+                    anyhow::ensure!(
+                        o == "*"
+                            || o.split_once("://").is_some_and(|(scheme, rest)| {
+                                matches!(scheme, "http" | "https") && !rest.is_empty() && !rest.contains(['/', '@'])
+                            }),
+                        "{o} isn't an origin; use e.g. https://app.example.com"
+                    );
+                }
+                self.allowed_origins = origins;
+            }
             "oidc-allow" => {
                 self.oidc_allow = value
                     .split([',', ' '])

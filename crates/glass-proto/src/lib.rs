@@ -8,6 +8,7 @@
 //!   client -> host  PING
 //!   client -> host  KEYFRAME_REQUEST  [kind, stream] after the client detects loss
 //!   host -> client  AUDIO  5 ms of 48 kHz s16 PCM (only to sessions that enabled audio)
+//!   host -> client  AUDIO_OPUS  one Opus packet instead, to viewers whose hello offered "opus"
 //!
 //! Input travels client -> host on one reliable unidirectional stream as fixed-size
 //! [`InputEvent`] records, so a lost key-up can never leave a key stuck down.
@@ -19,6 +20,9 @@ pub const KIND_KEYFRAME_REQUEST: u8 = 4;
 pub const KIND_AUDIO: u8 = 5;
 /// client -> host: the viewer's microphone, same layout as AUDIO (mono or stereo s16).
 pub const KIND_MIC: u8 = 6;
+/// host -> client: system audio as one Opus packet (48 kHz stereo), same 16-byte header as
+/// AUDIO, for viewers that can decode it (hello `codecs` has "opus").
+pub const KIND_AUDIO_OPUS: u8 = 7;
 
 /// 5 ms at 48 kHz: one packet fits a datagram (16 + 240 * 2 ch * 2 B = 976 bytes).
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
@@ -28,16 +32,54 @@ pub const AUDIO_FRAMES_PER_PACKET: usize = 240;
 pub const AUDIO_HEADER_LEN: usize = 16;
 
 pub fn audio_packet(seq: u32, capture_us: u64, channels: u8, pcm: &[i16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(AUDIO_HEADER_LEN + pcm.len() * 2);
-    out.push(KIND_AUDIO);
-    out.push(channels);
-    out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&seq.to_le_bytes());
-    out.extend_from_slice(&capture_us.to_le_bytes());
+    let mut out = audio_header(KIND_AUDIO, seq, capture_us, channels, pcm.len() * 2);
     for s in pcm {
         out.extend_from_slice(&s.to_le_bytes());
     }
     out
+}
+
+/// 10 ms at 48 kHz: the frames in each Opus packet.
+pub const OPUS_FRAMES_PER_PACKET: usize = 480;
+
+/// An AUDIO_OPUS datagram: the AUDIO header, then one Opus packet.
+pub fn opus_packet(seq: u32, capture_us: u64, channels: u8, opus: &[u8]) -> Vec<u8> {
+    let mut out = audio_header(KIND_AUDIO_OPUS, seq, capture_us, channels, opus.len());
+    out.extend_from_slice(opus);
+    out
+}
+
+fn audio_header(kind: u8, seq: u32, capture_us: u64, channels: u8, payload: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(AUDIO_HEADER_LEN + payload);
+    out.push(kind);
+    out.push(channels);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&capture_us.to_le_bytes());
+    out
+}
+
+/// The header of an AUDIO, AUDIO_OPUS or MIC datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioHeader {
+    pub kind: u8,
+    pub channels: u8,
+    pub seq: u32,
+    pub capture_us: u64,
+}
+
+impl AudioHeader {
+    pub fn read(buf: &[u8]) -> Option<Self> {
+        if buf.len() < AUDIO_HEADER_LEN || ![KIND_AUDIO, KIND_MIC, KIND_AUDIO_OPUS].contains(&buf[0]) {
+            return None;
+        }
+        Some(Self {
+            kind: buf[0],
+            channels: buf[1],
+            seq: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            capture_us: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        })
+    }
 }
 
 pub const FLAG_KEYFRAME: u8 = 1;
@@ -327,6 +369,24 @@ mod tests {
         assert_eq!(u32::from_le_bytes(p[4..8].try_into().unwrap()), 9);
         assert_eq!(u64::from_le_bytes(p[8..16].try_into().unwrap()), 77);
         assert_eq!(i16::from_le_bytes([p[18], p[19]]), 1);
+    }
+
+    #[test]
+    fn opus_packet_layout() {
+        let p = opus_packet(0xA1B2_C3D4, 1_234_567, 2, &[0xFC, 1, 2, 3]);
+        // Same bytes as web/proto.js's readAudioHeader test (tests/unit/proto.test.mjs).
+        assert_eq!(&p[..8], &[KIND_AUDIO_OPUS, 2, 0, 0, 0xD4, 0xC3, 0xB2, 0xA1]);
+        assert_eq!(u64::from_le_bytes(p[8..16].try_into().unwrap()), 1_234_567);
+        assert_eq!(&p[AUDIO_HEADER_LEN..], &[0xFC, 1, 2, 3]);
+        let h = AudioHeader::read(&p).unwrap();
+        assert_eq!(h, AudioHeader { kind: KIND_AUDIO_OPUS, channels: 2, seq: 0xA1B2_C3D4, capture_us: 1_234_567 });
+        // PCM packets read the same way; anything else (or too short) doesn't.
+        assert_eq!(AudioHeader::read(&audio_packet(3, 4, 2, &[0; 4])).map(|h| (h.kind, h.seq)), Some((KIND_AUDIO, 3)));
+        assert!(AudioHeader::read(&p[..AUDIO_HEADER_LEN - 1]).is_none());
+        assert!(AudioHeader::read(&[KIND_VIDEO; AUDIO_HEADER_LEN]).is_none());
+        // The kinds stay distinct from every other datagram's.
+        let kinds = [KIND_VIDEO, KIND_PING, KIND_PONG, KIND_KEYFRAME_REQUEST, KIND_AUDIO, KIND_MIC, KIND_AUDIO_OPUS];
+        assert!(kinds.iter().enumerate().all(|(i, k)| !kinds[..i].contains(k)));
     }
 
     #[test]

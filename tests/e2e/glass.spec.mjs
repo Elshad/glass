@@ -643,7 +643,11 @@ test.describe('audio', () => {
     await open(page, host);
     await expect(page.locator('#btn-audio')).toBeVisible();
     await toolbarClick(page, 'btn-audio');
-    await expect.poll(async () => (await stats(page)).audioPackets, { timeout: 10_000 }).toBeGreaterThan(150);
+    // Opus (10 ms packets) where WebCodecs decodes it, else PCM (5 ms).
+    await expect.poll(async () => (await stats(page)).audioPackets, { timeout: 10_000 }).toBeGreaterThan(75);
+    const { audioCodec, audioPackets } = await stats(page);
+    expect(audioPackets).toBeGreaterThan(audioCodec === 'opus' ? 75 : 150);
+    expect(['pcm', 'opus']).toContain(audioCodec);
   });
 });
 

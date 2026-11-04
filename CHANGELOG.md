@@ -4,12 +4,15 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 
 ## Unreleased
 
+- The file browser downloads folders: select one and press Download to get it as a zip, made as it downloads (nothing is staged on the computer, however big the folder). On the computer's own page you can also drag a folder out. Symlinks inside the folder are left out.
 - Your own tailnet devices connect without a token even when Tailscale isn't ready when Glass starts (common right after signing in to Windows). Glass checks again on the next connection and then remembers the owner. For a minute and a half after startup, a viewer who didn't bring a token or a link reconnects instead of seeing the token screen.
 - If macOS's screen capture service stops answering (it can after Glass restarts), Glass restarts it and carries on, instead of hanging with no picture until someone restarts the Mac. Tailscale commands Glass runs at startup time out instead of holding it up.
 - Letting someone in after more than 10 seconds no longer leaves them with a picture but no mouse or keyboard.
 - `glass support` on a computer already running Glass shares through it, instead of starting a second copy that fought it for the screen (the picture froze in one of them). Ending support removes the helper's access and nothing else.
 - If `glass support` is closed without ending the session (killed, crashed), Glass removes the helper's access within seconds.
 - Viewers whose browser can't take WebRTC video (a Tesla's, for one) on a slow or relayed connection get a steadier picture: Glass keeps about a tenth of a second of video waiting and lowers the bitrate to what the link carries, instead of queuing most of a second and dropping frames in bursts.
+- Web pages on other sites can no longer drive or read your computer through a browser on one of your devices. Glass answers only for its own names (its tailnet name, IP addresses, localhost; `glass config allowed-hosts` adds more), so a site can't point its own domain at it (DNS rebinding), and it turns away requests and WebTransport sessions from other sites' pages (`glass config allowed-origins` lets one in). A refused request gets a 403 that says why. `POST /agent/v1/act` now needs `Content-Type: application/json`.
+- Sound from the computer takes about a tenth of the bandwidth: browsers that can decode Opus (Chrome, Edge, Firefox, Safari 26) get it as Opus at 96 kbps instead of 1.5 Mbps of raw audio, so on a slow or relayed connection (a car's browser) sound no longer crowds out the picture. Older Safari keeps getting raw audio.
 
 ## 0.13.1
 

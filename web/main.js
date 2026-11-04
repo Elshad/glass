@@ -488,6 +488,7 @@ const files = createFiles({
   toast: (o) => ui.toast(o),
   upload: (list, dir) => uploadFiles(list, dir),
   // A plain browser download, from this page's own host (not over remote access).
+  // `name` '': the host's name for it (Content-Disposition).
   download: (url, name) => {
     const a = document.createElement('a');
     a.href = url;
@@ -1073,7 +1074,7 @@ function renderHud(d) {
       `${d.fps} fps  ${d.mbps.toFixed(1)} Mbps` + (targetMbps ? ` (target ${targetMbps.toFixed(0)})` : '') + `  dropped ${d.dropped}`,
     ),
   ];
-  if (d.audioPackets) lines.push(hudLine(`audio ${d.audioPackets} pkt/s  lost ${d.audioLost}`));
+  if (d.audioPackets) lines.push(hudLine(`audio ${d.audioPackets} pkt/s  lost ${d.audioLost}  ${d.audioCodec}`));
   hud.replaceChildren(...lines);
 }
 
@@ -1318,12 +1319,13 @@ function uploadFiles(list, dir) {
 function onFileProgress({ id, name, done, total, direction }) {
   let t = transfers.get(id);
   const verb = direction === 'up' ? 'Sending' : 'Receiving';
-  const fraction = total ? done / total : 1;
+  // `total` null: a folder zipped as it comes, so no total (an indeterminate bar).
+  const fraction = total === null ? null : total ? done / total : 1;
   if (!t) {
     t = ui.toast({ text: `${verb} ${name}`, progress: fraction, timeout: 0 });
     transfers.set(id, t);
   }
-  t.update({ progress: fraction });
+  t.update({ progress: fraction, text: total === null ? `${verb} ${name} · ${formatBytes(done)}` : undefined });
   if (done >= total && direction === 'up') {
     t.update({ text: `Sent ${name}` });
     t.dismiss(1500);
