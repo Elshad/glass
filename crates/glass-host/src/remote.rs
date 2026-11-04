@@ -76,17 +76,28 @@ impl InFlight {
         self.window_min = Some(self.window_min.map_or(outstanding, |m| m.min(outstanding)));
     }
 
-    /// Bytes actually waiting behind what's in flight.
+    /// Bytes actually waiting behind what's in flight. Past the hard cap everything counts,
+    /// so a floor that's wrong can never let the buffer grow without limit.
     fn queued(&self, outstanding: usize) -> usize {
+        if outstanding > DATAGRAM_BACKLOG {
+            return outstanding;
+        }
         outstanding.saturating_sub(self.floor)
     }
 
-    fn tick(&mut self) {
+    /// Once a second. `bps`: the bitrate now. The floor is held to what a long round trip
+    /// (`MAX_RTT_MS`) could have in flight: on a link that never drains, the least seen is
+    /// partly queue, and taking all of it as "in flight" would ratchet the queue up.
+    fn tick(&mut self, bps: u32) {
         if let Some(min) = self.window_min.take() {
-            self.floor = min;
+            let most = (bps as u64 / 8 * MAX_RTT_MS / 1000).min(DATAGRAM_BACKLOG as u64 / 2) as usize;
+            self.floor = min.min(most);
         }
     }
 }
+
+/// The longest round trip the in-flight floor allows for.
+const MAX_RTT_MS: u64 = 400;
 
 /// The least a link is capped to: still a picture, if a slow one.
 const MIN_LINK_CAP: u32 = 250_000;
@@ -958,7 +969,7 @@ async fn bridge(
                     let outstanding = dc.outstanding_bytes().await.unwrap_or(0);
                     let budget = video_backlog(crate::server::applied_bitrate());
                     let queued = inflight.queued(outstanding);
-                    inflight.tick();
+                    inflight.tick(crate::server::applied_bitrate());
                     if let Some(cap) = meter.tick(outstanding, queued, meter_drops > 0, budget, last_tick.elapsed()) {
                         match cap {
                             Some(bps) => debug!("remote peer ({peer}): link carries ~{:.1} Mbps of video", bps as f64 / 1e6),
@@ -1145,12 +1156,19 @@ mod tests {
             f.sample(o);
         }
         assert_eq!(f.queued(41_000), 41_000, "no floor until a second has been seen");
-        f.tick();
+        f.tick(1_300_000);
         assert_eq!(f.queued(41_000), 15_000);
         assert_eq!(f.queued(20_000), 0);
         // A second with no samples keeps the floor.
-        f.tick();
+        f.tick(1_300_000);
         assert_eq!(f.queued(36_000), 10_000);
+        // A link that never drains: the least seen (200 KB) is mostly queue. The floor
+        // stops at what 400 ms could have in flight at 1.3 Mbps (65 KB)...
+        f.sample(200_000);
+        f.tick(1_300_000);
+        assert_eq!(f.queued(200_000), 135_000);
+        // ...and past the hard cap, everything counts.
+        assert_eq!(f.queued(DATAGRAM_BACKLOG + 1), DATAGRAM_BACKLOG + 1);
         // So a keyframe gets out once what's queued, not what's in flight, has drained.
         let mut g = FrameGate::default();
         let budget = video_backlog(1_300_000);
