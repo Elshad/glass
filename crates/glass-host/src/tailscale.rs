@@ -259,10 +259,13 @@ pub async fn serves_https_to(port: u16) -> bool {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub async fn serve_https_to(port: u16) -> Result<()> {
     let target = format!("https+insecure://localhost:{port}");
-    let out = tokio::process::Command::new(cli())
+    let run = tokio::process::Command::new(cli())
         .args(["serve", "--bg", &target])
-        .output()
-        .await?;
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(CLI_TIMEOUT, run)
+        .await
+        .map_err(|_| anyhow::anyhow!("tailscale serve didn't answer in {}s", CLI_TIMEOUT.as_secs()))??;
     anyhow::ensure!(
         out.status.success(),
         "tailscale serve: {}",
@@ -343,8 +346,10 @@ pub async fn probe() -> Probe {
     let Ok(status) = json(&["status", "--json"]).await else {
         let installed = std::process::Command::new(cli())
             .arg("version")
-            .output()
-            .is_ok();
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok_and(|child| exited_ok(child, CLI_TIMEOUT));
         return if installed {
             Probe::NotRunning
         } else {
@@ -386,16 +391,23 @@ pub async fn ensure_cert(
     let cert = dir.join(format!("{name}.crt"));
     let key = dir.join(format!("{name}.key"));
     // `tailscale cert` only contacts Let's Encrypt when the cert is missing or near expiry.
-    let out = tokio::process::Command::new(cli())
+    // Longer than other commands: it may have to get a certificate from Let's Encrypt.
+    let run = tokio::process::Command::new(cli())
         .arg("cert")
         .arg("--cert-file")
         .arg(&cert)
         .arg("--key-file")
         .arg(&key)
         .arg(&name)
-        .output()
-        .await
-        .ok()?;
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(Duration::from_secs(90), run).await {
+        Ok(out) => out.ok()?,
+        Err(_) => {
+            tracing::warn!("tailscale cert didn't answer in 90s");
+            return None;
+        }
+    };
     if !out.status.success() {
         tracing::warn!(
             "tailscale cert: {}",

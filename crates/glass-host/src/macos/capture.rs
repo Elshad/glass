@@ -696,7 +696,12 @@ pub fn start(
         let _ = tx.send(unsafe { err.as_ref() }.map(|e| e.localizedDescription().to_string()));
     });
     unsafe { stream.startCaptureWithCompletionHandler(Some(&handler)) };
-    if let Some(err) = answer(&rx, "starting capture")? {
+    let started = answer(&rx, "starting capture");
+    if started.is_err() {
+        // Should it still start later, stop it: no stream runs without a Capture owning it.
+        unsafe { stream.stopCaptureWithCompletionHandler(None) };
+    }
+    if let Some(err) = started? {
         bail!("startCapture: {err}");
     }
 
