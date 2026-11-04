@@ -114,6 +114,12 @@ pub trait VideoSource: Send + Sync {
     fn picture(&self, _id: u32, _max: [u32; 2]) -> Option<crate::lossless::RawFrame> {
         None
     }
+    /// Makes sure display `id`'s changes reach `crate::damage` (an agent is waiting on it),
+    /// starting a capture of it if none runs; `false` when this source can't, and pictures
+    /// of it are compared instead. Called on each look; may block.
+    fn track_damage(&self, _id: u32) -> bool {
+        false
+    }
     /// Capture in full colour (BGRA), so `raw_frame` has pictures to send losslessly.
     fn set_full_colour(&self, _on: bool) {}
     /// Draw the pointer into the picture (`crate::cursor` decides), or leave it out.

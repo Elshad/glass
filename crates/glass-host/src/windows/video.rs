@@ -29,7 +29,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
+    DXGI_OUTDUPL_MOVE_RECT, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::core::{BOOL, Interface};
@@ -259,6 +259,8 @@ fn draw_pointer(pixels: &mut [u8], width: usize, height: usize, stride: usize, s
 
 /// One display's duplication, with a CPU-readable copy of its latest desktop image.
 struct Duplicator {
+    /// The display's id, for crate::damage.
+    display: u32,
     _device: ID3D11Device,
     context: ID3D11DeviceContext,
     dup: IDXGIOutputDuplication,
@@ -283,7 +285,7 @@ struct Duplicator {
 }
 
 impl Duplicator {
-    fn new(device_name: &str) -> Result<Self> {
+    fn new(display: u32, device_name: &str) -> Result<Self> {
         let mut found = None;
         for_each_output(|adapter, output, desc| {
             if self::device_name(&desc) == device_name {
@@ -313,6 +315,7 @@ impl Duplicator {
             let dup = output.DuplicateOutput(&device).context("DuplicateOutput")?;
             let desc = dup.GetDesc();
             Ok(Self {
+                display,
                 _device: device,
                 context,
                 dup,
@@ -422,10 +425,48 @@ impl Duplicator {
             }
             // SAFETY: both textures are the same size and format.
             unsafe { self.context.CopyResource(self.staging.as_ref().unwrap(), &texture) };
+            // A new duplication's first image is how the display looks, not a change (it
+            // comes all dirty).
+            let first = !self.has_image;
             self.has_image = true;
             changed = true;
+            let upright = self.rotation.upright((self.width, self.height));
+            // SAFETY: the frame is still acquired.
+            match unsafe { self.changed_rects(info) } {
+                _ if first => crate::damage::note(self.display, upright, &[]),
+                Some(rects) => crate::damage::note(self.display, upright, &rects),
+                None => crate::damage::note_all(self.display, upright),
+            }
         }
         Ok(changed)
+    }
+
+    /// Where the acquired frame changed (moved areas' destinations, and dirty areas),
+    /// upright; `None` when Duplication doesn't say. Must be called before ReleaseFrame.
+    unsafe fn changed_rects(&self, info: &DXGI_OUTDUPL_FRAME_INFO) -> Option<Vec<(u32, u32, u32, u32)>> {
+        let size = info.TotalMetadataBufferSize as usize;
+        if size == 0 {
+            return None;
+        }
+        let scanned = (self.width, self.height);
+        let mut out = Vec::new();
+        let mut push = |r: RECT| out.extend(self.rotation.upright_rect(scanned, [r.left, r.top, r.right, r.bottom]));
+        let mut moves = vec![DXGI_OUTDUPL_MOVE_RECT::default(); size / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>() + 1];
+        let mut need = 0u32;
+        let bytes = std::mem::size_of_val(moves.as_slice()) as u32;
+        // SAFETY: the buffer holds `bytes`; Duplication says how much it filled.
+        unsafe { self.dup.GetFrameMoveRects(bytes, moves.as_mut_ptr(), &mut need) }.ok()?;
+        for m in &moves[..(need as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>()).min(moves.len())] {
+            push(m.DestinationRect);
+        }
+        let mut dirty = vec![RECT::default(); size / std::mem::size_of::<RECT>() + 1];
+        let bytes = std::mem::size_of_val(dirty.as_slice()) as u32;
+        // SAFETY: as above.
+        unsafe { self.dup.GetFrameDirtyRects(bytes, dirty.as_mut_ptr(), &mut need) }.ok()?;
+        for &r in &dirty[..(need as usize / std::mem::size_of::<RECT>()).min(dirty.len())] {
+            push(r);
+        }
+        Some(out)
     }
 
     fn make_staging(&self, width: u32, height: u32) -> windows::core::Result<ID3D11Texture2D> {
@@ -494,7 +535,7 @@ fn capture_loop(id: usize, device: String, monitor: Arc<Monitor>, tx: FrameSende
         // In the secure-desktop helper, follow the input desktop so duplication can see the
         // lock screen / UAC desktop. A no-op in the ordinary per-user host.
         super::secure::follow_input_desktop();
-        let mut dup = match Duplicator::new(&device) {
+        let mut dup = match Duplicator::new(id as u32, &device) {
             Ok(d) => {
                 let (w, h) = d.rotation.upright((d.width, d.height));
                 match d.rotation {
@@ -1100,6 +1141,11 @@ impl VideoSource for Video {
             }
         }
     }
+    /// Every display is duplicated all the time, and Duplication says what changed.
+    fn track_damage(&self, id: u32) -> bool {
+        let monitors = self.monitors.lock().unwrap();
+        monitors.as_ref().and_then(|m| m.get(id as usize)).is_some_and(|m| m.present.load(Ordering::Relaxed))
+    }
     fn picture(&self, id: u32, max: [u32; 2]) -> Option<crate::lossless::RawFrame> {
         *THUMBS_UNTIL.lock().unwrap() = Some(Instant::now() + Duration::from_secs(10));
         let frame = {
@@ -1209,7 +1255,7 @@ mod tests {
     #[ignore]
     fn captures_a_display() {
         let (device, _) = outputs().unwrap().into_iter().next().expect("a display");
-        let mut dup = Duplicator::new(&device).unwrap();
+        let mut dup = Duplicator::new(0, &device).unwrap();
         let mailbox = Arc::new(Mailbox::default());
         let tx = FrameSender(mailbox.clone());
         let deadline = Instant::now() + Duration::from_secs(5);

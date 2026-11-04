@@ -509,6 +509,8 @@ struct StreamState {
     tx: FrameSender,
     first: bool,
     id: usize,
+    /// Compares frames for crate::damage when the compositor doesn't say what changed.
+    differ: crate::damage::Differ,
 }
 
 fn run_pipewire(
@@ -537,10 +539,11 @@ fn run_pipewire(
             tx,
             first: true,
             id: i,
+            differ: Default::default(),
         };
         let listener = stream
             .add_local_listener_with_user_data(state)
-            .param_changed(|_, st, id, param| {
+            .param_changed(|stream, st, id, param| {
                 let Some(param) = param else { return };
                 if id != spa::param::ParamType::Format.as_raw() {
                     return;
@@ -565,6 +568,13 @@ fn run_pipewire(
                     size.height,
                     st.format.format()
                 );
+                // Ask for what changed in each frame, for agents waiting on the screen.
+                let meta = damage_params();
+                if let Some(pod) = Pod::from_bytes(&meta)
+                    && let Err(e) = stream.update_params(&mut [pod])
+                {
+                    warn!("screen {}: can't ask for damage: {e}", st.id);
+                }
             })
             .process(|stream, st| {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -573,6 +583,19 @@ fn run_pipewire(
                 let Some(pixel) = st.pixel else { return };
                 let size = st.format.size();
                 let (width, height) = (size.width as usize, size.height as usize);
+                // Where it changed, when the compositor says (read before the pixels).
+                let damage: Option<Vec<(u32, u32, u32, u32)>> = buffer
+                    .find_meta::<spa::buffer::meta::MetaVideoDamage>()
+                    .map(|d| {
+                        d.iter()
+                            .map(|r| {
+                                let (p, s) = (r.position(), r.size());
+                                let (x, y) = (p.x.max(0) as u32, p.y.max(0) as u32);
+                                (x, y, x.saturating_add(s.width), y.saturating_add(s.height))
+                            })
+                            .collect()
+                    })
+                    .filter(|rects: &Vec<_>| !rects.is_empty());
                 let datas = buffer.datas_mut();
                 let Some(data) = datas.first_mut() else {
                     return;
@@ -585,9 +608,26 @@ fn run_pipewire(
                 if bytes.len() < needed || width == 0 || height == 0 {
                     return;
                 }
-                if st.first {
+                let first = st.first;
+                if first {
                     st.first = false;
                     info!("screen {}: first frame", st.id);
+                }
+                let display = st.id as u32;
+                match damage {
+                    // How the display looks, not a change.
+                    _ if first => crate::damage::note(display, (width, height), &[]),
+                    Some(rects) => crate::damage::note(display, (width, height), &rects),
+                    // Compared only while an agent is looking: it reads the whole frame.
+                    None if crate::damage::wanted(display) => {
+                        if let Some(rects) = st.differ.diff(width, height, stride, &bytes[offset..needed]) {
+                            crate::damage::note(display, (width, height), &rects);
+                        }
+                    }
+                    None => {
+                        st.differ = Default::default();
+                        crate::damage::note_all(display, (width, height));
+                    }
                 }
                 let captured_us = now_us();
                 let mut pixels = st.tx.0.buffer();
@@ -617,6 +657,34 @@ fn run_pipewire(
     }
     mainloop.run();
     Ok(())
+}
+
+/// Damage regions with each buffer (SPA_META_VideoDamage), up to 16 a frame.
+fn damage_params() -> Vec<u8> {
+    use spa::pod::{ChoiceValue, Object, Property, Value};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id, SpaTypes};
+    // SPA_PARAM_META_type and SPA_PARAM_META_size (spa/param/buffers.h).
+    const META_TYPE: u32 = 1;
+    const META_SIZE: u32 = 2;
+    let region = std::mem::size_of::<spa::sys::spa_meta_region>() as i32;
+    let obj = Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            Property::new(META_TYPE, Value::Id(Id(spa::sys::SPA_META_VideoDamage))),
+            Property::new(
+                META_SIZE,
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range { default: region * 16, min: region, max: region * 16 },
+                ))),
+            ),
+        ],
+    };
+    spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+        .expect("serialize meta pod")
+        .0
+        .into_inner()
 }
 
 /// Accept 32-bit RGB formats in shared memory (no DMA-BUF modifiers offered, so the
@@ -700,6 +768,10 @@ impl VideoSource for Video {
                 *m.latest.lock().unwrap() = None;
             }
         }
+    }
+    /// Every shared monitor is captured all the time; frames say (or show) what changed.
+    fn track_damage(&self, id: u32) -> bool {
+        self.monitors.lock().unwrap().as_ref().is_some_and(|m| (id as usize) < m.len())
     }
     fn picture(&self, id: u32, max: [u32; 2]) -> Option<crate::lossless::RawFrame> {
         *THUMBS_UNTIL.lock().unwrap() = Some(std::time::Instant::now() + Duration::from_secs(10));

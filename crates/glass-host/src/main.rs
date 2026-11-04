@@ -14,6 +14,7 @@ mod connlog;
 mod cursor;
 mod elements;
 mod control;
+mod damage;
 mod files;
 mod forward;
 mod grants;

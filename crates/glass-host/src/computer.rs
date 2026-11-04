@@ -382,8 +382,11 @@ pub async fn screenshot(id: Option<u32>, max: Option<[u32; 2]>) -> Result<Value,
     screen_visible()?;
     let d = display(id).await?;
     let max = max.unwrap_or(DEFAULT_MAX).map(|v| v.clamp(16, LARGEST));
-    let shared = shared()?;
     let id = d.id;
+    // Changes from here on are after this picture (a wait can count them with `since`).
+    follow(id).await?;
+    let seq = crate::damage::seq();
+    let shared = shared()?;
     // A source may need a moment for its first picture (Linux keeps them only on demand).
     let frame = tokio::task::spawn_blocking(move || {
         let start = Instant::now();
@@ -408,8 +411,15 @@ pub async fn screenshot(id: Option<u32>, max: Option<[u32; 2]>) -> Result<Value,
         "display": id,
         "width": frame.width,
         "height": frame.height,
+        "seq": seq,
         "png": base64::engine::general_purpose::STANDARD.encode(png),
     }))
+}
+
+/// Follows display `id`'s changes for a while (an agent is looking at it).
+async fn follow(id: u32) -> Result<(), Refused> {
+    let shared = shared()?;
+    tokio::task::spawn_blocking(move || crate::damage::follow(&shared.video, id)).await.map_err(|e| Refused(e.to_string()))
 }
 
 fn button_code(name: Option<&str>) -> Result<u8, Refused> {
@@ -527,33 +537,50 @@ fn shown_keys(keys: &str) -> String {
     if crate::grants::secure_input() { "a key, into a password field".into() } else { keys.to_string() }
 }
 
-/// Waits for the display to change and then settle (or for `timeout`).
-pub async fn wait_for_change(id: Option<u32>, timeout: Duration) -> Result<Value, Refused> {
+/// What `wait_for_change` waits for (crate::damage::Wait, as an agent gives it).
+pub struct WaitFor {
+    /// For a change first (after `since`, or the call).
+    pub change: bool,
+    /// Then for quiet this long; by default 300 ms, or none after a change.
+    pub idle: Option<Duration>,
+    /// x, y, width, height in the pixels of the latest screenshot of the display.
+    pub region: Option<[f64; 4]>,
+    /// A `seq` from a screenshot, an action or an earlier wait.
+    pub since: Option<u64>,
+    pub timeout: Duration,
+}
+
+/// Waits for the display (or part of it) to settle, or to change (or for `timeout`), from
+/// what capture says changed: nothing is missed for being small.
+pub async fn wait_for_change(id: Option<u32>, w: WaitFor) -> Result<Value, Refused> {
     may_act(true).await?;
     let d = display(id).await?;
-    let shared = shared()?;
-    let id = d.id;
-    let changed = tokio::task::spawn_blocking(move || {
-        const SMALL: [u32; 2] = [256, 160];
-        let start = Instant::now();
-        let first = shared.video.picture(id, SMALL).map(|f| f.bgra);
-        let mut last = first.clone();
-        let mut changed_at: Option<Instant> = None;
-        while start.elapsed() < timeout {
-            std::thread::sleep(Duration::from_millis(200));
-            let now = shared.video.picture(id, SMALL).map(|f| f.bgra);
-            if now != last {
-                changed_at = Some(Instant::now());
-                last = now;
-            } else if changed_at.is_some_and(|t| t.elapsed() >= Duration::from_millis(500)) {
-                return (true, start.elapsed());
-            }
-        }
-        (changed_at.is_some(), start.elapsed())
-    })
-    .await
-    .map_err(|e| Refused(e.to_string()))?;
-    Ok(json!({ "changed": changed.0, "waited_ms": changed.1.as_millis() as u64 }))
+    let region = match w.region {
+        None => None,
+        Some(r) => Some(region_of(&d, r)?),
+    };
+    follow(d.id).await?;
+    let idle = w.idle.unwrap_or(if w.change { Duration::ZERO } else { crate::damage::DEFAULT_IDLE });
+    let waited = crate::damage::wait(d.id, crate::damage::Wait { change: w.change, idle, region, since: w.since, timeout: w.timeout }).await;
+    Ok(json!({
+        "changed": waited.changed,
+        "timed_out": waited.timed_out,
+        "seq": waited.seq,
+        "waited_ms": waited.waited.as_millis() as u64,
+    }))
+}
+
+/// `[x, y, width, height]` in the pixels of the latest screenshot of `d`, as 0..1 of it.
+fn region_of(d: &DisplayInfo, [x, y, w, h]: [f64; 4]) -> Result<crate::damage::Region, Refused> {
+    let (sw, sh) = shot_size(d);
+    let (sw, sh) = (sw.max(1) as f64, sh.max(1) as f64);
+    if !(w > 0.0 && h > 0.0) || [x, y, w, h].iter().any(|v| !v.is_finite()) {
+        return Err(Refused("region needs a width and a height".into()));
+    }
+    if x >= sw || y >= sh || x + w <= 0.0 || y + h <= 0.0 {
+        return Err(Refused(format!("region is off the screenshot ({sw}×{sh} pixels)")));
+    }
+    Ok(crate::damage::Region { x: x / sw, y: y / sh, w: w / sw, h: h / sh })
 }
 
 /// Asks the person something and waits for their answer: `help` (they do something, then
@@ -825,7 +852,16 @@ pub enum Action {
     Scroll { display: Option<u32>, x: f64, y: f64, #[serde(default)] dx: f64, #[serde(default)] dy: f64 },
     Type { text: String },
     Key { keys: String },
-    WaitForChange { display: Option<u32>, timeout_ms: Option<u64> },
+    WaitForChange {
+        display: Option<u32>,
+        timeout_ms: Option<u64>,
+        idle_ms: Option<u64>,
+        #[serde(default)]
+        change: bool,
+        /// x, y, width, height in screenshot pixels.
+        region: Option<[f64; 4]>,
+        since: Option<u64>,
+    },
     Snapshot { app: Option<String>, #[serde(default)] all_windows: bool, max_lines: Option<usize> },
     Press { #[serde(rename = "ref")] target: String },
     SetValue { #[serde(rename = "ref")] target: String, text: String },
@@ -878,6 +914,18 @@ impl Action {
 }
 
 pub async fn act(action: Action) -> Result<Value, Refused> {
+    // What the screen shows from here on is this action's doing: a wait after it can count
+    // changes since its `seq`.
+    let input = !action.describe().1 && !matches!(action, Action::RequestHelp { .. } | Action::Confirm { .. } | Action::CheckAnswer { .. });
+    let seq = crate::damage::seq();
+    let mut v = run(action).await?;
+    if input && let Some(o) = v.as_object_mut() {
+        o.insert("seq".into(), json!(seq));
+    }
+    Ok(v)
+}
+
+async fn run(action: Action) -> Result<Value, Refused> {
     match action {
         Action::Screenshot { display, max_width, max_height } => {
             let max = (max_width.is_some() || max_height.is_some())
@@ -892,8 +940,15 @@ pub async fn act(action: Action) -> Result<Value, Refused> {
         Action::Scroll { display, x, y, dx, dy } => scroll(display, x, y, dx, dy).await,
         Action::Type { text } => type_text(&text).await,
         Action::Key { keys } => key(&keys).await,
-        Action::WaitForChange { display, timeout_ms } => {
-            wait_for_change(display, Duration::from_millis(timeout_ms.unwrap_or(10_000).min(60_000))).await
+        Action::WaitForChange { display, timeout_ms, idle_ms, change, region, since } => {
+            let w = WaitFor {
+                change,
+                idle: idle_ms.map(|ms| Duration::from_millis(ms.min(60_000))),
+                region,
+                since,
+                timeout: Duration::from_millis(timeout_ms.unwrap_or(10_000).min(60_000)),
+            };
+            wait_for_change(display, w).await
         }
         Action::Snapshot { app, all_windows, max_lines } => crate::elements::snapshot(app, all_windows, max_lines).await,
         Action::Press { target } => crate::elements::press(&target).await,

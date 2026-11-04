@@ -1580,7 +1580,8 @@ latest screenshot of that display.\n\
 - On a Mac or a Windows PC, `snapshot` reads an app's window as text, with a ref on each element you can act on; \
 `press` and `set_value` act on a ref without moving the pointer. Prefer them for ordinary app \
 windows, and screenshot and click for what a snapshot doesn't show (canvases, games, video).\n\
-- After acting, check the result: pass `screenshot_after: true`, or call `wait_for_change` then `screenshot`.\n\
+- After acting, check the result: pass `screenshot_after: true`, or call `wait_for_change` then `screenshot`. \
+To wait for an action's effect, pass `wait_for_change` the `seq` from the screenshot before it as `since`, with `change: true`.\n\
 - Before anything hard to undo (sending, buying, deleting, posting, changing settings or \
 accounts), call `confirm` and only go ahead if approved. If the person hasn't answered yet, the \
 question stays pending: do other work, then collect the answer with `check_answer`.\n\
@@ -1717,7 +1718,7 @@ async fn run_tool(g: &Grant, name: &str, args: &Value) -> Result<Vec<Value>, Str
             let v = act(action, true).await?;
             let mut out = crate::mcp::show(show, &v);
             if after {
-                let _ = act(json!({ "action": "wait_for_change", "display": display, "timeout_ms": 1500 }), false).await;
+                let _ = act(crate::mcp::wait_after(&display, &v), false).await;
                 let shot = act(json!({ "action": "screenshot", "display": display }), false).await?;
                 out.extend(crate::mcp::show(Show::Shot, &shot));
             }

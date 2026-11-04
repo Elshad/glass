@@ -116,6 +116,8 @@ pub struct Ivars {
     state: Arc<FrameState>,
     audio: Option<Arc<std::sync::Mutex<Packetizer>>>,
     display: CGDirectDisplayID,
+    /// Capturing a whole display (not a window): its changes go to crate::damage.
+    damage: bool,
     started: std::time::Instant,
     frames: std::sync::atomic::AtomicU64,
     idle: std::sync::atomic::AtomicU64,
@@ -155,12 +157,16 @@ define_class!(
                 }
                 return;
             };
-            if ivars.frames.fetch_add(1, Relaxed) == 0 {
+            let first = ivars.frames.fetch_add(1, Relaxed) == 0;
+            if first {
                 tracing::info!(
                     "display {}: first frame after {} ms",
                     ivars.display,
                     ivars.started.elapsed().as_millis()
                 );
+            }
+            if ivars.damage {
+                note_damage(ivars.display, sample, &image, first);
             }
             let pts = unsafe { sample.presentation_time_stamp() };
             let capture_us = match cmtime_us(pts) {
@@ -214,11 +220,13 @@ impl StreamOutput {
         state: Arc<FrameState>,
         audio: Option<Arc<std::sync::Mutex<Packetizer>>>,
         display: CGDirectDisplayID,
+        damage: bool,
     ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(Ivars {
             state,
             audio,
             display,
+            damage,
             started: std::time::Instant::now(),
             frames: Default::default(),
             idle: Default::default(),
@@ -313,6 +321,185 @@ impl Capture {
             .stopped
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// Where a frame of display `display` changed, for crate::damage: ScreenCaptureKit's dirty
+/// rects (in the frame's pixels). A capture's first frame is how the display looks, not a
+/// change (ScreenCaptureKit calls all of it dirty).
+fn note_damage(display: CGDirectDisplayID, sample: &CMSampleBuffer, image: &CVImageBuffer, first: bool) {
+    use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetWidth};
+    let size = (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image));
+    if first {
+        crate::damage::note(display, size, &[]);
+        return;
+    }
+    match dirty_rects(sample, size) {
+        Some(rects) => crate::damage::note(display, size, &rects),
+        None => crate::damage::note_all(display, size),
+    }
+}
+
+/// A frame's dirty rects (SCStreamFrameInfoDirtyRects), clipped to its `w`×`h` pixels, as
+/// (x0, y0, x1, y1); `None` when it doesn't have them.
+fn dirty_rects(sample: &CMSampleBuffer, (w, h): (usize, usize)) -> Option<Vec<(u32, u32, u32, u32)>> {
+    use objc2_core_foundation::{CFArray, CFDictionary, CGRect};
+    use objc2_screen_capture_kit::SCStreamFrameInfoDirtyRects;
+    let attachments = unsafe { sample.sample_attachments_array(false) }?;
+    if attachments.count() == 0 {
+        return None;
+    }
+    // SAFETY: a sample's attachments are dictionaries; the dirty rects an array of
+    // CGRect dictionaries. NSString keys are toll-free bridged to CFString.
+    let info = unsafe { (attachments.value_at_index(0) as *const CFDictionary).as_ref() }?;
+    let key: &objc2_foundation::NSString = unsafe { SCStreamFrameInfoDirtyRects };
+    let list = unsafe { (info.value((key as *const objc2_foundation::NSString).cast()) as *const CFArray).as_ref() }?;
+    let mut out = Vec::with_capacity(list.count().max(0) as usize);
+    for i in 0..list.count() {
+        let dict = unsafe { (list.value_at_index(i) as *const CFDictionary).as_ref() };
+        let mut r = CGRect::default();
+        if !unsafe { objc2_core_graphics::CGRectMakeWithDictionaryRepresentation(dict, &mut r) } {
+            continue;
+        }
+        let x0 = r.origin.x.floor().clamp(0.0, w as f64) as u32;
+        let y0 = r.origin.y.floor().clamp(0.0, h as f64) as u32;
+        let x1 = (r.origin.x + r.size.width).ceil().clamp(0.0, w as f64) as u32;
+        let y1 = (r.origin.y + r.size.height).ceil().clamp(0.0, h as f64) as u32;
+        if x1 > x0 && y1 > y0 {
+            out.push((x0, y0, x1, y1));
+        }
+    }
+    Some(out)
+}
+
+pub struct WatchIvars {
+    display: CGDirectDisplayID,
+    frames: std::sync::atomic::AtomicU64,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+define_class!(
+    /// Hears a display's changes for crate::damage, and nothing else.
+    #[unsafe(super(NSObject))]
+    #[name = "GlassDamageOutput"]
+    #[ivars = WatchIvars]
+    struct DamageOutput;
+
+    unsafe impl NSObjectProtocol for DamageOutput {}
+
+    unsafe impl SCStreamOutput for DamageOutput {
+        #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
+        unsafe fn stream_did_output(
+            &self,
+            _stream: &SCStream,
+            sample: &CMSampleBuffer,
+            kind: SCStreamOutputType,
+        ) {
+            if kind != SCStreamOutputType::Screen {
+                return;
+            }
+            let Some(image) = (unsafe { sample.image_buffer() }) else {
+                return;
+            };
+            let ivars = self.ivars();
+            let first = ivars.frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
+            note_damage(ivars.display, sample, &image, first);
+        }
+    }
+
+    unsafe impl SCStreamDelegate for DamageOutput {
+        #[unsafe(method(stream:didStopWithError:))]
+        unsafe fn stream_did_stop(&self, _stream: &SCStream, _error: &NSError) {
+            self.ivars().stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+);
+
+/// A display watched for changes alone (an agent waits on it and no viewer streams it);
+/// stops when dropped.
+pub struct Watch {
+    stream: Retained<SCStream>,
+    _output: Retained<DamageOutput>,
+    _queue: dispatch2::DispatchRetained<DispatchQueue>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+// As Capture.
+unsafe impl Send for Watch {}
+
+impl Watch {
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        unsafe { self.stream.stopCaptureWithCompletionHandler(None) };
+    }
+}
+
+/// The widest a watched display is captured: its dirty rects still find a caret.
+const WATCH_WIDTH: usize = 1920;
+
+/// Starts watching `display` for changes: a small capture with no encoder, whose dirty
+/// rects go to crate::damage.
+pub fn watch(display: &Display) -> Result<Watch> {
+    let (w, h) = (display.info.width.max(1), display.info.height.max(1));
+    let scale = (WATCH_WIDTH as f64 / w as f64).min(1.0);
+    let (width, height) = (((w as f64 * scale) as usize).max(2) & !1, ((h as f64 * scale) as usize).max(2) & !1);
+    let filter = unsafe {
+        SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display.sc, &NSArray::new())
+    };
+    let config = unsafe { SCStreamConfiguration::new() };
+    unsafe {
+        config.setWidth(width);
+        config.setHeight(height);
+        config.setMinimumFrameInterval(CMTime::new(1, 30));
+        config.setPixelFormat(PIXEL_FORMAT_420V);
+        // The pointer moving isn't the screen changing.
+        config.setShowsCursor(false);
+        config.setQueueDepth(3);
+    }
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output = DamageOutput::alloc().set_ivars(WatchIvars {
+        display: display.info.id,
+        frames: Default::default(),
+        stopped: stopped.clone(),
+    });
+    let output: Retained<DamageOutput> = unsafe { msg_send![super(output), init] };
+    let stream = unsafe {
+        SCStream::initWithFilter_configuration_delegate(
+            SCStream::alloc(),
+            &filter,
+            &config,
+            Some(ProtocolObject::from_ref(&*output)),
+        )
+    };
+    let queue = DispatchQueue::new("glass.damage", DispatchQueueAttr::SERIAL);
+    unsafe {
+        stream
+            .addStreamOutput_type_sampleHandlerQueue_error(
+                ProtocolObject::from_ref(&*output),
+                SCStreamOutputType::Screen,
+                Some(&queue),
+            )
+            .map_err(|e| anyhow!("addStreamOutput: {}", e.localizedDescription()))?;
+    }
+    let (tx, rx) = mpsc::channel();
+    let handler = RcBlock::new(move |err: *mut NSError| {
+        let _ = tx.send(unsafe { err.as_ref() }.map(|e| e.localizedDescription().to_string()));
+    });
+    unsafe { stream.startCaptureWithCompletionHandler(Some(&handler)) };
+    let started = answer(&rx, "starting a watch");
+    if started.is_err() {
+        unsafe { stream.stopCaptureWithCompletionHandler(None) };
+    }
+    if let Some(err) = started? {
+        bail!("startCapture: {err}");
+    }
+    let id = display.info.id;
+    tracing::info!("display {id}: watching for changes for an agent ({width}x{height})");
+    Ok(Watch { stream, _output: output, _queue: queue, stopped })
 }
 
 /// A BGRA pixel buffer's pixels, rows packed (`None` for other formats).
@@ -671,7 +858,7 @@ pub fn start(
         queue: queue.clone(),
         stopped: Default::default(),
     });
-    let output = StreamOutput::new(state.clone(), audio, source_id);
+    let output = StreamOutput::new(state.clone(), audio, source_id, matches!(source, Source::Display(_)));
     // The output is also the delegate, to hear when ScreenCaptureKit ends the stream.
     let stream = unsafe {
         SCStream::initWithFilter_configuration_delegate(
