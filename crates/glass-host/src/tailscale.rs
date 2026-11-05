@@ -1,6 +1,7 @@
 //! Trusts peers that Tailscale says belong to the same user as this Mac, so devices on
 //! your own tailnet connect without a token.
 
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -359,20 +360,21 @@ pub enum Probe {
     },
 }
 
+/// With `tailscale status` failing: is the CLI there at all?
+fn probe_installed() -> Probe {
+    let installed = std::process::Command::new(cli())
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok_and(|child| exited_ok(child, CLI_TIMEOUT));
+    if installed { Probe::NotRunning } else { Probe::Missing }
+}
+
 /// Where this Mac stands with Tailscale, for `glass setup`.
 pub async fn probe() -> Probe {
     let Ok(status) = json(&["status", "--json"]).await else {
-        let installed = std::process::Command::new(cli())
-            .arg("version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .is_ok_and(|child| exited_ok(child, CLI_TIMEOUT));
-        return if installed {
-            Probe::NotRunning
-        } else {
-            Probe::Missing
-        };
+        return probe_installed();
     };
     if status["BackendState"].as_str() != Some("Running") {
         return Probe::LoggedOut;
@@ -435,6 +437,47 @@ pub async fn ensure_cert(
     }
     tracing::info!("using Tailscale HTTPS certificate for {name}");
     Some((cert, key))
+}
+
+/// How long after startup Glass keeps trying for its certificate, and how often. Long enough
+/// for a slow boot; after that, starting Tailscale still needs a restart of Glass, as it always has.
+const CERT_WINDOW: Duration = Duration::from_secs(300);
+const CERT_POLL: Duration = Duration::from_secs(5);
+
+/// Whether Tailscale may still be on its way up, so a certificate could arrive shortly after
+/// startup. `status` is `tailscale status --json`, or None if that failed. A logged-out or
+/// stopped Tailscale, or a tailnet without HTTPS, stays that way until someone changes it.
+fn may_come_up(status: Option<&Value>, installed: impl FnOnce() -> bool) -> bool {
+    let Some(status) = status else { return installed() };
+    match status["BackendState"].as_str() {
+        Some("Stopped" | "NeedsLogin" | "NeedsMachineAuth") => false,
+        Some("Running") => status["CertDomains"].as_array().is_some_and(|d| !d.is_empty()),
+        _ => true,
+    }
+}
+
+/// Keeps calling `check` until it finds a certificate or the window ends.
+async fn cert_arrives<F: Future<Output = bool>>(mut check: impl FnMut() -> F, every: Duration, window: Duration) -> bool {
+    let end = tokio::time::Instant::now() + window;
+    while tokio::time::Instant::now() + every <= end {
+        tokio::time::sleep(every).await;
+        if check().await {
+            return true;
+        }
+    }
+    false
+}
+
+/// For a host that started without a certificate. At boot Glass can start before Tailscale;
+/// without this it would serve plain HTTP on localhost's name until someone restarts it, and
+/// nothing on the tailnet could reach it. True when a certificate is there to restart for.
+pub async fn wait_for_cert(dir: &std::path::Path) -> bool {
+    let status = json(&["status", "--json"]).await.ok();
+    if !may_come_up(status.as_ref(), || !matches!(probe_installed(), Probe::Missing)) {
+        return false;
+    }
+    tracing::info!("no certificate yet: waiting for Tailscale");
+    cert_arrives(|| async { ensure_cert(dir).await.is_some() }, CERT_POLL, CERT_WINDOW).await
 }
 
 pub(crate) fn is_tailscale_ip(ip: IpAddr) -> bool {
@@ -592,6 +635,43 @@ mod tests {
         owner.expire();
         assert_eq!(owner.get_or_resolve(ts).await.as_deref(), Some("ada@example.com"));
         assert_eq!(owner.get_or_resolve(ts).await.as_deref(), Some("ada@example.com"), "bea is never read");
+    }
+
+    #[test]
+    fn only_a_tailscale_on_its_way_up_is_worth_waiting_for() {
+        let up = |v: Value| may_come_up(Some(&v), || panic!("status answered"));
+        assert!(!may_come_up(None, || false), "not installed");
+        assert!(may_come_up(None, || true), "installed, tailscaled not answering yet");
+        assert!(up(serde_json::json!({"BackendState": "NoState"})));
+        assert!(up(serde_json::json!({"BackendState": "Starting"})));
+        assert!(up(serde_json::json!({"BackendState": "Running", "CertDomains": ["a.ts.net"]})), "tailscale cert failed");
+        assert!(!up(serde_json::json!({"BackendState": "Running", "CertDomains": []})), "HTTPS off");
+        assert!(!up(serde_json::json!({"BackendState": "Running"})), "HTTPS off");
+        assert!(!up(serde_json::json!({"BackendState": "Stopped"})));
+        assert!(!up(serde_json::json!({"BackendState": "NeedsLogin"})));
+        assert!(!up(serde_json::json!({"BackendState": "NeedsMachineAuth"})));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_certificate_is_found_and_an_absent_one_stops_the_search() {
+        let every = Duration::from_secs(5);
+        let calls = std::cell::Cell::new(0);
+        let third = || {
+            calls.set(calls.get() + 1);
+            std::future::ready(calls.get() == 3)
+        };
+        assert!(cert_arrives(third, every, Duration::from_secs(300)).await);
+        assert_eq!(calls.get(), 3);
+
+        calls.set(0);
+        let started = tokio::time::Instant::now();
+        let never = || {
+            calls.set(calls.get() + 1);
+            std::future::ready(false)
+        };
+        assert!(!cert_arrives(never, every, Duration::from_secs(30)).await);
+        assert_eq!(calls.get(), 6);
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
     }
 
     #[test]
