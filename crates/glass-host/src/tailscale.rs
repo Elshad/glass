@@ -360,21 +360,20 @@ pub enum Probe {
     },
 }
 
-/// With `tailscale status` failing: is the CLI there at all?
-fn probe_installed() -> Probe {
-    let installed = std::process::Command::new(cli())
-        .arg("version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok_and(|child| exited_ok(child, CLI_TIMEOUT));
-    if installed { Probe::NotRunning } else { Probe::Missing }
-}
-
 /// Where this Mac stands with Tailscale, for `glass setup`.
 pub async fn probe() -> Probe {
     let Ok(status) = json(&["status", "--json"]).await else {
-        return probe_installed();
+        let installed = std::process::Command::new(cli())
+            .arg("version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok_and(|child| exited_ok(child, CLI_TIMEOUT));
+        return if installed {
+            Probe::NotRunning
+        } else {
+            Probe::Missing
+        };
     };
     if status["BackendState"].as_str() != Some("Running") {
         return Probe::LoggedOut;
@@ -484,12 +483,7 @@ where
 /// without this it would serve plain HTTP on localhost's name until someone restarted it, and
 /// nothing on the tailnet could reach it. True when there's a certificate to restart for.
 pub async fn wait_for_cert(dir: &std::path::Path) -> bool {
-    if json(&["status", "--json"]).await.is_err()
-        && matches!(tokio::task::spawn_blocking(probe_installed).await, Ok(Probe::Missing))
-    {
-        return false;
-    }
-    tracing::info!("no certificate yet: waiting for Tailscale");
+    tracing::info!("no certificate yet: watching for Tailscale for {}s", CERT_WINDOW.as_secs());
     cert_arrives(
         || async { json(&["status", "--json"]).await.is_ok_and(|s| cert_available(&s)) },
         || async { ensure_cert(dir).await.is_some() },
