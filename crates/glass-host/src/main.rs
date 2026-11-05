@@ -1278,11 +1278,13 @@ async fn run_host(args: Args) -> Result<()> {
             .await
             .map(|(cert, key)| server::TlsFiles { cert, key }),
     };
-    // Started before Tailscale (at boot, say): pick up HTTPS once it's there. Only under
-    // something that starts Glass again, so a `glass` in a terminal doesn't just quit.
-    if tls.is_none() && !args.test && !support::is_host() && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    // Started before Tailscale (at boot, say): pick up HTTPS once it's there, when nobody is
+    // connected. Only under something that starts Glass again, or it would just quit.
+    let restarted = signin::active() || std::env::var_os("GLASS_SUPERVISED").is_some();
+    if tls.is_none() && restarted && !args.test && !support::is_host() {
         tokio::spawn(async {
             if tailscale::wait_for_cert(&config_dir().join("certs")).await {
+                viewers::until_none().await;
                 power::restart_for_certificate();
             }
         });
