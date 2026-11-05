@@ -47,6 +47,28 @@ impl Rotation {
             Self::Cw270 => (h - 1 - y, x),
         }
     }
+
+    /// A rectangle of the scanned-out picture (`scanned` pixels; left, top, right, bottom,
+    /// as Desktop Duplication's dirty and move rectangles are) in the upright one, as
+    /// (x0, y0, x1, y1). `None` when it's empty or off the picture.
+    pub fn upright_rect(self, scanned: (usize, usize), [l, t, r, b]: [i32; 4]) -> Option<(u32, u32, u32, u32)> {
+        let clamp = |v: i32, max: usize| (v.max(0) as usize).min(max);
+        let (l, r) = (clamp(l, scanned.0), clamp(r, scanned.0));
+        let (t, b) = (clamp(t, scanned.1), clamp(b, scanned.1));
+        if r <= l || b <= t {
+            return None;
+        }
+        let (w, h) = self.upright(scanned);
+        // Inverse of `source`, on the first and last pixels inside.
+        let up = |sx: usize, sy: usize| match self {
+            Self::None => (sx, sy),
+            Self::Cw90 => (w - 1 - sy, sx),
+            Self::Cw180 => (w - 1 - sx, h - 1 - sy),
+            Self::Cw270 => (sy, h - 1 - sx),
+        };
+        let ((ax, ay), (bx, by)) = (up(l, t), up(r - 1, b - 1));
+        Some((ax.min(bx) as u32, ay.min(by) as u32, ax.max(bx) as u32 + 1, ay.max(by) as u32 + 1))
+    }
 }
 
 /// A rectangle of a picture, in pixels.
@@ -395,6 +417,27 @@ mod tests {
         assert_eq!([at(&cw180, w, 0, 0), at(&cw180, w, 2, 1)], [(2, 1), (0, 0)]);
         let (w, cw270) = all(Rotation::Cw270);
         assert_eq!([at(&cw270, w, 0, 0), at(&cw270, w, 1, 0), at(&cw270, w, 0, 2)], [(2, 0), (2, 1), (0, 0)]);
+    }
+
+    #[test]
+    fn changed_rects_turn_upright_with_the_picture() {
+        let scanned = (30, 20);
+        for rotation in [Rotation::None, Rotation::Cw90, Rotation::Cw180, Rotation::Cw270] {
+            let (l, t, r, b) = (3, 4, 11, 9);
+            let (x0, y0, x1, y1) = rotation.upright_rect(scanned, [l, t, r, b]).unwrap();
+            let (w, h) = rotation.upright(scanned);
+            // Exactly the upright pixels that come from inside the rect.
+            for y in 0..h {
+                for x in 0..w {
+                    let (sx, sy) = rotation.source((w, h), x, y);
+                    let inside = (l as usize..r as usize).contains(&sx) && (t as usize..b as usize).contains(&sy);
+                    let mapped = (x0 as usize..x1 as usize).contains(&x) && (y0 as usize..y1 as usize).contains(&y);
+                    assert_eq!(inside, mapped, "{rotation:?} at {x}, {y}");
+                }
+            }
+        }
+        assert_eq!(Rotation::None.upright_rect(scanned, [-5, 0, 40, 3]), Some((0, 0, 30, 3)));
+        assert_eq!(Rotation::None.upright_rect(scanned, [31, 0, 40, 3]), None);
     }
 
     #[test]

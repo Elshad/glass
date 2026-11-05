@@ -347,7 +347,9 @@ test.describe('input', () => {
     await expect.poll(async () => (await host.input('scroll')).events.length).toBeGreaterThan(0);
     const { events } = await host.input();
     expect(events.some((e) => e.t === 'down' && e.button === 2)).toBeTruthy();
-    expect((await host.input('scroll')).events.reduce((sum, e) => sum + e.dy, 0)).toBeCloseTo(120, 0);
+    // In the host's desktop points: the 640-point display is shown at another size.
+    const shown = Math.min(box.width / 640, box.height / 360) * 640;
+    expect((await host.input('scroll')).events.reduce((sum, e) => sum + e.dy, 0)).toBeCloseTo(120 * 640 / shown, 0);
   });
 
   it('sends typed keys as Mac keycodes', async ({ page, host }) => {
@@ -358,6 +360,25 @@ test.describe('input', () => {
     await page.keyboard.press('KeyI');
     await expect.poll(() => keys(host, 'keyup')).toEqual([K.H, K.Shift, K.I]);
     expect(await keys(host, 'keydown')).toEqual([K.Shift, K.H, K.I]);
+  });
+
+  it('types IME, emoji and accented text as text, in order with keys', async ({ page, host }) => {
+    await open(page, host);
+    await host.clearInput();
+    await page.locator('#keys').focus();
+    await page.keyboard.insertText('café 👍');
+    // An IME settling on what was composed.
+    await page.evaluate(() => {
+      const sink = document.getElementById('keys');
+      sink.dispatchEvent(new CompositionEvent('compositionstart', { data: '' }));
+      sink.dispatchEvent(new CompositionEvent('compositionend', { data: '日本語' }));
+    });
+    // Plain ASCII still goes as keys.
+    await page.keyboard.insertText('i');
+    await expect.poll(() => keys(host, 'keyup')).toEqual([K.I]);
+    const { events } = await host.input();
+    const typed = events.filter((e) => e.t === 'text' || e.t === 'keydown').map((e) => e.text ?? e.keycode);
+    expect(typed).toEqual(['café 👍', '日本語', K.I]);
   });
 
   it('PC keyboard mode turns Ctrl into ⌘ and Super into Ctrl', async ({ page, host }) => {
@@ -661,20 +682,18 @@ test.describe('resilience', () => {
     expect(host.clientLog('decoder error detail')).toHaveLength(0);
   });
 
-  it('backs off the bitrate under loss, and a quiet stream does not climb back', async ({ page, host }) => {
+  it('a few lost frames recover without cutting the bitrate, and a quiet stream does not climb', async ({ page, host }) => {
     await open(page, host);
     const bps = async () => (await host.get('/test/bitrate')).bps;
-    const max = await bps();
+    const before = await bps();
     await host.post('/test/drop?frames=4');
-    await expect.poll(bps, { timeout: 5_000 }).toBeLessThan(max);
+    // This viewer acknowledges frames, so its rate follows the queue (ack_rate tests in
+    // flow.rs): isolated loss isn't congestion. What it needs is the picture going again.
+    await expect.poll(async () => (await stats(page)).fps, { timeout: 5_000 }).toBeGreaterThan(10);
     await expect(page.locator('#hud')).toContainText('target');
-    // The test pattern uses a sliver of its allowance: no loss, but no evidence the link
-    // could take more, so the rate holds (it rises only when used; see rate.rs tests).
-    await page.waitForTimeout(3000);
-    const low = await bps();
+    // The test pattern uses a sliver of its allowance: no evidence the link could take more.
     await page.waitForTimeout(4000);
-    // Never climbs back; on a loaded test machine real loss can push it lower still.
-    expect(await bps()).toBeLessThanOrEqual(low);
+    expect(await bps()).toBeLessThanOrEqual(before);
   });
 
   it('never decodes a corrupted frame', async ({ page, host }) => {

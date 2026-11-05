@@ -1,5 +1,6 @@
 //! Captures each display with DXGI Desktop Duplication (one thread per display), draws the
-//! pointer in (duplication leaves it out), and encodes each on its own thread: on the GPU
+//! pointer in (duplication leaves it out; viewers that draw their own go without, see
+//! `crate::cursor`), and encodes each on its own thread: on the GPU
 //! through Media Foundation where there's a hardware encoder, else with OpenH264. A single
 //! window is streamed by cropping its display's picture to it each frame (so it has to be
 //! on screen; what's in front of it shows). Coordinates are physical pixels: the process
@@ -28,7 +29,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
+    DXGI_OUTDUPL_MOVE_RECT, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::core::{BOOL, Interface};
@@ -191,6 +192,13 @@ struct Pointer {
 
 static POINTER: Mutex<Pointer> = Mutex::new(Pointer { shape: None });
 
+/// Draw the pointer into the picture (`crate::cursor` decides). The secure-desktop helper
+/// is its own process and never hears otherwise: it always does.
+static CURSOR_BAKED: AtomicBool = AtomicBool::new(true);
+/// When the pointer last went back into the picture: pictures from before then (an
+/// agent's screenshot) don't have it.
+static BAKED_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
 struct PointerShape {
     kind: u32,
     width: usize,
@@ -251,6 +259,8 @@ fn draw_pointer(pixels: &mut [u8], width: usize, height: usize, stride: usize, s
 
 /// One display's duplication, with a CPU-readable copy of its latest desktop image.
 struct Duplicator {
+    /// The display's id, for crate::damage.
+    display: u32,
     _device: ID3D11Device,
     context: ID3D11DeviceContext,
     dup: IDXGIOutputDuplication,
@@ -270,10 +280,12 @@ struct Duplicator {
     pointer: Option<(i32, i32)>,
     /// The staging copy holds a desktop image (not just a pointer move) yet.
     has_image: bool,
+    /// Whether the picture last sent has the pointer in it.
+    sent_pointer: bool,
 }
 
 impl Duplicator {
-    fn new(device_name: &str) -> Result<Self> {
+    fn new(display: u32, device_name: &str) -> Result<Self> {
         let mut found = None;
         for_each_output(|adapter, output, desc| {
             if self::device_name(&desc) == device_name {
@@ -303,6 +315,7 @@ impl Duplicator {
             let dup = output.DuplicateOutput(&device).context("DuplicateOutput")?;
             let desc = dup.GetDesc();
             Ok(Self {
+                display,
                 _device: device,
                 context,
                 dup,
@@ -315,6 +328,7 @@ impl Duplicator {
                 sent: None,
                 pointer: None,
                 has_image: false,
+                sent_pointer: true,
             })
         }
     }
@@ -333,9 +347,10 @@ impl Duplicator {
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                     // Nothing new on screen, but what's sent may have to change: another
                     // window (or the whole display again), or a resized window settling.
+                    // Or the pointer went in or out of the picture.
                     let crop = self.crop(window);
                     if self.has_image
-                        && crop != self.sent
+                        && (crop != self.sent || self.sent_pointer != CURSOR_BAKED.load(Ordering::Relaxed))
                         && let Some(crop) = crop
                     {
                         self.copy_out(tx, now_us(), crop)?;
@@ -375,6 +390,7 @@ impl Duplicator {
     /// into the staging texture. Whether anything visible changed.
     unsafe fn take(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO, resource: Option<IDXGIResource>) -> windows::core::Result<bool> {
         let mut changed = false;
+        let baked = CURSOR_BAKED.load(Ordering::Relaxed);
         if info.PointerShapeBufferSize > 0 {
             let mut data = vec![0u8; info.PointerShapeBufferSize as usize];
             let (mut needed, mut shape) = (0u32, DXGI_OUTDUPL_POINTER_SHAPE_INFO::default());
@@ -387,12 +403,13 @@ impl Duplicator {
                 pitch: shape.Pitch as usize,
                 data,
             }));
-            changed = true;
+            changed = baked;
         }
         if info.LastMouseUpdateTime != 0 {
             let p = info.PointerPosition;
             let at = p.Visible.as_bool().then_some((p.Position.x, p.Position.y));
-            changed |= at != self.pointer;
+            // Without the pointer in the picture, moving it changes nothing to encode.
+            changed |= baked && at != self.pointer;
             self.pointer = at;
         }
         if info.LastPresentTime != 0
@@ -408,10 +425,48 @@ impl Duplicator {
             }
             // SAFETY: both textures are the same size and format.
             unsafe { self.context.CopyResource(self.staging.as_ref().unwrap(), &texture) };
+            // A new duplication's first image is how the display looks, not a change (it
+            // comes all dirty).
+            let first = !self.has_image;
             self.has_image = true;
             changed = true;
+            let upright = self.rotation.upright((self.width, self.height));
+            // SAFETY: the frame is still acquired.
+            match unsafe { self.changed_rects(info) } {
+                _ if first => crate::damage::note(self.display, upright, &[]),
+                Some(rects) => crate::damage::note(self.display, upright, &rects),
+                None => crate::damage::note_all(self.display, upright),
+            }
         }
         Ok(changed)
+    }
+
+    /// Where the acquired frame changed (moved areas' destinations, and dirty areas),
+    /// upright; `None` when Duplication doesn't say. Must be called before ReleaseFrame.
+    unsafe fn changed_rects(&self, info: &DXGI_OUTDUPL_FRAME_INFO) -> Option<Vec<(u32, u32, u32, u32)>> {
+        let size = info.TotalMetadataBufferSize as usize;
+        if size == 0 {
+            return None;
+        }
+        let scanned = (self.width, self.height);
+        let mut out = Vec::new();
+        let mut push = |r: RECT| out.extend(self.rotation.upright_rect(scanned, [r.left, r.top, r.right, r.bottom]));
+        let mut moves = vec![DXGI_OUTDUPL_MOVE_RECT::default(); size / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>() + 1];
+        let mut need = 0u32;
+        let bytes = std::mem::size_of_val(moves.as_slice()) as u32;
+        // SAFETY: the buffer holds `bytes`; Duplication says how much it filled.
+        unsafe { self.dup.GetFrameMoveRects(bytes, moves.as_mut_ptr(), &mut need) }.ok()?;
+        for m in &moves[..(need as usize / std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>()).min(moves.len())] {
+            push(m.DestinationRect);
+        }
+        let mut dirty = vec![RECT::default(); size / std::mem::size_of::<RECT>() + 1];
+        let bytes = std::mem::size_of_val(dirty.as_slice()) as u32;
+        // SAFETY: as above.
+        unsafe { self.dup.GetFrameDirtyRects(bytes, dirty.as_mut_ptr(), &mut need) }.ok()?;
+        for &r in &dirty[..(need as usize / std::mem::size_of::<RECT>()).min(dirty.len())] {
+            push(r);
+        }
+        Some(out)
     }
 
     fn make_staging(&self, width: u32, height: u32) -> windows::core::Result<ID3D11Texture2D> {
@@ -451,8 +506,11 @@ impl Duplicator {
         unsafe { self.context.Unmap(staging, 0) };
         // Duplication gives the pointer's position and shape the way the desktop is seen
         // (upright), so it's drawn after turning the picture.
+        self.sent_pointer = CURSOR_BAKED.load(Ordering::Relaxed);
         let shape = POINTER.lock().unwrap().shape.clone();
-        if let (Some((x, y)), Some(shape)) = (self.pointer, shape) {
+        if self.sent_pointer
+            && let (Some((x, y)), Some(shape)) = (self.pointer, shape)
+        {
             draw_pointer(&mut pixels, width, height, width * 4, &shape, x - crop.x as i32, y - crop.y as i32);
         }
         tx.0.put(
@@ -477,7 +535,7 @@ fn capture_loop(id: usize, device: String, monitor: Arc<Monitor>, tx: FrameSende
         // In the secure-desktop helper, follow the input desktop so duplication can see the
         // lock screen / UAC desktop. A no-op in the ordinary per-user host.
         super::secure::follow_input_desktop();
-        let mut dup = match Duplicator::new(&device) {
+        let mut dup = match Duplicator::new(id as u32, &device) {
             Ok(d) => {
                 let (w, h) = d.rotation.upright((d.width, d.height));
                 match d.rotation {
@@ -901,6 +959,12 @@ fn encode_loop(
         if !wants_key && (!unsent || Instant::now() < next_due) {
             continue;
         }
+        // A viewer's link is still busy (crate::flow): keep the picture and look again
+        // shortly; the next frame carries every change since.
+        if !wants_key && crate::flow::held(slot as u8) {
+            next_due = Instant::now() + crate::flow::POLL;
+            continue;
+        }
         monitor.keyframe.store(false, Ordering::Relaxed);
 
         let size = (frame.width, frame.height);
@@ -1083,15 +1147,31 @@ impl VideoSource for Video {
             }
         }
     }
+    /// Every display is duplicated all the time, and Duplication says what changed.
+    fn track_damage(&self, id: u32) -> bool {
+        let monitors = self.monitors.lock().unwrap();
+        monitors.as_ref().and_then(|m| m.get(id as usize)).is_some_and(|m| m.present.load(Ordering::Relaxed))
+    }
     fn picture(&self, id: u32, max: [u32; 2]) -> Option<crate::lossless::RawFrame> {
         *THUMBS_UNTIL.lock().unwrap() = Some(Instant::now() + Duration::from_secs(10));
         let frame = {
             let monitors = self.monitors.lock().unwrap();
             let m = monitors.as_ref()?.get(id as usize).filter(|m| m.present.load(Ordering::Relaxed))?;
             let thumb = m.thumb.lock().unwrap();
-            thumb.as_ref()?.1.clone()
+            let (at, frame) = thumb.as_ref()?;
+            // An agent's screenshot wants the pointer: wait for a picture with it in.
+            if BAKED_SINCE.lock().unwrap().is_some_and(|since| *at < since) {
+                return None;
+            }
+            frame.clone()
         };
         crate::thumbs::downscale(&frame.bgra, frame.width, frame.height, frame.width * 4, false, max)
+    }
+    fn set_cursor_baked(&self, on: bool) {
+        if CURSOR_BAKED.swap(on, Ordering::Relaxed) != on {
+            // The capture loops send a picture with (or without) it on their next pass.
+            *BAKED_SINCE.lock().unwrap() = on.then(Instant::now);
+        }
     }
     fn frame_generation(&self, stream: u8) -> Option<u64> {
         let monitors = self.monitors.lock().unwrap();
@@ -1181,7 +1261,7 @@ mod tests {
     #[ignore]
     fn captures_a_display() {
         let (device, _) = outputs().unwrap().into_iter().next().expect("a display");
-        let mut dup = Duplicator::new(&device).unwrap();
+        let mut dup = Duplicator::new(0, &device).unwrap();
         let mailbox = Arc::new(Mailbox::default());
         let tx = FrameSender(mailbox.clone());
         let deadline = Instant::now() + Duration::from_secs(5);

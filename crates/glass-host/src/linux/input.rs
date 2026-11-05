@@ -19,7 +19,8 @@ use super::video::{self, Rect};
 
 /// Absolute pointer resolution across the whole desktop layout.
 const ABS_MAX: i32 = 65535;
-/// DOM wheel deltas are pixels; one wheel notch is 120 hi-res units, roughly 40 px.
+/// Viewers scroll in desktop (logical) pixels; one wheel notch is 120 hi-res units,
+/// roughly 40 px.
 const HI_RES_PER_PIXEL: f32 = 3.0;
 
 pub fn has_accessibility() -> bool {
@@ -36,6 +37,8 @@ pub struct Injector {
     held: HashSet<u16>,
     buttons: [bool; 3],
     wheel: (f32, f32),
+    /// Hi-res wheel movement under a unit, not sent yet (trackpads send fractions).
+    hi_res: (f32, f32),
     /// Where the pointer is, in logical desktop coordinates (for relative moves).
     pos: (f64, f64),
 }
@@ -50,6 +53,7 @@ impl Injector {
             held: HashSet::new(),
             buttons: [false; 3],
             wheel: (0.0, 0.0),
+            hi_res: (0.0, 0.0),
             pos: (0.0, 0.0),
         };
         this.set_displays(&[display]);
@@ -128,8 +132,8 @@ impl Injector {
                 let y = (self.pos.1 + dy as f64).clamp(l.y, l.y + l.h - 1.0);
                 self.move_to(x, y);
             }
-            // Routed to crate::gamepad by the server, never here.
-            Ev::Gamepad { .. } => {}
+            // Routed to crate::gamepad by the server, never here; text goes to type_text.
+            Ev::Gamepad { .. } | Ev::Text { .. } => {}
             // Pressure needs a tablet device; the pen still works as a mouse.
             Ev::Pen { .. } => {}
             Ev::MouseDown { button } | Ev::MouseUp { button } => {
@@ -145,19 +149,26 @@ impl Injector {
             }
             Ev::Scroll { dx, dy } => {
                 // DOM: +dy scrolls down. evdev: +wheel scrolls up, +hwheel scrolls right.
-                let (v, h) = (-dy * HI_RES_PER_PIXEL, dx * HI_RES_PER_PIXEL);
+                if !dx.is_finite() || !dy.is_finite() {
+                    return;
+                }
+                self.hi_res.0 -= dy * HI_RES_PER_PIXEL;
+                self.hi_res.1 += dx * HI_RES_PER_PIXEL;
+                let (v, h) = (self.hi_res.0.trunc(), self.hi_res.1.trunc());
+                self.hi_res.0 -= v;
+                self.hi_res.1 -= h;
                 self.wheel.0 += v;
                 self.wheel.1 += h;
                 let mut events = vec![
                     InputEvent::new(
                         EventType::RELATIVE.0,
                         RelativeAxisCode::REL_WHEEL_HI_RES.0,
-                        v.round() as i32,
+                        v as i32,
                     ),
                     InputEvent::new(
                         EventType::RELATIVE.0,
                         RelativeAxisCode::REL_HWHEEL_HI_RES.0,
-                        h.round() as i32,
+                        h as i32,
                     ),
                 ];
                 // Legacy whole-notch events for apps that ignore hi-res scrolling.

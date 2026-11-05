@@ -1,7 +1,7 @@
 // Main thread: wires input, UI and the worker together. Video and networking live
 // in worker.js so the main thread only handles input and small DOM updates.
 
-import { inputEvent } from './proto.js';
+import { Input, inputEvent } from './proto.js';
 import { attachInput } from './input.js';
 import { attachGamepads } from './gamepad.js';
 import { createUI, positionNames } from './ui.js';
@@ -18,6 +18,7 @@ import { createAgent } from './agent.js';
 import { createPush } from './push.js';
 import { createDevice } from './device.js';
 import { createFiles } from './files.js';
+import { createCursor } from './cursor.js';
 
 // Shortcuts iPadOS keeps for itself (no web page or app can capture them), sent as one tap.
 const CMD = K.MetaLeft;
@@ -170,6 +171,7 @@ const areaObserver = new ResizeObserver((entries) => {
 });
 matchMedia(`(resolution: ${devicePixelRatio}dppx)`).addEventListener?.('change', () => queueViewport());
 let viewportTimer;
+let firstViewport = false; // this connection hasn't sent its viewport
 let lastViewport = '';
 
 // Remote: no host serves this page, so there's no config to fetch.
@@ -195,11 +197,13 @@ worker.onerror = (e) => log('error', `worker: ${e.message}`, { src: `${e.filenam
 const control = (msg) => worker.postMessage({ type: 'control', msg });
 // A view-only link sends no input (the host would drop it anyway).
 let inputAllowed = true;
-const send = (kind, fields) => inputAllowed && worker.postMessage({ type: 'input', bytes: inputEvent(kind, fields) });
+// Text events come ready made (textEvents); the rest from their fields.
+const send = (kind, fields) => inputAllowed && worker.postMessage({ type: 'input', bytes: kind === Input.TEXT ? fields.bytes : inputEvent(kind, fields) });
 let session = 0; // this session's id, from welcome (chat from it is our own)
 let perms = { input: true, clipboard: true, files: true, owner: true };
 let features = {};
 let sharpWanted = storage((s) => s.getItem(SHARP_KEY)) === '1';
+let sharpPending = false; // to ask for once the first picture is up
 let sharpMode = 'off'; // what the host is doing: 'off', 'sharp' or '4:2:2'
 let deniedMsg; // why the host last turned us away
 
@@ -306,7 +310,16 @@ const input = attachInput({
     annotator.invalidate();
     document.getElementById('zoom-pill').classList.toggle('hidden', s === 1);
     document.getElementById('zoom-level').textContent = `${s.toFixed(1)}×`;
+    cursor.refresh();
   },
+  onResize: () => cursor.refresh(),
+});
+// The host's pointer, drawn here rather than in the video (where the host supports it).
+const cursor = createCursor({
+  screens,
+  overlay: document.getElementById('remote-cursor'),
+  contentRect: (el) => input.contentRect(el),
+  onWanted: (on) => worker.postMessage({ type: 'localCursor', on }),
 });
 document.getElementById('zoom-reset').addEventListener('click', () => input.resetZoom());
 let micContext;
@@ -347,6 +360,7 @@ const ui = createUI({
   onSelectDisplay: (id) => control(id === 'all' ? { t: 'showAll' } : { t: 'selectDisplay', id }),
   onSharp: (on) => {
     sharpWanted = on;
+    sharpPending = false;
     storage((s) => s.setItem(SHARP_KEY, on ? '1' : '0'));
     ui.setSharp({ on });
     control({ t: 'sharp', on });
@@ -610,6 +624,8 @@ worker.postMessage({
   // A wide-colour screen: a Display P3 stream is drawn in P3, not clipped to sRGB.
   wideColor: matchMedia('(color-gamut: p3)').matches,
   decoderStep: Number(storage((s) => s.getItem(DECODER_STEP_KEY)) ?? 0),
+  // bench/ only: read the test host's frame marker (see bench.js).
+  bench: storage((s) => s.getItem('glass.bench')) === '1',
 }, rtcPort ? [rtcPort] : []);
 armMachineTimeout();
 showStatus('connecting', 'Connecting', machineName(currentHost));
@@ -691,6 +707,9 @@ const transfers = new Map(); // id -> toast
 
 worker.onmessage = ({ data }) => {
   switch (data.type) {
+    case 'cursor':
+      cursor.setPosition(data.pos);
+      break;
     case 'connected':
       reloadIfUpdated('reconnect');
       if (rtpVideo) checkRtpVideoArrives();
@@ -731,6 +750,17 @@ worker.onmessage = ({ data }) => {
       if (data.fps > 0) hideStatus();
       renderHud(data);
       break;
+    case 'firstFrame':
+      window.glassFirstFrame ??= performance.now();
+      // Sharp text restarts capture and the encoder: not while the first picture is coming.
+      if (sharpPending) control({ t: 'sharp', on: true });
+      sharpPending = false;
+      startAfterFirstPicture(0);
+      break;
+    case 'bench':
+      // One second of the bench probe, for bench/run.mjs to collect.
+      (window.glassBench ??= []).push(data);
+      break;
     case 'decoderStep':
       storage((s) => s.setItem(DECODER_STEP_KEY, String(data.step)));
       break;
@@ -765,10 +795,31 @@ worker.onmessage = ({ data }) => {
   }
 };
 
+// On a slow link the first picture has to share it with everything else, so it goes first:
+// the main screen, then sound and the mic (the worker), then the other displays' previews,
+// then the rest. Only a picture that never comes (a hidden page) holds them to the wait.
+const FIRST_PICTURE_WAIT_MS = 6000;
+const PREVIEWS_AFTER_MS = 1000;
+const REST_AFTER_MS = 2000;
+let startTimers = [];
+function cancelStart() {
+  startTimers.forEach(clearTimeout);
+  startTimers = [];
+}
+function startAfterFirstPicture(wait) {
+  cancelStart();
+  startTimers = [
+    setTimeout(() => thumbs.setConnected(true), wait + PREVIEWS_AFTER_MS),
+    setTimeout(() => { if (remoteKey) setLogSink((lines) => control({ t: 'log', lines })); }, wait + REST_AFTER_MS),
+  ];
+}
+
 function onControl(msg) {
   switch (msg.t) {
     case 'welcome':
-      thumbs.setConnected(true);
+      startAfterFirstPicture(FIRST_PICTURE_WAIT_MS);
+      cursor.reset();
+      cursor.setHostSupports(Boolean(msg.features?.cursor));
       agent.reset();
       agent.setOwner(Boolean(msg.perms ? msg.perms.owner : !msg.guest));
       machineFailures = 0;
@@ -788,10 +839,7 @@ function onControl(msg) {
       ui.setHostOs(msg.host_os ?? 'macos');
       applyKeyboard(msg.host_os ?? 'macos');
       files.setHostOs(msg.host_os ?? 'macos');
-      if (remoteKey) {
-        setLogSink((lines) => control({ t: 'log', lines }));
-        rememberRemote(msg.computer);
-      }
+      if (remoteKey) rememberRemote(msg.computer);
       guest = Boolean(msg.guest);
       // Remote: other machines aren't reachable from here, so no machines menu either.
       ui.setGuest(guest || Boolean(remoteKey));
@@ -827,7 +875,7 @@ function onControl(msg) {
       // Sharp text is this device's choice: ask again on every (re)connect.
       sharpMode = 'off';
       ui.setSharp({ available: perms.input, on: sharpWanted && perms.input, mode: 'off' });
-      if (sharpWanted && perms.input) control({ t: 'sharp', on: true });
+      sharpPending = sharpWanted && perms.input;
       {
         // Controllers and the mic count as input: not for view-only links.
         const canInput = msg.perms?.input ?? true;
@@ -848,10 +896,16 @@ function onControl(msg) {
       recordButton.classList.toggle('hidden', !(msg.features?.record && msg.perms?.owner));
       if (guest && resolutionMode.startsWith('fit:')) setResolution('auto');
       onLayout(msg.streams);
-      queueViewport(true);
+      // At once: the host holds the first picture for it, to send it at this size.
+      firstViewport = true;
+      lastViewport = '';
+      sendViewport();
       // A reload or reconnect: the host put the displays back when the session ended.
       if (resolutionMode.startsWith('fit:') && !guest) sendFit();
       log('info', 'welcome', { displays: displays.length, streams: msg.streams.map((d) => d.id), audio: msg.audio });
+      break;
+    case 'cursor':
+      cursor.setShape(msg);
       break;
     case 'layout':
       // The host's current displays (a fit adds a virtual one and hides the one it mirrors).
@@ -1024,12 +1078,14 @@ let elsewhere;
 
 function onConnectionStatus(text) {
   if (elsewhere) {
+    cancelStart();
     thumbs.setConnected(false);
     device.setConnected(false);
     showStatus('error', ...elsewhere);
     return;
   }
   if (text !== 'connected') {
+    cancelStart();
     thumbs.setConnected(false);
     device.setConnected(false);
   }
@@ -1169,7 +1225,8 @@ function sendViewport() {
       streams.push([1, 1]);
       continue;
     }
-    const area = areas.get(elements[i]);
+    // Before the first layout: this window, near enough for the first picture's size.
+    const area = areas.get(elements[i])?.[0] ? areas.get(elements[i]) : firstViewport ? [innerWidth, innerHeight] : undefined;
     if (resolutionMode !== 'auto' || !area || !area[0]) {
       streams.push(null);
       continue;
@@ -1177,6 +1234,7 @@ function sendViewport() {
     const scale = devicePixelRatio * zoomScale * pressureScale;
     streams.push([Math.round(area[0] * scale), Math.round(area[1] * scale)]);
   }
+  firstViewport = false;
   const msg = JSON.stringify(streams);
   if (msg === lastViewport) return;
   lastViewport = msg;
@@ -1263,7 +1321,9 @@ function fitSizes() {
 
 function onLayout(streams) {
   annotator.invalidate();
+  input.setStreams(streams);
   input.refreshCursor();
+  cursor.setStreams(streams);
   for (const d of streams) if (!streamedWindows.has(d.id) && !displays.some((x) => x.id === d.id)) displays.push(d);
   // The host orders streams as arranged in macOS; lay them out the same way.
   screens.dataset.arrange = arrangement(streams);
@@ -1677,6 +1737,8 @@ let trackpadOn = touchScreen && (storage((s) => s.getItem(TRACKPAD_KEY)) ?? (pho
 function setTrackpad(on, chosen = false) {
   trackpadOn = on;
   input.setTrackpad(on);
+  // Trackpad mode draws its own pointer (#tp-cursor): the host's goes back in the video.
+  cursor.setWanted(!on);
   ui.setTrackpad({ available: touchScreen, on });
   if (!chosen) return;
   storage((s) => s.setItem(TRACKPAD_KEY, on ? '1' : '0'));

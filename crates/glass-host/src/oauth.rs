@@ -1580,7 +1580,8 @@ latest screenshot of that display.\n\
 - On a Mac or a Windows PC, `snapshot` reads an app's window as text, with a ref on each element you can act on; \
 `press` and `set_value` act on a ref without moving the pointer. Prefer them for ordinary app \
 windows, and screenshot and click for what a snapshot doesn't show (canvases, games, video).\n\
-- After acting, check the result: pass `screenshot_after: true`, or call `wait_for_change` then `screenshot`.\n\
+- After acting, check the result: pass `screenshot_after: true`, or call `wait_for_change` then `screenshot`. \
+To wait for an action's effect, pass `wait_for_change` the `seq` from the screenshot before it as `since`, with `change: true`.\n\
 - Before anything hard to undo (sending, buying, deleting, posting, changing settings or \
 accounts), call `confirm` and only go ahead if approved. If the person hasn't answered yet, the \
 question stays pending: do other work, then collect the answer with `check_answer`.\n\
@@ -1702,6 +1703,10 @@ async fn run_tool(g: &Grant, name: &str, args: &Value) -> Result<Vec<Value>, Str
         let asked = args["wait_seconds"].as_u64().unwrap_or(ASK_HOLD_DEFAULT);
         args["wait_seconds"] = json!(asked.min(ASK_HOLD_MAX));
     }
+    if name == "record" && args["seconds"].as_f64().is_some_and(|s| s > ASK_HOLD_MAX as f64) {
+        // A cloud agent's request can't stay open for a minute; start and stop instead.
+        args["seconds"] = json!(ASK_HOLD_MAX);
+    }
     let args = &args;
     // One tool call counts once against the hour, its follow-up screenshot included.
     let act = |v: Value, charge: bool| async move {
@@ -1717,7 +1722,7 @@ async fn run_tool(g: &Grant, name: &str, args: &Value) -> Result<Vec<Value>, Str
             let v = act(action, true).await?;
             let mut out = crate::mcp::show(show, &v);
             if after {
-                let _ = act(json!({ "action": "wait_for_change", "display": display, "timeout_ms": 1500 }), false).await;
+                let _ = act(crate::mcp::wait_after(&display, &v), false).await;
                 let shot = act(json!({ "action": "screenshot", "display": display }), false).await?;
                 out.extend(crate::mcp::show(Show::Shot, &shot));
             }

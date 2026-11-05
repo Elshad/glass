@@ -35,8 +35,17 @@ use super::convert::{PenPhase, pen_frame};
 use super::keymap::{self, Key, LEFT_CTRL, LEFT_WIN, RIGHT_WIN, V};
 use super::video::{self, Rect};
 
-/// DOM wheel deltas are pixels; one wheel notch is 120 units, roughly 40 px.
-const UNITS_PER_PIXEL: f32 = 3.0;
+/// Viewers scroll in desktop pixels (physical: this process is DPI aware). One wheel notch
+/// (120 units) is about 40 px at 100% scaling and proportionally more when scaled up.
+fn units_per_pixel() -> f32 {
+    // SAFETY: no arguments; reads the system DPI.
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() };
+    wheel_units(dpi)
+}
+
+fn wheel_units(dpi: u32) -> f32 {
+    3.0 * 96.0 / dpi.max(48) as f32
+}
 
 /// Windows needs no grant to send input to the user's own (non-elevated) windows.
 pub fn has_accessibility() -> bool {
@@ -296,7 +305,7 @@ impl Injector {
                         super::secure::move_abs(gx, gy);
                     }
                 }
-                Ev::Gamepad { .. } => {}
+                Ev::Gamepad { .. } | Ev::Text { .. } => {}
                 other => {
                     super::secure::send_input(&other);
                 }
@@ -313,8 +322,8 @@ impl Injector {
             }
             // Relative: what games and 3D apps reading raw input want.
             Ev::MouseMoveBy { dx, dy } => send(&[mouse(dx.round() as i32, dy.round() as i32, 0, MOUSEEVENTF_MOVE)]),
-            // Routed to crate::gamepad by the server, never here.
-            Ev::Gamepad { .. } => {}
+            // Routed to crate::gamepad by the server, never here; text goes to type_text.
+            Ev::Gamepad { .. } | Ev::Text { .. } => {}
             Ev::Pen { near, pressure, tilt_x, tilt_y, twist } => {
                 let was_near = self.pen.is_some();
                 if near {
@@ -355,8 +364,9 @@ impl Injector {
             }
             Ev::Scroll { dx, dy } => {
                 // DOM: +dy scrolls down, +dx right. Windows: +wheel scrolls up, +hwheel right.
-                self.wheel.0 -= dy * UNITS_PER_PIXEL;
-                self.wheel.1 += dx * UNITS_PER_PIXEL;
+                let k = units_per_pixel();
+                self.wheel.0 -= dy * k;
+                self.wheel.1 += dx * k;
                 let (v, h) = (self.wheel.0.trunc(), self.wheel.1.trunc());
                 self.wheel.0 -= v;
                 self.wheel.1 -= h;
@@ -679,6 +689,13 @@ mod tests {
         assert_eq!(flags(keyboard(V, true)), (0, 0x2F, KEYEVENTF_SCANCODE));
         // Keypad Enter shares Enter's scan code but isn't a modifier.
         assert_eq!(modifier_vk(0x1C, true), None);
+    }
+
+    #[test]
+    fn a_wheel_notch_scrolls_as_far_at_any_scaling() {
+        // 40 desktop px at 100%, 60 at 150%: one notch either way.
+        assert_eq!(40.0 * wheel_units(96), 120.0);
+        assert_eq!(60.0 * wheel_units(144), 120.0);
     }
 
     #[test]

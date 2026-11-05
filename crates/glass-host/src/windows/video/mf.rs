@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use windows::Win32::Foundation::{VARIANT_BOOL, VARIANT_TRUE};
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
+    CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
     CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
     IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFShutdown, IMFTransform,
     METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT,
@@ -157,6 +157,12 @@ fn set(codec: &ICodecAPI, api: &GUID, value: VARIANT, what: &str) -> bool {
     }
 }
 
+/// The rate controller's buffer (VBV): about two frames at the target (rate::short_window),
+/// so one frame can't take a second's worth of bits on a slow link.
+fn buffer_bits(bps: u32, fps: u32) -> u32 {
+    (crate::rate::short_window(bps, fps).0 * 8.0) as u32
+}
+
 fn pack(hi: u32, lo: u32) -> u64 {
     (hi as u64) << 32 | lo as u64
 }
@@ -242,6 +248,7 @@ impl MfEncoder {
                 set(codec, &CODECAPI_AVLowLatencyMode, variant_bool(true), "low latency");
                 set(codec, &CODECAPI_AVEncCommonRateControlMode, variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32), "CBR");
                 set(codec, &CODECAPI_AVEncCommonMeanBitRate, variant_u32(bitrate), "bitrate");
+                set(codec, &CODECAPI_AVEncCommonBufferSize, variant_u32(buffer_bits(bitrate, fps)), "buffer size");
                 set(codec, &CODECAPI_AVEncMPVGOPSize, variant_u32(MAX_GOP_FRAMES), "GOP size");
                 set(codec, &CODECAPI_AVEncMPVDefaultBPictureCount, variant_u32(0), "no B-frames");
             }
@@ -333,6 +340,7 @@ impl MfEncoder {
     pub fn set_bitrate(&mut self, bps: u32) {
         if let Some(codec) = &self.codec {
             set(codec, &CODECAPI_AVEncCommonMeanBitRate, variant_u32(bps), "bitrate");
+            set(codec, &CODECAPI_AVEncCommonBufferSize, variant_u32(buffer_bits(bps, self.fps)), "buffer size");
         }
     }
 

@@ -698,6 +698,15 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 
+/// Where peer connections listen: any port, except that a test host can be pinned to one
+/// (`GLASS_TEST_RTC_PORT`, IPv4) so bench/ can shape exactly that traffic.
+fn udp_addrs() -> Vec<String> {
+    match std::env::var("GLASS_TEST_RTC_PORT").ok().filter(|_| crate::testmode::enabled()) {
+        Some(port) => vec![format!("0.0.0.0:{port}")],
+        None => vec!["0.0.0.0:0".to_string(), "[::]:0".to_string()],
+    }
+}
+
 /// Answers a browser's offer; returns the answer SDP and its signature. The bridge runs
 /// until the peer goes away.
 async fn answer(
@@ -756,7 +765,7 @@ async fn answer(
         .with_interceptor_registry(registry)
         .with_handler(handler)
         .with_runtime(runtime)
-        .with_udp_addrs(vec!["0.0.0.0:0".to_string(), "[::]:0".to_string()])
+        .with_udp_addrs(udp_addrs())
         .build()
         .await?;
     let pc: Arc<dyn PeerConnection> = Arc::new(pc);
@@ -839,6 +848,7 @@ async fn bridge(
     let endpoint = wtransport::Endpoint::client(config)?;
     let (bridge_id, viewer, _registration) = register_bridge();
     let rtp_video = video.is_some();
+    let watching = viewer.watching.clone();
     let url = format!(
         "https://{}:{wt_port}/rtc?peer={peer}&b={bridge_id}{}&k={}",
         crate::listen::host(dial),
@@ -862,6 +872,12 @@ async fn bridge(
     }
 
     let mut datagram_channel: Option<Arc<dyn DataChannel>> = None;
+    // Frame acknowledgements from the browser, on their way to the host: the bridge reads
+    // them too, so its own flow control knows what's on screen. Once they come, the host
+    // sets this viewer's bitrate from them (end to end, through this bridge), and the link
+    // meter steps aside.
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<(u8, u32)>();
+    let mut acking = false;
     let mut bridge_drops = 0u64;
     // Video over the data channel: measure the link and cap the bitrate to it (RTP video
     // has its own congestion control).
@@ -874,6 +890,13 @@ async fn bridge(
     let mut last_keyframe_ask = std::time::Instant::now();
     let mut last_congestion_report = std::time::Instant::now();
     let mut last_drop_report = std::time::Instant::now();
+    // Flow control (crate::flow): while frames sent haven't left the data channel's buffer
+    // (it counts them until the browser acknowledges them), capture is held, so frames
+    // aren't made only to be dropped here. The gate stays as a safety net.
+    let mut link = crate::flow::Link::default();
+    let mut flow = crate::flow::Viewer::new();
+    let mut flow_poll = tokio::time::interval(crate::flow::POLL);
+    flow_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             channel = channels.recv() => {
@@ -883,10 +906,16 @@ async fn bridge(
                     "d" => {
                         datagram_channel = Some(channel.clone());
                         let conn = conn.clone();
+                        let ack_tx = ack_tx.clone();
                         tokio::spawn(async move {
                             while let Some(event) = channel.poll().await {
                                 match event {
-                                    DataChannelEvent::OnMessage(m) => { let _ = conn.send_datagram(&m.data[..]); }
+                                    DataChannelEvent::OnMessage(m) => {
+                                        if let Some(ack) = glass_proto::read_frame_ack(&m.data[..]) {
+                                            let _ = ack_tx.send(ack);
+                                        }
+                                        let _ = conn.send_datagram(&m.data[..]);
+                                    }
                                     DataChannelEvent::OnClose => break,
                                     _ => {}
                                 }
@@ -912,10 +941,16 @@ async fn bridge(
                     let payload = datagram.payload();
                     inflight.sample(outstanding);
                     let queued = inflight.queued(outstanding);
+                    let now = std::time::Instant::now();
+                    link.drained(outstanding, now);
                     match gate.admit(&payload, queued, video_backlog(crate::server::applied_bitrate())) {
                         Admit::Send => {
                             if dc.try_send(BytesMut::from(&payload[..])).await.is_ok() {
                                 meter.sent(payload.len());
+                                match glass_proto::VideoHeader::read(&payload) {
+                                    Some(h) => link.sent(h.stream, h.frame_id, payload.len(), now),
+                                    None => link.other(payload.len()),
+                                }
                             }
                         }
                         Admit::Drop => {
@@ -923,7 +958,12 @@ async fn bridge(
                             meter_drops += 1;
                         }
                     }
-                    // Tell the bitrate controller: the browser can't see these drops.
+                    flow.update(&mut link, now);
+                    // Tell the bitrate controller: the browser can't see these drops. (With
+                    // acknowledgements, the host sees them as frames that never arrive.)
+                    if acking {
+                        gate.dropped_frames = 0;
+                    }
                     if gate.dropped_frames > 0 && last_congestion_report.elapsed() >= Duration::from_secs(1) {
                         crate::server::bridge_congestion(std::mem::take(&mut gate.dropped_frames));
                         last_congestion_report = std::time::Instant::now();
@@ -964,7 +1004,28 @@ async fn bridge(
                     pipe_stream_to_channel(recv, channel).await;
                 });
             }
-            _ = meter_tick.tick(), if !rtp_video => {
+            Some((stream, id)) = ack_rx.recv() => {
+                if !acking {
+                    acking = true;
+                    crate::server::set_remote_cap(bridge_id, None);
+                    debug!("remote peer ({peer}): frames acknowledged; the host paces video by them");
+                }
+                let now = std::time::Instant::now();
+                link.acked(stream, id, now);
+                flow.update(&mut link, now);
+            }
+            _ = flow_poll.tick(), if link.busy() => {
+                if let Some(dc) = &datagram_channel {
+                    let now = std::time::Instant::now();
+                    link.drained(dc.outstanding_bytes().await.unwrap_or(0), now);
+                    // Paused: what's in flight says nothing about the link.
+                    if !*watching.borrow() {
+                        link.forget();
+                    }
+                    flow.update(&mut link, now);
+                }
+            }
+            _ = meter_tick.tick(), if !rtp_video && !acking => {
                 if let Some(dc) = &datagram_channel {
                     let outstanding = dc.outstanding_bytes().await.unwrap_or(0);
                     let budget = video_backlog(crate::server::applied_bitrate());
@@ -1040,6 +1101,10 @@ impl FrameGate {
                 Admit::Drop
             };
         };
+        // A lost fragment sent again: it isn't a new frame, and it's what ends a stall.
+        if h.flags & glass_proto::FLAG_RETRANSMIT != 0 {
+            return if outstanding < DATAGRAM_BACKLOG * 2 { Admit::Send } else { Admit::Drop };
+        }
         let s = (h.stream as usize).min(glass_proto::MAX_STREAMS - 1);
         if let Some((id, send)) = self.current[s]
             && id == h.frame_id

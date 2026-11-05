@@ -21,7 +21,8 @@ latest screenshot of that display.\n\
 - On a Mac or a Windows PC, `snapshot` reads an app's window as text, with a ref on each element you can act on; \
 `press` and `set_value` act on a ref without moving the pointer. Prefer them for ordinary app \
 windows, and screenshot and click for what a snapshot doesn't show (canvases, games, video).\n\
-- After acting, check the result: pass `screenshot_after: true`, or call `wait_for_change` then `screenshot`.\n\
+- After acting, check the result: pass `screenshot_after: true`, or call `wait_for_change` then `screenshot`. \
+To wait for an action's effect, pass `wait_for_change` the `seq` from the screenshot before it as `since`, with `change: true`.\n\
 - Prefer keyboard shortcuts (`press_keys`) when they're reliable.\n\
 - Before anything hard to undo (sending, buying, deleting, posting, changing settings or \
 accounts), call `confirm` and only go ahead if approved.\n\
@@ -199,7 +200,7 @@ pub(crate) fn tools() -> Value {
           "inputSchema": schema(json!({}), &[]) },
         { "name": "list_displays", "description": "The computer's displays: ids, sizes in pixels, which is main, and how they're arranged.",
           "inputSchema": schema(json!({}), &[]) },
-        { "name": "screenshot", "description": "A picture of a display (1280×800 at most unless asked). Click, move, drag and scroll coordinates are in the pixels of the latest screenshot of that display.",
+        { "name": "screenshot", "description": "A picture of a display (1280×800 at most unless asked). Click, move, drag and scroll coordinates are in the pixels of the latest screenshot of that display. Comes with a seq: pass it to wait_for_change as `since` to count only changes after this picture.",
           "inputSchema": schema(json!({ "display": display, "max_width": { "type": "integer" }, "max_height": { "type": "integer" } }), &[]) },
         { "name": "click", "description": "Clicks at a point.",
           "inputSchema": schema(json!({ "x": x, "y": x, "display": display,
@@ -224,8 +225,18 @@ pub(crate) fn tools() -> Value {
           "inputSchema": schema(json!({ "ref": { "type": "string", "description": "From snapshot, e.g. @k3f9:e12." }, "screenshot_after": after }), &["ref"]) },
         { "name": "set_value", "description": "Replaces the text in a field from a snapshot, without typing, and says what the field shows after. Some web pages don't notice text set this way: if the page doesn't react, click the field and use type_text.",
           "inputSchema": schema(json!({ "ref": { "type": "string", "description": "From snapshot, e.g. @k3f9:e12." }, "text": { "type": "string" }, "screenshot_after": after }), &["ref", "text"]) },
-        { "name": "wait_for_change", "description": "Waits until the display changes and settles (a page loads, a dialog opens), or the timeout passes.",
-          "inputSchema": schema(json!({ "display": display, "timeout_ms": { "type": "integer", "description": "Default 10000, at most 60000." } }), &[]) },
+        { "name": "wait_for_change", "description": "Waits for the screen, from what the computer says changed (even a caret or a spinner counts). By default, until nothing has changed for idle_ms (it has settled). With change: true, until something changes after `since` (or after the call), then for idle_ms of quiet if given. Says whether anything changed, and a seq to pass as `since` next time.",
+          "inputSchema": schema(json!({ "display": display,
+            "change": { "type": "boolean", "description": "Wait for a change first (a page starting to load, a dialog opening)." },
+            "idle_ms": { "type": "integer", "minimum": 0, "description": "Quiet this long counts as settled. Default 300, or 0 with change: true." },
+            "since": { "type": "integer", "description": "A seq from a screenshot or an earlier wait: changes after it count, even ones before this call." },
+            "region": { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4,
+              "description": "Only changes in [x, y, width, height] count, in pixels of the latest screenshot of this display." },
+            "timeout_ms": { "type": "integer", "description": "Default 10000, at most 60000." } }), &[]) },
+        { "name": "record", "description": "Records the screen as an MP4 (what's streamed: the main display unless a viewer chose another, with the pointer). Either for `seconds` (5 by default, at most 60; the call returns when it's done), or `start: true` to start one and get its id, then `stop: <id>` to end it and get it (a started recording ends by itself after 10 minutes). Use it to show the person what happened, or to look at something that moves. The video comes back as an embedded video/mp4 resource when it's 20 MB or less, with its path on that computer either way.",
+          "inputSchema": schema(json!({ "seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 60 },
+            "start": { "type": "boolean", "description": "Start a recording and return its id at once." },
+            "stop": { "type": "integer", "description": "Stop the recording with this id (from start) and return it." } }), &[]) },
         { "name": "request_help", "description": "Asks the person to do something you can't (sign in, a 2FA code, a CAPTCHA, a decision) and waits until they say it's done. Their note comes back. If they haven't answered within wait_seconds, it says the question is pending: collect the answer later with check_answer.",
           "inputSchema": schema(json!({ "message": { "type": "string", "description": "What you need them to do, in one or two sentences." }, "wait_seconds": wait }), &["message"]) },
         { "name": "confirm", "description": "Asks the person to approve an action before you take it (sending, buying, deleting, posting…). Waits for yes or no. If they haven't answered within wait_seconds, it says the question is pending: don't take the action; collect the answer later with check_answer.",
@@ -255,10 +266,16 @@ pub(crate) fn text(s: impl Into<String>) -> Value {
 pub(crate) fn image_content(shot: &Value) -> Vec<Value> {
     vec![
         json!({ "type": "image", "data": shot["png"], "mimeType": "image/png" }),
-        text(format!(
-            "Display {}: screenshot {}×{} pixels (coordinates for actions are in these pixels).",
-            shot["display"], shot["width"], shot["height"]
-        )),
+        text(match shot["seq"].as_u64() {
+            Some(seq) => format!(
+                "Display {}: screenshot {}×{} pixels (coordinates for actions are in these pixels), seq {seq}.",
+                shot["display"], shot["width"], shot["height"]
+            ),
+            None => format!(
+                "Display {}: screenshot {}×{} pixels (coordinates for actions are in these pixels).",
+                shot["display"], shot["width"], shot["height"]
+            ),
+        }),
     ]
 }
 
@@ -280,6 +297,8 @@ pub(crate) enum Show {
     Confirm,
     /// A pending question's answer: help or confirm, as it was asked.
     Answer,
+    /// A recording: started, or done.
+    Clip,
 }
 
 fn wait_ms(args: &Value) -> Value {
@@ -307,10 +326,14 @@ pub(crate) fn plan(name: &str, args: &Value) -> Result<Step, String> {
             "all_windows": args["all_windows"].as_bool().unwrap_or(false), "max_lines": args.get("max_lines") }), Show::Said),
         "press" => (json!({ "action": "press", "ref": args["ref"] }), Show::Said),
         "set_value" => (json!({ "action": "set_value", "ref": args["ref"], "text": args["text"] }), Show::Said),
-        "wait_for_change" => (json!({ "action": "wait_for_change", "display": display, "timeout_ms": args.get("timeout_ms") }), Show::Wait),
+        "wait_for_change" => (json!({ "action": "wait_for_change", "display": display, "timeout_ms": args.get("timeout_ms"),
+            "idle_ms": args.get("idle_ms"), "change": args["change"].as_bool().unwrap_or(false),
+            "region": args.get("region"), "since": args.get("since") }), Show::Wait),
         "request_help" => (json!({ "action": "request_help", "text": args["message"], "wait_ms": wait_ms(args) }), Show::Help),
         "confirm" => (json!({ "action": "confirm", "text": args["action"], "wait_ms": wait_ms(args) }), Show::Confirm),
         "check_answer" => (json!({ "action": "check_answer", "id": args["id"], "wait_ms": wait_ms(args) }), Show::Answer),
+        "record" => (json!({ "action": "record", "seconds": args.get("seconds"),
+            "start": args["start"].as_bool().unwrap_or(false), "stop": args.get("stop") }), Show::Clip),
         other => return Err(format!("unknown tool {other}")),
     };
     let after = after && (matches!(show, Show::Done) || matches!(name, "press" | "set_value"));
@@ -319,7 +342,7 @@ pub(crate) fn plan(name: &str, args: &Value) -> Result<Step, String> {
 
 /// Tools that only look (no input); the rest need `computer:use`.
 pub(crate) fn looks_only(name: &str) -> bool {
-    matches!(name, "list_displays" | "screenshot" | "wait_for_change" | "snapshot")
+    matches!(name, "list_displays" | "screenshot" | "wait_for_change" | "snapshot" | "record")
 }
 
 /// An action's result as MCP content.
@@ -341,11 +364,7 @@ pub(crate) fn show(how: Show, v: &Value) -> Vec<Value> {
         Show::Done => vec![text("Done.")],
         Show::Said => vec![text(v["text"].as_str().unwrap_or("Done."))],
         Show::Shot => image_content(v),
-        Show::Wait => vec![text(if v["changed"].as_bool().unwrap_or(false) {
-            format!("The screen changed and settled after {} ms.", v["waited_ms"])
-        } else {
-            format!("No change in {} ms.", v["waited_ms"])
-        })],
+        Show::Wait => vec![text(wait_text(v))],
         Show::Help => {
             let note = v["note"].as_str().filter(|n| !n.is_empty());
             vec![text(match (v["done"].as_bool().unwrap_or(false), note) {
@@ -363,8 +382,84 @@ pub(crate) fn show(how: Show, v: &Value) -> Vec<Value> {
                 format!("Not approved: don't do it.{note}")
             })]
         }
+        Show::Clip => clip_content(v),
         Show::Answer => unreachable!(),
     }
+}
+
+/// A path on the host as a file URI (Windows paths get a leading slash and forward ones).
+fn file_uri(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    let mut uri = String::from("file://");
+    for b in path.bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~:".contains(&b) {
+            uri.push(b as char);
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    uri
+}
+
+/// A recording as MCP content: started (its id), or done (where it is, and the video as an
+/// embedded resource when it came inline, since the agent may not be on that computer).
+fn clip_content(v: &Value) -> Vec<Value> {
+    if v["recording"] == true {
+        return vec![text(format!(
+            "Recording (id {0}). Call record with stop: {0} to end it and get the video; it ends by itself after {1} seconds.",
+            v["id"], v["max_seconds"]
+        ))];
+    }
+    let secs = v["duration_ms"].as_f64().unwrap_or(0.0) / 1000.0;
+    let display = v["display"].as_u64().map(|d| format!(" of display {d}")).unwrap_or_default();
+    let mb = v["bytes"].as_f64().unwrap_or(0.0) / 1_048_576.0;
+    let parts = v["parts"].as_array().map_or(0, Vec::len);
+    let mut said = format!("Recorded {secs:.1} s{display} ({mb:.1} MB), saved on that computer at {}", v["path"].as_str().unwrap_or("?"));
+    if parts > 1 {
+        said.push_str(&format!(" and {} more parts (the picture size changed)", parts - 1));
+    }
+    let mut out = vec![];
+    match v["mp4"].as_str() {
+        Some(data) => {
+            said.push('.');
+            out.push(text(said));
+            let path = v["path"].as_str().unwrap_or("recording.mp4");
+            out.push(json!({ "type": "resource", "resource": {
+                "uri": file_uri(path), "mimeType": "video/mp4", "blob": data } }));
+        }
+        None => {
+            said.push_str("; too big to send here.");
+            out.push(text(said));
+        }
+    }
+    out
+}
+
+/// A wait's result in words.
+fn wait_text(v: &Value) -> String {
+    let ms = &v["waited_ms"];
+    let changed = v["changed"].as_bool().unwrap_or(false);
+    let said = match (changed, v["timed_out"].as_bool()) {
+        (true, Some(false)) => format!("The screen changed; done waiting after {ms} ms."),
+        (false, Some(false)) => format!("Nothing changed; the screen was still after {ms} ms."),
+        (true, Some(true)) => format!("The screen changed, but was still changing after {ms} ms."),
+        (false, Some(true)) => format!("No change in {ms} ms."),
+        // A host from before seqs: changed meant changed and settled.
+        (true, None) => format!("The screen changed and settled after {ms} ms."),
+        (false, None) => format!("No change in {ms} ms."),
+    };
+    match v["seq"].as_u64() {
+        Some(seq) => format!("{said} seq {seq}."),
+        None => said,
+    }
+}
+
+/// The wait before `screenshot_after`'s picture: for the action (whose result has the seq
+/// from before it) to show, then settle.
+pub(crate) fn wait_after(display: &Value, done: &Value) -> Value {
+    json!({ "action": "wait_for_change", "display": display, "change": true, "idle_ms": 500,
+        "since": done.get("seq"), "timeout_ms": 1500 })
 }
 
 pub(crate) fn displays_content(displays: &Value) -> Vec<Value> {
@@ -392,7 +487,7 @@ fn call_tool(targets: &Targets, name: &str, args: &Value) -> Result<Vec<Value>, 
             let v = host.act(action)?;
             let mut out = show(how, &v);
             if after {
-                let _ = host.act(json!({ "action": "wait_for_change", "display": display, "timeout_ms": 1500 }));
+                let _ = host.act(wait_after(&display, &v));
                 let shot = host.act(json!({ "action": "screenshot", "display": display }))?;
                 out.extend(image_content(&shot));
             }
@@ -468,6 +563,40 @@ pub fn run(url: Option<String>, machine: Option<String>, token_file: Option<Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waits_take_the_new_options_and_say_the_seq() {
+        let Step::Act { action, .. } = plan("wait_for_change", &json!({ "change": true, "since": 7, "region": [1, 2, 3, 4], "idle_ms": 50 })).unwrap() else {
+            panic!()
+        };
+        let a: crate::computer::Action = serde_json::from_value(action).unwrap();
+        assert!(matches!(a, crate::computer::Action::WaitForChange { change: true, since: Some(7), region: Some([1.0, 2.0, 3.0, 4.0]), idle_ms: Some(50), .. }));
+        // An older host's answer still reads.
+        assert_eq!(wait_text(&json!({ "changed": true, "waited_ms": 10 })), "The screen changed and settled after 10 ms.");
+        assert_eq!(wait_text(&json!({ "changed": false, "timed_out": false, "waited_ms": 300, "seq": 9 })), "Nothing changed; the screen was still after 300 ms. seq 9.");
+        let w = wait_after(&json!(1), &json!({ "ok": true, "seq": 5 }));
+        assert_eq!((w["since"].clone(), w["change"].clone()), (json!(5), json!(true)));
+        assert!(serde_json::from_value::<crate::computer::Action>(w).is_ok());
+    }
+
+    #[test]
+    fn recordings_come_back_as_resources() {
+        let Step::Act { action, .. } = plan("record", &json!({ "stop": 12 })).unwrap() else { panic!() };
+        let a: crate::computer::Action = serde_json::from_value(action).unwrap();
+        assert!(matches!(a, crate::computer::Action::Record { stop: Some(12), start: false, seconds: None }));
+        assert!(looks_only("record"));
+        let started = show(Show::Clip, &json!({ "id": 3, "recording": true, "max_seconds": 600 }));
+        assert!(started[0]["text"].as_str().unwrap().contains("stop: 3"));
+        let done = show(Show::Clip, &json!({ "id": 3, "display": 1, "duration_ms": 2500, "bytes": 1000, "path": "/tmp/a b.mp4", "parts": ["/tmp/a b.mp4"], "mp4": "AAAA" }));
+        assert_eq!(done[1]["resource"]["mimeType"], "video/mp4");
+        assert_eq!(done[1]["resource"]["blob"], "AAAA");
+        assert_eq!(done[1]["resource"]["uri"], "file:///tmp/a%20b.mp4");
+        let windows = show(Show::Clip, &json!({ "duration_ms": 1, "path": "C:\\r\\a.mp4", "parts": [1], "mp4": "AA" }));
+        assert_eq!(windows[1]["resource"]["uri"], "file:///C:/r/a.mp4");
+        let big = show(Show::Clip, &json!({ "duration_ms": 1, "path": "/x.mp4", "parts": [1, 2] }));
+        assert_eq!(big.len(), 1);
+        assert!(big[0]["text"].as_str().unwrap().contains("1 more parts"));
+    }
 
     #[test]
     fn every_tool_has_a_schema() {
