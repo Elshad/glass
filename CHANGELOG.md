@@ -4,6 +4,8 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 
 ## Unreleased
 
+- The picture no longer freezes while you're using a page the browser wrongly reports as hidden (Edge on Windows did this under an always-on-top overlay, for minutes at a time). Input now counts as the page being on screen: video keeps going, and resumes if it had paused. A tab that's really in the background still pauses as before.
+
 ## 0.14.0
 
 November 4, 2026
