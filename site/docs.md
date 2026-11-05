@@ -4,7 +4,7 @@
 
 - Website: https://glassdesk.dev
 - Install (on the computer to be controlled): `curl -fsSL glassdesk.dev | sh`
-- Hosts: macOS 13+ (Apple Silicon and Intel), and Linux x86_64 on Wayland with glibc 2.39+ (beta; built for Hyprland/Omarchy, should work on GNOME and KDE; e.g. Arch, Fedora 40+, Ubuntu 24.04+).
+- Hosts: macOS 13+ (Apple Silicon and Intel), and Linux (x86_64 or ARM64) on Wayland with glibc 2.39+ (beta; built for Hyprland/Omarchy, should work on GNOME and KDE; e.g. Arch, Fedora 40+, Ubuntu 24.04+).
 - Viewers: any modern browser with WebTransport and WebCodecs: Safari 26.4+ (iPad, iPhone, Mac), Chrome, Chromium, Edge and Firefox, on any OS including Linux.
 - Price: free and open source (MIT): https://github.com/Ntarasiuk/glass
 
@@ -20,7 +20,7 @@ Features:
 - **Full control.** Mouse, trackpad, keyboard, and touch (tap to click, drag, long-press to right-click, two-finger scroll), plus an on-screen keyboard button.
 - **Fleet (new).** See every computer on your account in one list (model, system, disk, FileVault, firewall, battery), restart or update them from the page with a passkey confirmation, and mark the ones that break your rules. Off until you turn it on, computer by computer: [Glass Fleet](#glass-fleet-new).
 - **Trackpad mode on phones.** The screen works like a laptop trackpad: drag to move the pointer, tap to click, two-finger tap to right-click; zoomed in, the view follows the pointer. The toolbar folds into menus on small screens.
-- **Unlocks a locked Mac.** Type the password at the lock screen from the remote device.
+- **Unlocks a locked Mac.** Type the password at the lock screen from the remote device, even on a MacBook with its lid closed (`glass config lid-awake on`, while it's plugged in).
 - **Apple Pencil.** Pressure and tilt reach the Mac as tablet input, so drawing apps (Photoshop, Affinity, Krita) respond as they do to a drawing tablet.
 - **Multiple displays.** Show one display, switch between them, or show all of them side by side in their macOS arrangement.
 - **A second display.** Your iPad, a laptop or any browser becomes one more display that extends the Mac's desktop (Displays › Use as a second display), Retina where the screen is.
@@ -42,11 +42,11 @@ Features:
 - **One window.** Stream a single app's window instead of the whole display (macOS).
 - **Terminal and ports.** A shell on the computer inside the viewer, and its local web servers (`/fwd/3000/`) opened from your tailnet.
 - **Recording.** Record sessions to MP4 on the computer, per session or always.
-- **Microphone and controllers.** Your microphone reaches the computer, so its apps hear you (on a Mac through Glass Microphone, a small audio driver Glass installs with one password prompt). Game controllers reach Linux hosts.
+- **Microphone and controllers.** Your microphone reaches the computer, so its apps hear you (on a Mac through Glass Microphone, a small audio driver Glass installs with one password prompt). Game controllers reach Linux hosts, and Windows hosts with the free ViGEmBus driver.
 - **Keyboards per machine.** ⌘↔Ctrl, PC-keyboard and ⌘/⌥ swaps are remembered for each computer; an optional shortcut bar puts Mac shortcuts one tap away.
 - **Power.** Wake a sleeping machine (Wake-on-LAN), restart Glass or the whole computer and reconnect.
-- **AI agents, supervised.** `glass mcp` lets Claude Code, Claude Desktop, Cursor or any MCP client use the computer (and your other computers running Glass) while you watch each step, pause or stop it, and approve anything risky, from the viewer, the Mac app or a notification.
-- **The Glass app (macOS).** A native window for everything the command line does: setup, who's connected, links with QR codes, machines, history, AI agents, settings and teams. In Applications, Spotlight and the menu bar (**Open Glass…**).
+- **AI agents, supervised.** `glass mcp` lets Claude Code, Claude Desktop, Cursor or any MCP client use the computer (and your other computers running Glass) while you watch each step, pause or stop it, and approve anything risky, from the viewer, the Mac app or a notification. On a Mac it can also read an app's window as text (`snapshot`) and press buttons or fill in fields by reference (`press`, `set_value`), without moving your pointer.
+- **The Glass app (macOS and Windows).** A native window for everything the command line does: setup, who's connected, links with QR codes, machines, history, AI agents, settings and teams. On a Mac in Applications, Spotlight and the menu bar (**Open Glass…**); on Windows in the Start menu and the tray icon.
 - **A console.** `https://<computer>/admin/`: who's connected, requests to allow, links with QR codes, devices, history, settings, access rules and an address book of your machines.
 - **For teams.** Single sign-on (any OpenID Connect provider), LDAP, SCIM provisioning, access rules per email, domain or group, and device posture checks.
 - **Self-hostable relay.** Run the remote-access introducer and TURN relay yourself.
@@ -68,9 +68,9 @@ The installer:
 
 Running the same command again updates Glass in place (it says which version it updated from), restarts the background service, and skips the setup guide if Glass is already set up. Settings and macOS permissions carry over.
 
-## The Glass app (macOS)
+## The Glass app (macOS and Windows)
 
-Open **Glass** from Applications or Spotlight, or choose **Open Glass…** from the menu bar icon. It does everything the `glass` command does, in a window:
+Open **Glass** from Applications or Spotlight, or choose **Open Glass…** from the menu bar icon. On Windows, open **Glass** from the Start menu or the tray icon. It does everything the `glass` command does, in a window:
 
 - **Home:** whether Glass is ready, the address to open with a QR code to scan, anything that needs fixing (a permission, Tailscale), and the switches used most.
 - **Connected:** who's viewing (end any session), connection requests to allow or deny, the chat with viewers (both sides, and reply), the privacy screen.
@@ -112,9 +112,15 @@ To make another computer the default instead of this one: `glass mcp --machine m
 
 Then ask, for example: "on my Mac, export the frames from the open Figma file to the Desktop". Any MCP client works the same way (command `glass`, argument `mcp`).
 
-Tools: `list_machines`, `screenshot`, `list_displays`, `click` (left, right, middle; double and triple), `move_pointer`, `drag`, `scroll`, `type_text` (any text), `press_keys` (`cmd+s`, `return`, `ctrl+c`…), `wait_for_change`, `request_help`, `confirm` and `check_answer`. `confirm` and `request_help` take an optional `wait_seconds`: when you haven't answered by then, they say the question is pending (it stays up for you), and `check_answer` collects your answer later. Coordinates are in the pixels of the latest screenshot (1280×800 at most unless the agent asks for more), so they work with computer-use models as is.
+Tools: `list_machines`, `screenshot`, `list_displays`, `click` (left, right, middle; double and triple), `move_pointer`, `drag`, `scroll`, `type_text` (any text), `press_keys` (`cmd+s`, `return`, `ctrl+c`…), `wait_for_change`, `snapshot`, `press`, `set_value`, `request_help`, `confirm` and `check_answer`. `confirm` and `request_help` take an optional `wait_seconds`: when you haven't answered by then, they say the question is pending (it stays up for you), and `check_answer` collects your answer later. Coordinates are in the pixels of the latest screenshot (1280×800 at most unless the agent asks for more), so they work with computer-use models as is.
 
-Only the computer's owner can drive it: your own tailnet devices, or this computer's token (which `glass mcp` reads by itself on this computer). Guests and links can't. Under the hood it's an HTTP API at `https://<computer>/agent/v1/` (`POST /agent/v1/act` with `{"action": "click", "x": 640, "y": 400}` and so on), if you'd rather call it directly.
+`wait_for_change` follows what the computer's capture says changed (ScreenCaptureKit, Desktop Duplication or PipeWire), so even a blinking caret or a spinner counts. By default it returns once the screen has been still for `idle_ms` (300 ms); with `change: true` it waits for a change first. Screenshots come with a `seq`: passed as `since`, only changes after that picture count, even ones that happened before the wait began. `region` (`[x, y, width, height]` in screenshot pixels) limits it to part of the screen.
+
+`record` makes an MP4 of the screen from the video Glass already sends viewers (nothing is re-encoded): for a few seconds (60 at most), or started and stopped by id (10 minutes at most). The agent gets the video back when it's 20 MB or less, and the file stays on the computer for a day, in Glass's config folder under `agent-recordings`. You see it in the viewer when an agent starts and stops recording. An agent you connected with a grant has its recording deleted if a protected app (passwords, keychains, or an app outside its limit) comes to the front.
+
+On a Mac, `snapshot` reads an app's window (and its menu bar) through Accessibility as text: each element's role, name and value, with a ref like `@k3f9:e12` on each one it can act on. `press` (buttons, links, checkboxes, tabs, menu items, rows) and `set_value` (text fields) act on a ref without moving your pointer, even in a window behind others. A ref is good only for the snapshot it came from: if the window changed, nothing happens and the agent is told to take a new snapshot. Password fields never show their contents, and an agent under a grant can't fill one in. Chrome and Electron apps (Slack, VS Code…) show a page's content only while their window is visible, so the agent brings the window to the front first; an app that has just launched may need a moment before it answers. Canvases, games and video don't appear in a snapshot: the agent uses screenshots for those.
+
+Only the computer's owner can drive it: your own tailnet devices, or this computer's token (which `glass mcp` reads by itself on this computer). Guests and links can't. Under the hood it's an HTTP API at `https://<computer>/agent/v1/` (`POST /agent/v1/act` with `{"action": "click", "x": 640, "y": 400}` and so on, sent as `Content-Type: application/json`), if you'd rather call it directly.
 
 ## Agents from anywhere
 
@@ -134,7 +140,7 @@ On your tailnet no publishing is needed: use `https://<computer>/mcp`. Publishin
 - `computer:view` (screenshots) and `computer:use` (pointer and keyboard). A view-only agent that asks to click gets told to ask you for more.
 - It never drives password managers (Passwords, 1Password, Bitwarden…), Keychain Access, System Settings, the system's password prompts, terminals, Screen Sharing or Glass itself, and never types into a password field. It's told to ask you instead. Glass checks the app that would actually get the input (what's under the pointer, or what has the keyboard, Spotlight and Control Center included), not just the app in front.
 - An agent can limit itself to some apps (`authorization_details` of type `glass_computer` with `apps`); input anywhere else (other apps, Spotlight, the Dock) is refused.
-- It doesn't see protected apps: screenshots are refused while one (or, for an agent limited to some apps, any other app) is in front.
+- It doesn't see protected apps: screenshots are refused while one (or, for an agent limited to some apps, any other app) is in front, and so are snapshots of them.
 - When you use the computer, at its own keyboard and mouse or by clicking, typing or scrolling in a viewer, agents wait until you've stopped for a few seconds (an agent from another device is told to try again after 20 seconds).
 - 1,500 actions an hour per agent; an agent over it is held until the hour ends (you get a notification), or until you resume agents.
 - On Linux, Glass can't tell which app input reaches, so it can't keep an agent out of particular apps or password fields (the sign-in page says so), and agents can't limit themselves to apps there.
@@ -357,15 +363,24 @@ More in the toolbar:
   - **Picture in picture:** the screen in a floating window while you do something else.
   - **Use all my screens:** with several monitors here and several displays there, one display on each (Chrome and Edge).
   - **Capture mouse:** for games and 3D apps, the pointer stays in the picture and sends relative motion; Esc releases it.
-  - **Sync clipboard:** switching back to Glass puts this device's clipboard on the computer (Chrome and Edge).
+  - **Sync clipboard:** switching back to Glass puts this device's clipboard on the computer. Chrome and Edge do it by themselves; Safari and Firefox show a Send button, then their own Paste button to confirm.
   - **Pause while away:** stops the video while this computer is locked or idle (Chrome and Edge).
   - **Install Glass:** its own window and icon. On a desktop, the toolbar moves into the title bar.
 
 **As an installed app** (Home Screen, or **Install Glass**): long-press the icon for Chat, Machines, Send files and each of your other machines; share photos, files or text to Glass from other apps (Android, ChromeOS, desktop) to send them to the computer; open files with Glass on the desktop; `web+glass://<machine>` links open that machine. It opens even when the computer can't be reached, and says so. Only one tab of a browser shows a computer at a time; another tab asks before taking over.
 
-Game controllers connected to the viewing device work on Linux hosts as a virtual Xbox 360 controller.
+Game controllers connected to the viewing device work on Linux hosts, and on Windows hosts with the free [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver installed, as a virtual Xbox 360 controller.
 
 Local shortcuts (not sent to the Mac): Ctrl+Shift+F toggles fullscreen, Ctrl+Shift+H toggles the stats overlay.
+
+### A locked screen, or a closed lid
+
+Type your password at the lock screen from the viewer, as you would at the computer. Keys pressed into a password field (the lock screen, a password prompt) aren't shown to other viewers or written to Glass's log: they see "a key, into a password field". Agents with a grant can't type into one at all; they ask you with `request_help`.
+
+A laptop sleeps when its lid closes, and a sleeping computer can't be unlocked from anywhere. Turn on **Stay awake with the lid closed** (Glass app › Settings, or `glass config lid-awake on`) to keep it awake with the lid closed while it's plugged in. On battery it sleeps as usual, so it still sleeps closed in a bag. Keep a closed laptop that stays awake somewhere it can cool down.
+
+- **macOS:** turning it on asks for your admin password once, to install `/etc/sudoers.d/glass-lid`. That rule lets Glass run exactly `pmset -a disablesleep 1` and `pmset -a disablesleep 0` and nothing else. Glass only turns back on a sleep it turned off itself. A virtual display (as Glass makes for **Use as a second display**) doesn't keep a closed Mac awake; a real external display does. If your company manages the Mac, its management software may remove the rule; turn the setting on again to reinstall it.
+- **Linux:** no password. While plugged in, Glass holds systemd-logind's `handle-lid-switch` inhibitor, if polkit allows it (it usually does for your own session). GNOME and KDE decide about the lid themselves, so set their own lid action too; Hyprland, Sway and others leave it to logind.
 
 ### Keyboard and ⌘ shortcuts on iPad
 
@@ -421,6 +436,8 @@ glass acl remove 0        # by position
 
 A rule matches an email, `@domain`, `group:name` or `*`, and takes the same limits as `glass link`. With no rules, nobody signs in with a directory account. Rules live in `~/.config/glass/acl.json`.
 
+**People on your tailnet.** The rules apply to Tailscale too: someone else on the computer's tailnet (a member you invited, or a device you shared it with) whose Tailscale login a rule names connects without the token, as a guest with that rule's limits. `glass config tailnet-members on` lets everyone on the tailnet in that way (off by default; on a company tailnet that's everyone in it). Devices tagged in Tailscale belong to no one and never count.
+
 **SCIM.** `glass config scim-token new` prints a token for SCIM 2.0 provisioning at `https://<computer>/scim/v2` (Okta, Entra ID). Users and groups stay in sync; deactivated users can't sign in and lose their sessions at once.
 
 **Device posture.** Checked on every connection:
@@ -475,7 +492,7 @@ glass uninstall     Stop the background service and remove it from login items
 glass --version
 ```
 
-Host options: `--http-port` (default 8080; if it's taken, the next free port up to 8099), `--https-port` (default 443: also serve there when free, so URLs need no port; 0 turns it off), `--wt-port` (UDP, default 4433; likewise moves to the next free port, which browsers learn automatically), `--fps` (default 60), `--mbps` (default 30), `--scale`, `--cert`/`--key` (custom TLS), `--token-file`, `--web-dir`, `--log-dir`.
+Host options: `--bind` (repeatable, or comma-separated) sets the address for the web ports and WebTransport together. The default is `0.0.0.0` (every IPv4 address; WebTransport also accepts IPv6, as before). `tailscale` listens on this machine's Tailscale addresses and fails if Tailscale isn't running. For example `--bind tailscale --bind 127.0.0.1`, or `--bind 127.0.0.1,100.64.0.2`. The same list is saved with `glass config bind` and applies the next time Glass starts; a `--bind` flag overrides it. On macOS, port 443 needs the default bind (or `0.0.0.0`): an unprivileged process can only bind a port below 1024 on the wildcard address, so a specific address falls back to the web port. `--http-port` (default 8080; if it's taken, the next free port up to 8099, on every chosen address), `--https-port` (default 443: also serve there when free, so URLs need no port; 0 turns it off), `--wt-port` (UDP, default 4433; likewise moves to the next free port, which browsers learn automatically), `--fps` (default 60), `--mbps` (default 30), `--scale`, `--cert`/`--key` (custom TLS), `--token-file`, `--web-dir`, `--log-dir`.
 
 Files:
 
@@ -505,12 +522,12 @@ Files:
 
 ## Linux host (beta)
 
-The same one-liner installs Glass on Linux x86_64. The Linux host uses:
+The same one-liner installs Glass on Linux x86_64 and ARM64 (aarch64). The Linux host uses:
 
 - **Screen capture:** xdg-desktop-portal ScreenCast over PipeWire. On Hyprland (Omarchy), the share picker asks once which screen to share; Glass saves a restore token so it doesn't ask again.
 - **Encoding:** software H.264 (OpenH264, screen-content mode). Screens larger than 2560×1600 are halved before encoding, to keep the frame rate up. Hardware VA-API encoding is planned.
 - **Input:** a virtual keyboard and absolute pointer through `/dev/uinput`. `glass setup` installs a one-line udev rule (`/etc/udev/rules.d/60-glass-uinput.rules`) giving the logged-in user access; this needs `sudo` once.
-- **Address:** Linux only lets root listen on port 443, so `glass setup` runs `tailscale serve` to forward `https://<machine>.<tailnet>.ts.net/` to Glass. If that isn't possible, use the `:8080` address.
+- **Address:** Linux only lets root listen on port 443, so `glass setup` runs `tailscale serve` to forward `https://<machine>.<tailnet>.ts.net/` to Glass on localhost. If that isn't possible, use the `:8080` address. `--bind` / `glass config bind` chooses which addresses the ports use; include `127.0.0.1` when `tailscale serve` is what publishes port 443, because that forward targets localhost.
 - **Clipboard:** `wl-copy` / `wl-paste` (wl-clipboard).
 - **Audio:** the default output's monitor, through PipeWire. The viewer's microphone appears as a "Glass microphone" input while it's on.
 - **Controllers:** game controllers on the viewing device appear as a virtual Xbox 360 controller through `/dev/uinput`.
@@ -521,6 +538,29 @@ The same one-liner installs Glass on Linux x86_64. The Linux host uses:
 Dependencies: PipeWire, wl-clipboard and your desktop's screen-sharing portal (`xdg-desktop-portal-hyprland`, `-gnome`, `-kde` or `-wlr`). Setup detects pacman, apt, dnf or zypper and offers to install what's missing, e.g. on Arch / Omarchy: `sudo pacman -S --needed pipewire xdg-desktop-portal-hyprland wl-clipboard`; on Ubuntu: `sudo apt-get install pipewire xdg-desktop-portal-gnome wl-clipboard`. Tailscale: `curl -fsSL https://tailscale.com/install.sh | sh`, then `sudo tailscale up`.
 
 Keys arrive as typed on Linux hosts: ⌘ on an Apple keyboard is Super. Paste from the viewer's clipboard sends Ctrl+V.
+
+While the session is locked (logind's lock hint, or a locker such as hyprlock or swaylock running), keys aren't shown to viewers or logged. **Stay awake with the lid closed** works on Linux laptops too; see [A locked screen, or a closed lid](#a-locked-screen-or-a-closed-lid).
+
+## Windows host (beta)
+
+On Windows 10 or 11 (x64 or Arm), run in PowerShell:
+
+```powershell
+irm glassdesk.dev/install.ps1 | iex
+```
+
+It installs to `%LOCALAPPDATA%\Programs\Glass` for your user (no administrator needed), starts Glass at sign-in, and runs `glass setup`. For managed installs there's a per-machine MSI (`msiexec /i glass-….msi /qn`) and Group Policy settings; see the release notes. The Windows host uses:
+
+- **Screen capture:** DXGI Desktop Duplication, every display, with the pointer drawn in.
+- **Encoding:** H.264 on the GPU through Media Foundation where there is one, otherwise OpenH264.
+- **Input:** `SendInput`, keys by scan code. Game controllers need the free [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) driver.
+- **Clipboard:** text, rich text (HTML) and images.
+- **Audio:** system audio through WASAPI loopback; the viewer's microphone through [VB-CABLE](https://vb-audio.com/Cable/) if it's installed.
+- **Terminal:** PowerShell in the viewer, through ConPTY.
+- **Background:** `glassw.exe` starts Glass at sign-in (the Run key), with an icon in the notification area showing who's viewing. Logs: `%LOCALAPPDATA%\Glass\Logs`.
+- **Lock screen, UAC, Ctrl+Alt+Del and signing in after a restart (optional):** `glass service install` (one UAC prompt) adds the Glass Secure Desktop service, which keeps a helper running as SYSTEM in the console session so viewers can see and use the lock screen, UAC prompts and elevated windows, and send Ctrl+Alt+Del. Only the signed-in console user's own Glass can talk to it. After a restart, while nobody is signed in, the service also serves the sign-in screen to the same viewers (from a copy of your token and settings that only SYSTEM and administrators can read): screen, keyboard and mouse only, no files, clipboard, terminal or agents. Once you sign in, your own Glass takes over and the page reconnects. `glass service uninstall` removes it.
+
+To remove Glass, uninstall it in **Settings › Apps › Installed apps**: that takes away the programs, the start-at-sign-in entry, the Start menu shortcut, the firewall rule and the secure-desktop service (one UAC prompt), and keeps your settings in `%APPDATA%\Glass`. `glass uninstall` only stops Glass starting at sign-in.
 
 ## Viewing from Linux or Windows (Omarchy included)
 
@@ -536,16 +576,29 @@ Hyprland keeps its own Super shortcuts. In fullscreen (Ctrl+Shift+F), Chromium's
 
 - All traffic is encrypted (TLS 1.3 via QUIC/HTTPS).
 - With Tailscale, traffic stays on your private tailnet and goes directly between devices when possible.
-- Access control: a device is let in if Tailscale reports it belongs to the same user as the Mac, or if it presents the access token. Glass sends nothing to a session (video, audio, clipboard, input) until it is authenticated. Links, single sign-on, LDAP, access rules, posture checks and passkeys can narrow that further; see above.
-- Glass runs as your user (a LaunchAgent on macOS, a systemd user service on Linux), never as root.
+- Access control: a device is let in if Tailscale reports it belongs to the same user as the Mac, if it presents the access token, or (as a guest) if its Tailscale user is named by an access rule or `tailnet-members` is on. Glass sends nothing to a session (video, audio, clipboard, input) until it is authenticated. Links, single sign-on, LDAP, access rules, posture checks and passkeys can narrow that further; see above.
+- Glass runs as your user (a LaunchAgent on macOS, a systemd user service on Linux, a sign-in entry on Windows), never as root. On Windows you can opt into the Glass Secure Desktop service, whose SYSTEM helper only serves your own Glass (see [Windows host](#windows-host-beta)). The one exception you can opt into: **Stay awake with the lid closed** on a Mac installs a sudoers rule that lets it turn sleep off and on (`pmset -a disablesleep 0|1`), nothing else.
+- Keys pressed into a password field, or anywhere while a Linux session is locked, aren't shown to viewers or logged.
 - The file browser is for the computer's owner only (not links or guests), sees only the home folder (no `..`, no symlinks out), and moves to the Trash rather than deleting.
 - Fleet (opt-in) sends a computer's details to your glassdesk.dev account and lets that account ask for a fixed set of actions, each signed by your passkey and checked by the computer itself. See [Glass Fleet](#glass-fleet-new) for what's sent and what can and can't happen.
 - Notifications are the one thing that leaves your network: the computer sends them through your browser's push service (Apple, Google, Mozilla or Microsoft), encrypted end to end (RFC 8291), so the push service can't read them. Only devices you turn them on for get them; guests only ever get messages.
 - The glassdesk.dev website uses Google Analytics on its pages (not on the remote viewer at glassdesk.dev/app), counts downloads using a salted hash of the IP address (no raw IPs stored) and stores feedback you choose to send, which is emailed to the maintainer. Downloads are also counted in Google Analytics under that same hash, with the country. The installer says which version it replaces, if any, so updates are counted apart from new installs. The Glass app itself sends nothing to glassdesk.dev except feedback you submit, its check for a new version, and, when you run `glass account add`, the computer's name and public key (plus, only if you run `glass fleet on`, the details listed under *Glass Fleet*). The /computers page loads no analytics.
 
+## Code signing policy
+
+Glass's programs are signed in GitHub Actions ([release.yml](https://github.com/Ntarasiuk/glass/blob/main/.github/workflows/release.yml)), built from this repository's source and nothing else: macOS builds with Glass's own key, Windows builds (`glass.exe`, `glassw.exe` and the MSI) with an Authenticode certificate. Only Glass's own code is signed, never third-party programs.
+
+Windows signing is being set up through SignPath Foundation's free program for open-source projects. Until it's in place, the Windows downloads are unsigned: SmartScreen may warn before the MSI runs (**More info › Run anyway**), and a PC with Smart App Control turned on may block Glass. Each release's notes say whether its Windows builds are signed.
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- **Committers and reviewers:** [Nathan Tarasiuk](https://github.com/Ntarasiuk). A pull request from anyone else is reviewed by a committer before it's merged.
+- **Approvers:** [Nathan Tarasiuk](https://github.com/Ntarasiuk) approves every signing request by hand.
+- **Privacy:** what Glass sends and where is under [Security and privacy](https://glassdesk.dev/docs#security-and-privacy).
+
 ## Requirements
 
-- Host: macOS 13 Ventura or newer (Apple Silicon or Intel), or Linux x86_64 with a Wayland compositor that supports the ScreenCast portal, plus PipeWire.
+- Host: macOS 13 Ventura or newer (Apple Silicon or Intel), or Linux (x86_64 or ARM64) with a Wayland compositor that supports the ScreenCast portal, plus PipeWire.
 - Viewer: a browser with WebTransport and WebCodecs, such as Safari 26.4+ on iPadOS/iOS/macOS, or current Chrome, Edge, or Firefox.
 - Remote access: Tailscale on both devices with HTTPS Certificates enabled for the tailnet (free plan works).
 
@@ -563,6 +616,8 @@ Hyprland keeps its own Super shortcuts. In fullscreen (Ctrl+Shift+F), Chromium's
 - **The mic needs setting up:** run `glass mic` to check and `glass mic install` to set it up (Glass Microphone on a Mac, `pactl` on Linux). Another loopback driver works too on a Mac: set `GLASS_MIC_DEVICE` to part of its name in the service's environment.
 - **The Mac's input is still Glass Microphone (or BlackHole):** Glass puts your previous input back when the mic turns off, and at its next start if it stopped while a mic was on. Or pick it in System Settings › Sound › Input.
 - **Displays missing:** sleeping displays aren't capturable; Glass keeps displays awake while running and wakes them on start.
+- **The lock screen says the password is incorrect when it isn't:** update Glass (`glass update`). Older versions' typing didn't count as someone at the computer, so while the display slept macOS rejected the password without checking it.
+- **A MacBook goes to sleep when its lid closes:** turn on **Stay awake with the lid closed** (`glass config lid-awake on`) and keep it plugged in. `pmset -g | grep SleepDisabled` shows `1` while it's in effect.
 
 ## FAQ
 
@@ -578,11 +633,11 @@ Hyprland keeps its own Super shortcuts. In fullscreen (Ctrl+Shift+F), Chromium's
 
 **Does it work on Linux?** Yes, as a viewer in any modern browser, and as a host on Wayland (beta).
 
-**Does it work on Windows?** As a viewer, yes, in any modern browser. Windows can't be the computer you control yet.
+**Does it work on Windows?** As a viewer, yes, in any modern browser. As a host, in beta: see [Windows host](#windows-host-beta).
 
 **Does it stream audio?** Yes, the host's system audio, toggled per device.
 
-**Can I control a locked Mac?** Yes; type your password at the lock screen. FileVault still requires one local login after a reboot.
+**Can I control a locked Mac?** Yes; type your password at the lock screen. With **Stay awake with the lid closed** on, that works on a closed MacBook too, while it's plugged in. FileVault still requires one local login after a reboot.
 
 ## Feedback
 

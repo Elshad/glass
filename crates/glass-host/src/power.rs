@@ -30,6 +30,8 @@ pub fn restart_computer() -> Result<()> {
         .status()?;
     #[cfg(target_os = "linux")]
     let status = std::process::Command::new("systemctl").arg("reboot").status()?;
+    #[cfg(windows)]
+    let status = std::process::Command::new("shutdown").args(["/r", "/t", "0"]).status()?;
     anyhow::ensure!(status.success(), "the system didn't accept the restart");
     Ok(())
 }

@@ -152,8 +152,27 @@ async fn pick_native() -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Shows the standard Open dialog on the host's screen.
+#[cfg(windows)]
+async fn pick_native() -> Result<Vec<PathBuf>> {
+    // Owned by an invisible topmost window: a dialog from a background process otherwise
+    // opens behind whatever is in front, where the viewer can't see it.
+    let script = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; \
+        $o = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false; Opacity = 0; StartPosition = 'CenterScreen' }; $o.Show(); $o.Activate(); \
+        $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Title = 'Send to the viewer (Glass)'; $d.Multiselect = $true; \
+        if ($d.ShowDialog($o) -eq [System.Windows.Forms.DialogResult]::OK) { $d.FileNames }; $o.Close()";
+    let cmd = crate::platform::powershell(script);
+    let output = tokio::process::Command::from(cmd).output().await?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect())
+}
+
 /// `file:///home/me/My%20File.txt` → `/home/me/My File.txt`.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(unix, test)))]
 fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let encoded = uri.strip_prefix("file://")?;
     let bytes = encoded.as_bytes();
@@ -188,6 +207,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn decodes_file_uris() {
         assert_eq!(
             file_uri_to_path("file:///home/me/My%20File.txt"),
@@ -209,13 +229,7 @@ pub async fn send(conn: &Connection, path: &Path) -> Result<()> {
         .context("no file name")?
         .to_string_lossy()
         .into_owned();
-    let header = serde_json::to_vec(&FileHeader { name, size, dir: None })?;
-
-    let mut stream = conn.open_uni().await?.await?;
-    let mut prefix = vec![STREAM_FILE];
-    prefix.extend_from_slice(&(header.len() as u32).to_le_bytes());
-    prefix.extend_from_slice(&header);
-    stream.write_all(&prefix).await?;
+    let mut stream = open_file_stream(conn, FileHeader { name, size, dir: None, streamed: false }).await?;
 
     let mut buf = vec![0u8; CHUNK];
     loop {
@@ -227,5 +241,41 @@ pub async fn send(conn: &Connection, path: &Path) -> Result<()> {
     }
     stream.finish().await?;
     info!("sent file {} ({size} bytes)", path.display());
+    Ok(())
+}
+
+/// Opens a uni stream and writes the `STREAM_FILE` tag and `header`.
+async fn open_file_stream(conn: &Connection, header: FileHeader) -> Result<wtransport::SendStream> {
+    let header = serde_json::to_vec(&header)?;
+    let mut stream = conn.open_uni().await?.await?;
+    let mut prefix = vec![STREAM_FILE];
+    prefix.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    prefix.extend_from_slice(&header);
+    stream.write_all(&prefix).await?;
+    Ok(stream)
+}
+
+/// Sends folder `dir` (resolved inside the file browser's root) as a zip made on the fly.
+/// A failure part way resets the stream, so the viewer doesn't keep half a zip.
+pub async fn send_folder(conn: &Connection, dir: &Path) -> Result<()> {
+    let name = crate::zipdir::name(dir);
+    let mut stream = open_file_stream(conn, FileHeader { name, size: 0, dir: None, streamed: true }).await?;
+    let mut chunks = crate::zipdir::stream(crate::browse::root(), dir.to_path_buf());
+    let mut sent = 0u64;
+    let result: Result<()> = async {
+        while let Some(chunk) = chunks.recv().await {
+            let chunk = chunk?;
+            stream.write_all(&chunk).await?;
+            sent += chunk.len() as u64;
+        }
+        stream.finish().await?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = stream.reset(1u32.into());
+    }
+    result?;
+    info!("sent folder {} as a zip ({sent} bytes)", dir.display());
     Ok(())
 }

@@ -357,9 +357,8 @@ fn cookie(headers: &HeaderMap) -> Option<String> {
 // ---- Pure parts (unit tested) ----
 
 fn random(n: usize) -> Result<String> {
-    use std::io::Read;
     let mut bytes = vec![0u8; n];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    crate::control::getrandom(&mut bytes)?;
     Ok(b64url(&bytes))
 }
 

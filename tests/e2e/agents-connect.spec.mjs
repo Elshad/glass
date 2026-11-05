@@ -204,7 +204,7 @@ it('on an owner device it is one tap; a view-only agent can look but not touch, 
     expect(t.body.scope).toBe('computer:view');
 
     const names = (await mcp(host, t.body.access_token, 'tools/list')).body.result.tools.map((x) => x.name);
-    expect(names.sort()).toEqual(['list_displays', 'screenshot', 'wait_for_change']);
+    expect(names.sort()).toEqual(['list_displays', 'record', 'screenshot', 'snapshot', 'wait_for_change']);
     // Asking to touch: step-up, the MCP way.
     const click = await mcp(host, t.body.access_token, 'tools/call', { name: 'click', arguments: { x: 1, y: 1 } });
     expect(click.status).toBe(403);

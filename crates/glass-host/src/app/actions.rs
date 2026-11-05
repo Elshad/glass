@@ -194,7 +194,7 @@ pub fn install(at_login: bool) -> Result<String> {
 
 pub fn uninstall() -> Result<String> {
     agent::uninstall()?;
-    Ok("Glass is off and removed from login items.".into())
+    Ok(format!("Glass is off and removed from {}.", if cfg!(windows) { "startup apps" } else { "login items" }))
 }
 
 /// Installs the newest release (the installer restarts the service on it) and waits for
@@ -207,7 +207,17 @@ pub fn update_now() -> Result<String> {
     Ok(version)
 }
 
+/// Opens the app again in a moment, once this one has quit (so it's the new version).
+#[cfg(windows)]
+pub fn relaunch() {
+    if let Ok(exe) = std::env::current_exe() {
+        let glassw = crate::platform::ps_string(&exe.with_file_name("glassw.exe").display().to_string());
+        let _ = crate::platform::powershell(&format!("Start-Sleep 1; Start-Process {glassw} app")).spawn();
+    }
+}
+
 /// Opens Glass.app again in a moment, once this one has quit (so it's the new version).
+#[cfg(not(windows))]
 pub fn relaunch() {
     use std::os::unix::process::CommandExt;
     let app = super::bundle::path();
@@ -225,12 +235,34 @@ pub fn feedback(text: &str) -> Result<String> {
     Ok("Thanks! Feedback sent.".into())
 }
 
+/// Opens a link, file or folder with what the system uses for it.
 pub fn open(target: &str) {
+    #[cfg(windows)]
+    crate::platform::setup::open_url(target);
+    #[cfg(not(windows))]
     let _ = std::process::Command::new("open").arg(target).spawn();
 }
 
+/// Opens the Tailscale app (to sign in).
+pub fn open_tailscale() {
+    #[cfg(windows)]
+    {
+        let ipn = std::path::Path::new(r"C:\Program Files\Tailscale\tailscale-ipn.exe");
+        let _ = std::process::Command::new(ipn).spawn();
+    }
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("open").args(["-a", "Tailscale"]).spawn();
+}
+
+/// Where Tailscale is downloaded for this system.
+pub const TAILSCALE_DOWNLOAD: &str =
+    if cfg!(windows) { "https://tailscale.com/download/windows" } else { "https://tailscale.com/download/mac" };
+
 /// The `glass` an agent should run: the installed one, else this binary.
 pub fn glass_path() -> PathBuf {
+    #[cfg(windows)]
+    let installed = crate::platform::local_app_data().join(r"Programs\Glass\bin\glass.exe");
+    #[cfg(not(windows))]
     let installed = crate::home().join(".glass/bin/glass");
     if installed.exists() { installed } else { std::env::current_exe().unwrap_or(installed) }
 }

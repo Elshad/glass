@@ -1,7 +1,7 @@
 //! The file browser in the viewer (owner only): list a folder under the home folder, fetch
-//! a file, upload into a folder, make folders, rename and move to the Trash, and small
-//! previews of images and PDFs. Paths from the viewer are relative to the home folder and
-//! must stay inside it: no `..`, and no symlink that leads out.
+//! a file or a folder (as a zip), upload into a folder, make folders, rename and move to the
+//! Trash, and small previews of images and PDFs. Paths from the viewer are relative to the
+//! home folder and must stay inside it: no `..`, and no symlink that leads out.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -14,7 +14,7 @@ use serde::Serialize;
 /// Folders listed in one go (a folder with more shows the first ones and says so).
 const MAX_ENTRIES: usize = 5000;
 /// Previews are this many pixels on their longest side.
-#[cfg(target_os = "macos")]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 const THUMB_SIZE: u32 = 160;
 /// Drag-out links (`/files/raw`) work this long after the listing that made them.
 const TICKET_TTL: Duration = Duration::from_secs(15 * 60);
@@ -102,7 +102,7 @@ pub fn list(root: &Path, rel: &str, hidden: bool) -> Result<Listing> {
     for e in std::fs::read_dir(&dir).with_context(|| format!("can't open {}", dir.display()))? {
         let Ok(e) = e else { continue };
         let name = e.file_name().to_string_lossy().into_owned();
-        if !hidden && name.starts_with('.') {
+        if !hidden && (name.starts_with('.') || hidden_on_windows(&e)) {
             continue;
         }
         if entries.len() >= MAX_ENTRIES {
@@ -123,6 +123,21 @@ pub fn list(root: &Path, rel: &str, hidden: bool) -> Result<Listing> {
     // Folders first, then by name (case-insensitive), like Finder.
     entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     Ok(Listing { path: relative(root, &dir), entries, truncated })
+}
+
+/// Windows marks what Explorer doesn't show as hidden or system (AppData, and the old
+/// "My Documents" / "Cookies" junctions in every home folder), not with a leading dot.
+#[cfg(windows)]
+fn hidden_on_windows(e: &std::fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN: u32 = 0x2;
+    const SYSTEM: u32 = 0x4;
+    e.metadata().is_ok_and(|m| m.file_attributes() & (HIDDEN | SYSTEM) != 0)
+}
+
+#[cfg(not(windows))]
+fn hidden_on_windows(_: &std::fs::DirEntry) -> bool {
+    false
 }
 
 fn kind(name: &str) -> &'static str {
@@ -186,7 +201,22 @@ fn move_to_trash(path: &Path) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{}", e.localizedDescription()))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn move_to_trash(path: &Path) -> Result<()> {
+    crate::platform::system::recycle(path)
+}
+
+/// A path as the Windows shell takes it: without the `\\?\` prefix canonical paths have.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn shell_path(p: &str) -> String {
+    if let Some(unc) = p.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        p.strip_prefix(r"\\?\").unwrap_or(p).to_string()
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn move_to_trash(path: &Path) -> Result<()> {
     let status = std::process::Command::new("gio").arg("trash").arg(path).status().context("gio trash")?;
     anyhow::ensure!(status.success(), "couldn't move it to the Trash");
@@ -232,7 +262,46 @@ fn make_thumbnail(path: &Path, out: &Path) -> Result<bool> {
     Ok(ok)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The shell's thumbnail (the one Explorer shows: pictures, PDFs, videos).
+#[cfg(windows)]
+fn make_thumbnail(path: &Path, out: &Path) -> Result<bool> {
+    let Some((w, h, bgra)) = crate::platform::system::thumbnail(path, THUMB_SIZE) else { return Ok(false) };
+    // Written aside and moved in, so a half-written file never sits in the cache.
+    let tmp = out.with_extension("part");
+    std::fs::write(&tmp, shell_png(w, h, &bgra)?)?;
+    std::fs::rename(&tmp, out)?;
+    Ok(true)
+}
+
+/// A PNG from a shell thumbnail: premultiplied BGRA, top to bottom. Photos often come with
+/// alpha all 0, which means opaque there. One bigger than asked (it shouldn't be) is scaled
+/// down to THUMB_SIZE.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shell_png(w: usize, h: usize, bgra: &[u8]) -> Result<Vec<u8>> {
+    anyhow::ensure!(w > 0 && h > 0 && bgra.len() >= w * h * 4, "bad thumbnail");
+    let max = [THUMB_SIZE, THUMB_SIZE];
+    if crate::thumbs::fit(w, h, max) != (w, h) {
+        let small = crate::thumbs::downscale(bgra, w, h, w * 4, false, max).context("bad thumbnail")?;
+        return crate::lossless::encode_png(&small, [0, 0, small.width, small.height]);
+    }
+    let opaque = bgra[..w * h * 4].chunks_exact(4).all(|p| p[3] == 0);
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for p in bgra[..w * h * 4].chunks_exact(4) {
+        let a = if opaque { 255 } else { p[3] };
+        let straight = |c: u8| if a == 0 { 0 } else { (c as u32 * 255 / a as u32).min(255) as u8 };
+        rgba.extend_from_slice(&[straight(p[2]), straight(p[1]), straight(p[0]), a]);
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()?.write_image_data(&rgba)?;
+    }
+    Ok(out)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn make_thumbnail(_path: &Path, _out: &Path) -> Result<bool> {
     Ok(false)
 }
@@ -292,12 +361,23 @@ async fn raw(axum::extract::Query(q): axum::extract::Query<RawQuery>) -> axum::r
     let Ok(path) = resolve(&root(), &q.path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if path.is_dir() {
+        // A folder: zipped as it downloads (no length, so the browser shows no total).
+        let chunks = crate::zipdir::stream(root(), path.clone());
+        let stream = futures_util::stream::unfold(chunks, |mut rx| async move { rx.recv().await.map(|c| (c, rx)) });
+        let name = crate::zipdir::name(&path);
+        return (
+            [
+                (header::CONTENT_TYPE, "application/zip".to_string()),
+                (header::CONTENT_DISPOSITION, format!("attachment; filename*=UTF-8''{}", encode(&name))),
+            ],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response();
+    }
     let Ok(file) = tokio::fs::File::open(&path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if path.is_dir() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
     let body = axum::body::Body::from_stream(tokio_util_stream(file));
@@ -350,6 +430,39 @@ mod tests {
         std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
     }
 
+    /// Width, height, colour type and pixels of a PNG.
+    fn decode(png_bytes: &[u8]) -> (u32, u32, png::ColorType, Vec<u8>) {
+        let mut r = png::Decoder::new(png_bytes).read_info().unwrap();
+        let mut buf = vec![0; r.output_buffer_size()];
+        let info = r.next_frame(&mut buf).unwrap();
+        buf.truncate(info.buffer_size());
+        (info.width, info.height, info.color_type, buf)
+    }
+
+    #[test]
+    fn shell_thumbnails_become_straight_rgba_pngs() {
+        // Premultiplied: half-transparent white is 128,128,128,128.
+        let (w, h, color, px) = decode(&shell_png(2, 1, &[10, 20, 30, 255, 128, 128, 128, 128]).unwrap());
+        assert_eq!((w, h, color), (2, 1, png::ColorType::Rgba));
+        assert_eq!(px, [30, 20, 10, 255, 255, 255, 255, 128]);
+        // Alpha all 0 (a photo): opaque, colours as they are.
+        let (_, _, _, px) = decode(&shell_png(1, 1, &[10, 20, 30, 0]).unwrap());
+        assert_eq!(px, [30, 20, 10, 255]);
+        // Bigger than asked: scaled to fit, aspect kept.
+        let big = vec![200u8; 320 * 100 * 4];
+        let (w, h, _, _) = decode(&shell_png(320, 100, &big).unwrap());
+        assert_eq!((w, h), (THUMB_SIZE, 50));
+        assert!(shell_png(0, 0, &[]).is_err());
+        assert!(shell_png(2, 2, &[0; 4]).is_err());
+    }
+
+    #[test]
+    fn the_windows_shell_gets_plain_paths() {
+        assert_eq!(shell_path(r"\\?\C:\Users\ana\a.txt"), r"C:\Users\ana\a.txt");
+        assert_eq!(shell_path(r"\\?\UNC\server\share\a.txt"), r"\\server\share\a.txt");
+        assert_eq!(shell_path(r"C:\a"), r"C:\a");
+    }
+
     #[test]
     fn stays_inside_the_root() {
         let root = tmp();
@@ -365,6 +478,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlinks_out_are_refused() {
         let root = tmp();
         let outside = std::env::temp_dir().join(format!("glass-outside-{}", rand_suffix()));

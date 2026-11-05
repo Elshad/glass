@@ -19,18 +19,29 @@ echo
 bold "Glass: your computer, in any browser"
 echo
 
+# On Windows (Git Bash, MSYS2, Cygwin, or WSL, whose Linux can't see the Windows desktop),
+# point at the Windows installer instead.
+windows() { fail "This is $1 on Windows. To control this PC, run this in PowerShell instead:  irm glassdesk.dev | iex"; }
+case "$(uname -s)" in
+  MINGW*|MSYS*) windows "Git Bash" ;;
+  CYGWIN*) windows "Cygwin" ;;
+  Linux) if [ -n "${WSL_DISTRO_NAME:-}" ] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then windows "WSL"; fi ;;
+esac
+
 case "$(uname -s)-$(uname -m)" in
   Darwin-*)
     major=$(sw_vers -productVersion | cut -d. -f1)
     [ "$major" -ge 13 ] || fail "Glass needs macOS 13 (Ventura) or newer; this Mac has $(sw_vers -productVersion)."
     TARBALL="glass-latest-darwin-universal.tar.gz"
     ;;
-  Linux-x86_64)
+  Linux-x86_64|Linux-aarch64|Linux-arm64)
     [ -n "${WAYLAND_DISPLAY:-}" ] || info "Glass on Linux needs a Wayland session (Hyprland, GNOME, KDE…); run setup from inside it."
-    TARBALL="glass-latest-linux-x86_64.tar.gz"
+    arch=$(uname -m)
+    [ "$arch" = arm64 ] && arch=aarch64
+    TARBALL="glass-latest-linux-$arch.tar.gz"
     ;;
-  Linux-*) fail "Glass on Linux currently supports x86_64; this machine is $(uname -m)." ;;
-  *) fail "Glass runs on macOS and Linux. Install it on the computer you want to control." ;;
+  Linux-*) fail "Glass on Linux supports x86_64 and ARM64 (aarch64); this machine is $(uname -m)." ;;
+  *) fail "Glass runs on macOS, Linux and Windows (in PowerShell: irm glassdesk.dev | iex). Install it on the computer you want to control." ;;
 esac
 
 tmp=$(mktemp -d)

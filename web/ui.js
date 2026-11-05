@@ -19,7 +19,7 @@ const storageSet = (key, value) => {
 };
 
 
-export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () => {}, onSelectDisplay, onSharp, onListWindows, onSelectWindow, onShortcut, shortcuts, swapCmdOption, onSwapCmdOption, ctrlAsCmd, onCtrlAsCmd, pcKeyboard, onPcKeyboard, onKeyboard, onUploadFiles, onRequestFiles, onAudio, onMic, onFullscreen, onToggleStats, onPrivacy, onRestart, onToken, onTerminal = () => {}, onOpenDevice = () => {}, onTrackpad = () => {}, onPad = () => {}, onExtend = () => {}, resolution = 'auto', onResolution, fitSizes = () => [], deviceName = () => 'device' }) {
+export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () => {}, onSelectDisplay, onSharp, onListWindows, onSelectWindow, onShortcut, shortcuts, swapCmdOption, onSwapCmdOption, ctrlAsCmd, onCtrlAsCmd, pcKeyboard, onPcKeyboard, onKeyboard, onUploadFiles, onRequestFiles, onAudio, onMic, onFullscreen, onToggleStats, onPrivacy, onRestart, onSas, onToken, onTerminal = () => {}, onOpenDevice = () => {}, onTrackpad = () => {}, onPad = () => {}, onExtend = () => {}, resolution = 'auto', onResolution, fitSizes = () => [], deviceName = () => 'device' }) {
   const toolbar = $('toolbar');
   // Each toolbar menu: its button and panel.
   const menus = {
@@ -428,7 +428,7 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
         checked: resolutionMode === 'auto',
         onSelect: () => { setMenuOpen('displays', false); onResolution?.('auto'); },
       }),
-      menuItem('This Mac', native ? `${native.width}×${native.height}` : 'full resolution', {
+      menuItem(hostOs === 'macos' ? 'This Mac' : 'Full size', native ? `${native.width}×${native.height}` : 'full resolution', {
         checked: resolutionMode === 'native',
         onSelect: () => { setMenuOpen('displays', false); onResolution?.('native'); },
       }),
@@ -491,6 +491,8 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
   let isOwner = false;
   let privacyAvailable = false;
   let privacyOn = false;
+  let hostOs;
+  let canInput = true;
   function renderMore() {
     const items = [
       menuItem('Stats', 'Ctrl+Shift+H', {
@@ -498,6 +500,12 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
         onSelect: () => { setMenuOpen('more', false); onToggleStats?.(); },
       }),
     ];
+    // Ctrl+Alt+Del: any input-capable viewer of a Windows host (needs the secure-desktop service).
+    if (hostOs === 'windows' && canInput) {
+      items.push(menuItem('Send Ctrl+Alt+Del', 'secure attention', {
+        onSelect: () => { setMenuOpen('more', false); onSas?.(); },
+      }));
+    }
     // Another screen shows the computer (a car, a TV); this one is its trackpad and keyboard.
     if (padAvailable) {
       items.push(menuItem('Keyboard and mouse mode', 'the picture is paused here', {
@@ -586,7 +594,8 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
     if (progress !== undefined) {
       bar = document.createElement('progress');
       bar.max = 1;
-      bar.value = progress;
+      // null: indeterminate (no total known).
+      if (progress !== null) bar.value = progress;
       el.append(bar);
     }
     let timer;
@@ -612,7 +621,7 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
     const api = {
       update({ text: t, progress: p }) {
         if (t !== undefined) label.textContent = label.title = t;
-        if (bar && p !== undefined) bar.value = p;
+        if (bar && p != null) bar.value = p;
       },
       dismiss(after = 0) {
         clearTimeout(timer);
@@ -651,11 +660,13 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
     },
     /** What this session may do: a link can be view only, or without files. */
     setPerms({ input = true, files = true } = {}) {
+      canInput = input;
       $('btn-upload').classList.toggle('hidden', !files);
       $('btn-download').classList.toggle('hidden', !files);
       $('btn-keyboard').classList.toggle('hidden', !input);
       if (!input) $('btn-shortcuts').classList.add('hidden');
       renderBar();
+      renderMore();
     },
     /** "Use as a second display": offered (`available`) and on (`on`). */
     setExtend({ available = extendAvailable, on = extended } = {}) {
@@ -705,8 +716,10 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
     },
     /** The ⌘ menu (Mac shortcuts and key remaps) only applies to Mac hosts. */
     setHostOs(os) {
+      hostOs = os;
       $('btn-shortcuts').classList.toggle('hidden', os !== 'macos');
       renderBar();
+      renderMore();
     },
     /** Shows this machine's keyboard remaps in the menu. */
     setKeyboardProfile({ pc, ctrlAsCmd, swap }) {

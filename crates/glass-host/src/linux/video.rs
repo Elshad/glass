@@ -2,7 +2,7 @@
 //! each on its own thread, and maps them to stream numbers according to the layout.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use super::{audio, clock::now_us, permissions, portal};
+use crate::mailbox::{FrameSender, Mailbox};
 use crate::media::VideoSource;
 pub use crate::media::{AudioPackets, DisplayInfo, EncodedFrame, Layout};
 use crate::soft_encode::{Encoder, Frame, PixelFormat};
@@ -278,9 +279,8 @@ impl Video {
                 keyframe: AtomicBool::new(true),
                 bitrate: std::sync::atomic::AtomicU32::new(self.config.bitrate as u32),
             });
-            // One-slot queue: if encoding falls behind, newer frames replace nothing and
-            // are simply dropped until the encoder is free.
-            let (tx, rx) = sync_channel::<(Frame, u64)>(1);
+            let rx = Arc::new(Mailbox::default());
+            let tx = FrameSender(rx.clone());
             let (fps, bitrate, scale) = (
                 self.config.fps as u32,
                 self.config.bitrate as u32,
@@ -312,24 +312,29 @@ impl Video {
 
 fn encode_loop(
     monitor: Arc<Monitor>,
-    rx: Receiver<(Frame, u64)>,
+    rx: Arc<Mailbox>,
     frames: broadcast::Sender<Arc<EncodedFrame>>,
     fps: u32,
     bitrate: u32,
     scale: f64,
 ) {
-    let mut encoder: Option<Encoder> = None;
+    let mut encoder: Option<VideoEncoder> = None;
     let mut applied_bitrate = bitrate;
     let mut last: Option<(Frame, u64)> = None;
+    // The latest picture hasn't been encoded yet (held while a viewer's link is full).
+    let mut unsent = false;
     loop {
-        let fresh = match rx.recv_timeout(IDLE_POLL) {
+        let wait = if unsent { crate::flow::POLL } else { IDLE_POLL };
+        let fresh = match rx.recv_timeout(wait) {
             Ok(f) => Some(f),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
         let has_fresh = fresh.is_some();
-        if let Some(f) = fresh {
-            last = Some(f);
+        if let Some(f) = fresh
+            && let Some((old, _)) = last.replace(f)
+        {
+            rx.recycle(old.data);
         }
         // Previews cover every monitor, shown or not.
         if has_fresh
@@ -351,9 +356,10 @@ fn encode_loop(
         if slot < 0 {
             continue;
         }
+        unsent |= has_fresh;
         let wants_key = monitor.keyframe.load(Ordering::Relaxed);
         // Nothing new: only re-encode the last frame to answer a keyframe request.
-        if !has_fresh && !wants_key {
+        if !unsent && !wants_key {
             continue;
         }
         let Some((frame, captured_us)) = last.as_ref() else {
@@ -364,7 +370,7 @@ fn encode_loop(
         let size = (frame.width, frame.height);
         let mut force = wants_key;
         if encoder.as_ref().is_none_or(|e| e.source_size() != size) {
-            match Encoder::new(
+            match VideoEncoder::new(
                 frame.width,
                 frame.height,
                 fps,
@@ -407,7 +413,13 @@ fn encode_loop(
                 }));
             }
         }
-        let capture_us = if has_fresh { *captured_us } else { now_us() };
+        // A viewer's link is still busy (crate::flow): keep the picture and look again
+        // shortly; the next frame carries every change since.
+        if !wants_key && crate::flow::held(slot as u8) {
+            continue;
+        }
+        let capture_us = if unsent { *captured_us } else { now_us() };
+        unsent = false;
         match encoder.as_mut().unwrap().encode(frame, force) {
             Ok(Some((data, keyframe))) => {
                 let _ = frames.send(Arc::new(EncodedFrame {
@@ -420,7 +432,83 @@ fn encode_loop(
                 }));
             }
             Ok(None) => {}
-            Err(e) => warn!("encode: {e:#}"),
+            Err(e) => {
+                warn!("encode: {e:#}");
+                if encoder.as_ref().is_some_and(VideoEncoder::is_hardware) {
+                    // Drop it; the next frame gets OpenH264 (and a keyframe).
+                    warn!("hardware encoding failed; using OpenH264 from now on");
+                    HARDWARE_FAILED.store(true, Ordering::Relaxed);
+                    encoder = None;
+                }
+            }
+        }
+    }
+}
+
+/// Set once the VA-API encoder has failed: the host stays on OpenH264 after that.
+static HARDWARE_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// OpenH264, or with `GLASS_ENCODER=vaapi` the GPU through VA-API. Opt-in for now: with
+/// frames captured into system memory, copying them to a discrete GPU costs about what
+/// software encoding does (the GPU path uses less CPU). Capturing DMA-BUFs would remove
+/// the copy.
+enum VideoEncoder {
+    Soft(Encoder),
+    #[cfg(feature = "vaapi")]
+    Va(super::va_encode::VaEncoder),
+}
+
+impl VideoEncoder {
+    fn new(width: usize, height: usize, fps: u32, bitrate: u32, scale: f64) -> Result<Self> {
+        let wants_vaapi = std::env::var("GLASS_ENCODER").is_ok_and(|e| e.eq_ignore_ascii_case("vaapi"));
+        #[cfg(not(feature = "vaapi"))]
+        if wants_vaapi && !HARDWARE_FAILED.swap(true, Ordering::Relaxed) {
+            warn!("GLASS_ENCODER=vaapi, but this build has no VA-API (--features vaapi); using OpenH264");
+        }
+        #[cfg(feature = "vaapi")]
+        if wants_vaapi
+            && !HARDWARE_FAILED.load(Ordering::Relaxed)
+            && super::va_encode::fits(width, height, scale)
+        {
+            match super::va_encode::VaEncoder::new(width, height, fps, bitrate, scale) {
+                Ok(e) => {
+                    info!("encoder: {} (VA-API)", e.name);
+                    return Ok(Self::Va(e));
+                }
+                Err(e) => {
+                    warn!("VA-API encoder unavailable, using OpenH264: {e:#}");
+                    HARDWARE_FAILED.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(Self::Soft(Encoder::new(width, height, fps, bitrate, scale)?))
+    }
+
+    fn is_hardware(&self) -> bool {
+        !matches!(self, Self::Soft(_))
+    }
+
+    fn source_size(&self) -> (usize, usize) {
+        match self {
+            Self::Soft(e) => e.source_size(),
+            #[cfg(feature = "vaapi")]
+            Self::Va(e) => e.source_size(),
+        }
+    }
+
+    fn set_bitrate(&mut self, bps: u32) {
+        match self {
+            Self::Soft(e) => e.set_bitrate(bps),
+            #[cfg(feature = "vaapi")]
+            Self::Va(e) => e.set_bitrate(bps),
+        }
+    }
+
+    fn encode(&mut self, frame: &Frame, force: bool) -> Result<Option<(Vec<u8>, bool)>> {
+        match self {
+            Self::Soft(e) => e.encode(frame, force),
+            #[cfg(feature = "vaapi")]
+            Self::Va(e) => e.encode(frame, force),
         }
     }
 }
@@ -428,14 +516,16 @@ fn encode_loop(
 struct StreamState {
     format: spa::param::video::VideoInfoRaw,
     pixel: Option<PixelFormat>,
-    tx: SyncSender<(Frame, u64)>,
+    tx: FrameSender,
     first: bool,
     id: usize,
+    /// Compares frames for crate::damage when the compositor doesn't say what changed.
+    differ: crate::damage::Differ,
 }
 
 fn run_pipewire(
     fd: std::os::fd::OwnedFd,
-    captures: Vec<(u32, Arc<Monitor>, SyncSender<(Frame, u64)>)>,
+    captures: Vec<(u32, Arc<Monitor>, FrameSender)>,
 ) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -459,10 +549,11 @@ fn run_pipewire(
             tx,
             first: true,
             id: i,
+            differ: Default::default(),
         };
         let listener = stream
             .add_local_listener_with_user_data(state)
-            .param_changed(|_, st, id, param| {
+            .param_changed(|stream, st, id, param| {
                 let Some(param) = param else { return };
                 if id != spa::param::ParamType::Format.as_raw() {
                     return;
@@ -487,6 +578,13 @@ fn run_pipewire(
                     size.height,
                     st.format.format()
                 );
+                // Ask for what changed in each frame, for agents waiting on the screen.
+                let meta = damage_params();
+                if let Some(pod) = Pod::from_bytes(&meta)
+                    && let Err(e) = stream.update_params(&mut [pod])
+                {
+                    warn!("screen {}: can't ask for damage: {e}", st.id);
+                }
             })
             .process(|stream, st| {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -495,6 +593,19 @@ fn run_pipewire(
                 let Some(pixel) = st.pixel else { return };
                 let size = st.format.size();
                 let (width, height) = (size.width as usize, size.height as usize);
+                // Where it changed, when the compositor says (read before the pixels).
+                let damage: Option<Vec<(u32, u32, u32, u32)>> = buffer
+                    .find_meta::<spa::buffer::meta::MetaVideoDamage>()
+                    .map(|d| {
+                        d.iter()
+                            .map(|r| {
+                                let (p, s) = (r.position(), r.size());
+                                let (x, y) = (p.x.max(0) as u32, p.y.max(0) as u32);
+                                (x, y, x.saturating_add(s.width), y.saturating_add(s.height))
+                            })
+                            .collect()
+                    })
+                    .filter(|rects: &Vec<_>| !rects.is_empty());
                 let datas = buffer.datas_mut();
                 let Some(data) = datas.first_mut() else {
                     return;
@@ -507,19 +618,40 @@ fn run_pipewire(
                 if bytes.len() < needed || width == 0 || height == 0 {
                     return;
                 }
-                if st.first {
+                let first = st.first;
+                if first {
                     st.first = false;
                     info!("screen {}: first frame", st.id);
                 }
+                let display = st.id as u32;
+                match damage {
+                    // How the display looks, not a change.
+                    _ if first => crate::damage::note(display, (width, height), &[]),
+                    Some(rects) => crate::damage::note(display, (width, height), &rects),
+                    // Compared only while an agent is looking: it reads the whole frame.
+                    None if crate::damage::wanted(display) => {
+                        if let Some(rects) = st.differ.diff(width, height, stride, &bytes[offset..needed]) {
+                            crate::damage::note(display, (width, height), &rects);
+                        }
+                    }
+                    None => {
+                        st.differ = Default::default();
+                        crate::damage::note_all(display, (width, height));
+                    }
+                }
+                let captured_us = now_us();
+                let mut pixels = st.tx.0.buffer();
+                pixels.clear();
+                pixels.extend_from_slice(&bytes[offset..needed]);
                 let frame = Frame {
                     width,
                     height,
                     stride,
                     format: pixel,
-                    data: bytes[offset..needed].to_vec(),
+                    data: pixels,
                 };
-                // Encoder busy: drop this frame rather than queue latency.
-                let _ = st.tx.try_send((frame, now_us()));
+                // Replaces a frame the encoder hasn't started on: it always gets the newest.
+                st.tx.0.put(frame, captured_us);
             })
             .register()?;
 
@@ -535,6 +667,34 @@ fn run_pipewire(
     }
     mainloop.run();
     Ok(())
+}
+
+/// Damage regions with each buffer (SPA_META_VideoDamage), up to 16 a frame.
+fn damage_params() -> Vec<u8> {
+    use spa::pod::{ChoiceValue, Object, Property, Value};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id, SpaTypes};
+    // SPA_PARAM_META_type and SPA_PARAM_META_size (spa/param/buffers.h).
+    const META_TYPE: u32 = 1;
+    const META_SIZE: u32 = 2;
+    let region = std::mem::size_of::<spa::sys::spa_meta_region>() as i32;
+    let obj = Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            Property::new(META_TYPE, Value::Id(Id(spa::sys::SPA_META_VideoDamage))),
+            Property::new(
+                META_SIZE,
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range { default: region * 16, min: region, max: region * 16 },
+                ))),
+            ),
+        ],
+    };
+    spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+        .expect("serialize meta pod")
+        .0
+        .into_inner()
 }
 
 /// Accept 32-bit RGB formats in shared memory (no DMA-BUF modifiers offered, so the
@@ -618,6 +778,10 @@ impl VideoSource for Video {
                 *m.latest.lock().unwrap() = None;
             }
         }
+    }
+    /// Every shared monitor is captured all the time; frames say (or show) what changed.
+    fn track_damage(&self, id: u32) -> bool {
+        self.monitors.lock().unwrap().as_ref().is_some_and(|m| (id as usize) < m.len())
     }
     fn picture(&self, id: u32, max: [u32; 2]) -> Option<crate::lossless::RawFrame> {
         *THUMBS_UNTIL.lock().unwrap() = Some(std::time::Instant::now() + Duration::from_secs(10));

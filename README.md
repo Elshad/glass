@@ -22,6 +22,7 @@
   <a href="https://glassdesk.dev">Website</a> ·
   <a href="https://glassdesk.dev/docs">Docs</a> ·
   <a href="https://glassdesk.dev/features">Features</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
   <a href="#faq">FAQ</a>
 </p>
 
@@ -52,10 +53,10 @@ And the viewer is just a web page. No app to install, no account to create.
 - **Steady on bad Wi-Fi.** Adapts bitrate, reconnects after sleep or tab suspension, never shows a corrupted frame, and asks for a smaller picture when your device struggles.
 
 ### Control
-- **Full control.** Mouse, trackpad, keyboard, touch and pinch to zoom, or trackpad mode on a phone (drag the pointer, the zoomed view follows it). ⌘Tab works on iPad. Unlock a locked Mac from the lock screen.
+- **Full control.** Mouse, trackpad, keyboard, touch and pinch to zoom, or trackpad mode on a phone (drag the pointer, the zoomed view follows it). ⌘Tab works on iPad. Unlock a locked Mac from the lock screen, even a MacBook with its lid closed (`glass config lid-awake on`, while it's plugged in).
 - **Apple Pencil.** Pressure and tilt reach the Mac as tablet input, so drawing apps respond as they do to a drawing tablet.
 - **Keyboards per machine.** ⌘↔Ctrl, PC-keyboard and ⌘/⌥ swaps remembered for each computer, and a shortcut bar for touch screens.
-- **Games.** Capture the mouse (relative motion) for games and 3D apps; game controllers reach Linux hosts.
+- **Games.** Capture the mouse (relative motion) for games and 3D apps; game controllers reach Linux hosts, and Windows hosts with the free ViGEmBus driver.
 - **Every machine.** All your computers in one menu; wake sleeping ones (Wake-on-LAN), restart Glass or the whole computer and reconnect.
 
 ### Between your devices
@@ -78,12 +79,12 @@ And the viewer is just a web page. No app to install, no account to create.
 - **Your computers, at one address.** Sign in at glassdesk.dev/computers with a passkey (no email, no password) to see which of your computers are online and open any of them from any device. `glass account add` puts a computer there; the account only lists computers, so getting in still takes the computer's own sign-in.
 
 ### AI agents
-- **Let an agent drive, supervised.** `glass mcp` gives Claude Code (or any MCP client) the screens, pointer and keyboard of every computer on your tailnet running Glass. Add it to Claude Code, Claude Desktop or Cursor in one click from the Mac app. You watch every step, pause or stop it, approve anything risky from your phone, and hand it a 2FA code when it's stuck.
+- **Let an agent drive, supervised.** `glass mcp` gives Claude Code (or any MCP client) the screens, pointer and keyboard of every computer on your tailnet running Glass. On a Mac it can also read an app's window as text and press buttons or fill in fields through Accessibility, without moving your pointer. Add it to Claude Code, Claude Desktop or Cursor in one click from the Mac app. You watch every step, pause or stop it, approve anything risky from your phone, and hand it a 2FA code when it's stuck.
 - **Agents from anywhere.** An agent on Vercel, in claude.ai or on a server asks to use your computer through standard MCP sign-in (works with Vercel Connect). You approve it once with one tap; then it works with no prompts, can't touch passwords or security settings, waits while you're using the computer, and every step is logged. Revoke it any time.
 - **Agent-ready setup.** Ask Claude Code to "set up Glass on my Mac mini" and it does it over SSH ([skill](#set-up-with-an-ai-agent)).
 
 ### The Mac app, the console and the command line
-- **A real Mac app.** Glass.app does everything the CLI does in a native, GPU-drawn window: setup in a few clicks, who's connected and chat, links with QR codes, machines, history, AI agents, settings and teams, and a one-click update.
+- **A real desktop app.** Glass.app on a Mac, and Glass in the Start menu on Windows, does everything the CLI does in a native, GPU-drawn window: setup in a few clicks, who's connected and chat, links with QR codes, machines, history, AI agents, settings and teams, and a one-click update.
 - **A console.** `https://<computer>/admin/`: who's connected, requests to allow, links, devices, history, settings, access rules, and an address book of your machines.
 - **Beyond the desktop.** Stream a single app's window, a resizable full-screen terminal in the viewer, local web ports (`/fwd/3000/`) from your tailnet, and recording to MP4.
 
@@ -108,7 +109,8 @@ And the viewer is just a web page. No app to install, no account to create.
 **Host** (the computer you control):
 
 - macOS 13 Ventura or newer, Apple Silicon or Intel.
-- Linux x86_64 on Wayland with PipeWire (beta). Built on Hyprland/Omarchy; works on GNOME and KDE. Arch, Fedora 40+, Ubuntu 24.04+.
+- Linux (x86_64 or ARM64) on Wayland with PipeWire (beta). Built on Hyprland/Omarchy; works on GNOME and KDE. Arch, Fedora 40+, Ubuntu 24.04+.
+  Video is encoded in software (OpenH264), so the ~20 ms above is the Mac figure. A build with `--features vaapi` (needs the GStreamer libraries) can encode on an Intel or AMD GPU instead: set `GLASS_ENCODER=vaapi` for the service.
 
 ```sh
 curl -fsSL glassdesk.dev | sh   # installs to ~/.glass, verifies the checksum, opens the Glass app to set up
@@ -151,7 +153,8 @@ glass acl add @example.com                     # wins: email, @domain, group:nam
 glass acl / glass acl remove 0                 # list; remove by position
 glass config scim-token new   # SCIM provisioning at https://<computer>/scim/v2 (Okta, Entra ID):
                          # deactivated users can't sign in and lose their sessions
-glass config             # settings: ask-guests, record, privacy, hevc, forward-ports, name, accent, relay…
+glass config             # settings: ask-guests, record, privacy, hevc, forward-ports, bind, name, accent, relay…
+                         # bind: listen addresses (default 0.0.0.0). On macOS, port 443 needs the default or 0.0.0.0.
 glass mcp                # MCP server: an AI agent uses this computer while you watch
                          # (claude mcp add glass -- glass mcp; --machine mac-mini for another)
 glass agents             # agents from anywhere: list, revoke ID|all, install CLIENT, log, verify,
@@ -212,7 +215,7 @@ Found a security issue? Please open a [private security advisory](https://github
 
 **Do I need an app on the iPad?** No, just Safari. Tailscale is optional when you use `glass link --anywhere`.
 
-**Can Windows be the host?** Not yet. Windows works as a viewer in any modern browser.
+**Can Windows be the host?** Yes, in beta: Windows 10 or 11, x64 or Arm. In PowerShell, `irm glassdesk.dev/install.ps1 | iex`. See [Windows host](https://glassdesk.dev/docs#windows-host-beta).
 
 **Can I control a locked Mac?** Yes, type your password at the lock screen. After a reboot, FileVault still needs one local login.
 
@@ -245,6 +248,10 @@ cd site && npm install && npm run dev       # site locally (wrangler dev)
 Issues and pull requests are welcome. For anything bigger than a fix, open an issue first so we can agree on the approach. Feedback also works from the app (`glass feedback "…"`) or at [glassdesk.dev](https://glassdesk.dev/features#feedback).
 
 If Glass is useful to you, a ⭐ helps other people find it.
+
+## Code signing policy
+
+Releases are signed in GitHub Actions from this repository's source; Windows signing is being set up through SignPath Foundation. See the [code signing policy](https://glassdesk.dev/docs#code-signing-policy).
 
 ## License
 

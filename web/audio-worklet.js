@@ -1,4 +1,5 @@
-// Plays 48 kHz s16 interleaved PCM packets posted by worker.js through this node's port.
+// Plays 48 kHz audio posted by worker.js through this node's port: s16 interleaved PCM
+// packets, or float planes (Opus, decoded by WebCodecs).
 // Keeps a small jitter buffer: starts once TARGET is queued, trims back to TARGET if the
 // queue grows past MAX (so latency can't creep up), and re-primes after an underrun.
 
@@ -16,7 +17,10 @@ class GlassAudio extends AudioWorkletProcessor {
     this.playing = false;
     this.step = SOURCE_RATE / sampleRate; // source frames per output frame
     this.underruns = 0;
-    this.port.onmessage = ({ data }) => this.push(new Int16Array(data.pcm), data.channels);
+    this.port.onmessage = ({ data }) => {
+      if (data.planes) this.pushPlanes(data.planes);
+      else this.push(new Int16Array(data.pcm), data.channels);
+    };
   }
 
   queued() {
@@ -31,6 +35,19 @@ class GlassAudio extends AudioWorkletProcessor {
       this.channels[0][i] = left;
       this.channels[1][i] = channels > 1 ? pcm[f * channels + 1] / 32768 : left;
     }
+    this.wrote(frames);
+  }
+
+  pushPlanes([left, right = left]) {
+    for (let f = 0; f < left.length; f++) {
+      const i = (this.write + f) % CAPACITY;
+      this.channels[0][i] = left[f];
+      this.channels[1][i] = right[f];
+    }
+    this.wrote(left.length);
+  }
+
+  wrote(frames) {
     this.write += frames;
     const max = (MAX_MS / 1000) * SOURCE_RATE;
     if (this.queued() > max) this.read = this.write - (TARGET_MS / 1000) * SOURCE_RATE;

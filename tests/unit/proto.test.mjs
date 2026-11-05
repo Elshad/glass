@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  fletcher16, inputEvent, penEvent, Input, INPUT_EVENT_LEN, ping, readPong, readVideoHeader, KIND_PING, KIND_PONG, VIDEO_HEADER_LEN,
+  fletcher16, inputEvent, penEvent, textEvents, Input, INPUT_EVENT_LEN, MAX_TEXT_BYTES, TEXT_CHUNK, ping, readPong, readVideoHeader, KIND_PING, KIND_PONG, VIDEO_HEADER_LEN, readCursor, KIND_CURSOR, CURSOR_VISIBLE, CURSOR_YOURS, frameAck, KIND_FRAME_ACK, nack,
 } from '../../web/proto.js';
 
 test('fletcher16 matches the Rust implementation', () => {
@@ -67,6 +67,16 @@ test('mic packets match the host audio layout', async () => {
   assert.ok(micPacket(0, 0, 1, new Int16Array(240)).length <= 1200);
 });
 
+test('opus audio datagrams match glass_proto::opus_packet', async () => {
+  const { readAudioHeader, KIND_AUDIO_OPUS, KIND_AUDIO, KIND_MIC, AUDIO_HEADER_LEN } = await import('../../web/proto.js');
+  assert.equal(KIND_AUDIO_OPUS, 7);
+  assert.equal(new Set([KIND_AUDIO, KIND_MIC, KIND_AUDIO_OPUS, KIND_PING, KIND_PONG]).size, 5);
+  // Same bytes as the Rust test opus_packet_layout.
+  const p = new Uint8Array([7, 2, 0, 0, 0xd4, 0xc3, 0xb2, 0xa1, 0x87, 0xd6, 0x12, 0, 0, 0, 0, 0, 0xfc, 1, 2, 3]);
+  assert.deepEqual(readAudioHeader(new DataView(p.buffer)), { kind: KIND_AUDIO_OPUS, channels: 2, seq: 0xa1b2c3d4, captureUs: 1234567 });
+  assert.deepEqual([...p.subarray(AUDIO_HEADER_LEN)], [0xfc, 1, 2, 3]);
+});
+
 test('gamepad events carry pad, index and value', () => {
   const e = inputEvent(Input.PAD_AXIS, { button: 2, keycode: 3, a: -0.5 });
   const v = new DataView(e.buffer);
@@ -84,4 +94,58 @@ test('pen events match glass_proto::InputEvent::Pen byte for byte', () => {
   const c = penEvent({ near: false, pressure: 3, tiltX: 200, tiltY: -200 });
   assert.deepEqual([...c.slice(0, 4)], [11, 0, 90, 0xa6]);
   assert.equal(new DataView(c.buffer).getFloat32(4, true), 1);
+});
+
+test('text events match glass_proto::text_events', () => {
+  const [e] = textEvents('é!');
+  // Same bytes as text_wire_layout in crates/glass-proto.
+  assert.deepEqual([...e.slice(0, 5)], [12, 0x80 | 3, 0xc3, 0xa9, 0x21]);
+  assert.ok(e.slice(5).every((b) => b === 0));
+  assert.equal(e.length, INPUT_EVENT_LEN);
+  assert.deepEqual(textEvents(''), []);
+});
+
+test('text events hold whole characters and put back together', () => {
+  const dec = new TextDecoder('utf-8', { fatal: true });
+  const join = (events) => {
+    const pieces = [];
+    let bytes = [];
+    for (const e of events) {
+      assert.equal(e[0], Input.TEXT);
+      const len = e[1] & 0x7f;
+      assert.ok(len <= TEXT_CHUNK);
+      dec.decode(e.slice(2, 2 + len)); // throws if a character was split
+      bytes.push(...e.slice(2, 2 + len));
+      if (e[1] & 0x80) { pieces.push(dec.decode(new Uint8Array(bytes))); bytes = []; }
+    }
+    return pieces;
+  };
+  for (const t of ['日本語の入力', '👍🏽 ok', '한국어', 'café', '0123456789']) assert.deepEqual(join(textEvents(t)), [t]);
+  assert.equal(textEvents('😀😀😀').length, 2);
+  const long = 'é'.repeat(MAX_TEXT_BYTES);
+  const pieces = join(textEvents(long));
+  assert.ok(pieces.length >= 2 && pieces.every((p) => new TextEncoder().encode(p).length <= MAX_TEXT_BYTES));
+  assert.equal(pieces.join(''), long);
+});
+
+test('cursor positions match glass_proto::CursorPos byte for byte', () => {
+  // Same bytes as the Rust test cursor_roundtrip_and_layout.
+  const b = new Uint8Array(16);
+  b.set([KIND_CURSOR, 1, CURSOR_VISIBLE | CURSOR_YOURS, 0, 7, 0, 0, 0]);
+  const v = new DataView(b.buffer);
+  v.setFloat32(8, 0.25, true);
+  v.setFloat32(12, 0.5, true);
+  assert.deepEqual(readCursor(v), { stream: 1, flags: 3, shape: 7, x: 0.25, y: 0.5 });
+});
+
+test('frame acks are kind 8, stream, two spare bytes, then the frame id', () => {
+  // Same bytes as glass_proto::frame_ack(2, 0xdeadbeef).
+  assert.equal(KIND_FRAME_ACK, 8);
+  assert.deepEqual([...frameAck(2, 0xdeadbeef)], [8, 2, 0, 0, 0xef, 0xbe, 0xad, 0xde]);
+});
+
+test('nacks match glass_proto::nack byte for byte', () => {
+  // Same bytes as nack_layout in crates/glass-proto.
+  assert.deepEqual([...nack(2, 0xa1b2c3d4, [1, 0x0203])], [10, 2, 2, 0, 0xd4, 0xc3, 0xb2, 0xa1, 1, 0, 3, 2]);
+  assert.deepEqual([...nack(0, 7)], [10, 0, 0, 0, 7, 0, 0, 0]);
 });

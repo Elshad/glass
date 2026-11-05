@@ -4,7 +4,7 @@
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme, Sizable, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Disableable, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -187,9 +187,7 @@ impl GlassApp {
                 theme.warning,
                 if tailnet == Tailnet::NotRunning { "Tailscale isn't running" } else { "Tailscale is signed out" },
                 "Open Tailscale and sign in to reach this computer from your devices.",
-                Button::new("open-ts").small().label("Open Tailscale").on_click(|_, _, _| {
-                    let _ = std::process::Command::new("open").args(["-a", "Tailscale"]).spawn();
-                }),
+                Button::new("open-ts").small().label("Open Tailscale").on_click(|_, _, _| actions::open_tailscale()),
                 cx,
             )),
             Tailnet::NoHttps(_) => fixes.push(ui::icon_row(
@@ -250,8 +248,11 @@ impl GlassApp {
                 I::EyeOff,
                 theme.primary,
                 "Privacy screen",
-                if snap.viewers.is_empty() { "Blank this screen while you're connected (applies to the next session)." } else { "Blank this screen right now, while you're connected." },
-                Switch::new("privacy").checked(if snap.viewers.is_empty() { s.privacy } else { snap.privacy }).on_click({
+                ui::managed(
+                    if snap.viewers.is_empty() { "Blank this screen while you're connected (applies to the next session)." } else { "Blank this screen right now, while you're connected." },
+                    snap.policy.locked("privacy"),
+                ),
+                Switch::new("privacy").checked(if snap.viewers.is_empty() { s.privacy } else { snap.privacy }).disabled(snap.policy.locked("privacy")).on_click({
                     let live = !snap.viewers.is_empty();
                     move |on: &bool, window, cx| {
                         let on = *on;
@@ -264,8 +265,8 @@ impl GlassApp {
                 I::Hand,
                 theme.primary,
                 "Ask before guests connect",
-                "Someone with a link waits until you allow them, here or in the menu bar.",
-                Switch::new("ask-guests").checked(s.ask_guests).on_click(|on: &bool, window, cx| {
+                ui::managed(format!("Someone with a link waits until you allow them, here or in the {}.", super::ICON_PLACE), snap.policy.locked("ask-guests")),
+                Switch::new("ask-guests").checked(s.ask_guests).disabled(snap.policy.locked("ask-guests")).on_click(|on: &bool, window, cx| {
                     let v = if *on { "on" } else { "off" };
                     act(window, cx, move || actions::set_setting("ask-guests", v))
                 }),
@@ -275,8 +276,8 @@ impl GlassApp {
                 I::Globe,
                 theme.primary,
                 "Reach from anywhere",
-                "Links can work outside your tailnet, end-to-end encrypted, with no open ports.",
-                Switch::new("remote").checked(snap.remote).on_click(|on: &bool, window, cx| {
+                ui::managed("Links can work outside your tailnet, end-to-end encrypted, with no open ports.", snap.policy.locked("remote")),
+                Switch::new("remote").checked(snap.remote).disabled(snap.policy.locked("remote")).on_click(|on: &bool, window, cx| {
                     let on = *on;
                     act(window, cx, move || actions::set_remote(on))
                 }),
@@ -294,14 +295,18 @@ impl GlassApp {
                 cx,
             ),
         ];
-        // Until it's installed: your devices' microphones on this Mac need a driver.
+        // Until it's installed: your devices' microphones on this computer need a driver.
         let mut quick = quick;
         if snap.mic.is_none() {
             quick.push(ui::icon_row(
                 I::Mic,
                 theme.primary,
                 "Microphone from your devices",
-                "Talk into this Mac's apps from your iPad or phone. Needs a small audio driver.",
+                if cfg!(windows) {
+                    "Talk into this computer's apps from your iPad or phone. Needs VB-CABLE, a free virtual audio cable."
+                } else {
+                    "Talk into this Mac's apps from your iPad or phone. Needs a small audio driver."
+                },
                 Button::new("home-install-mic")
                     .small()
                     .icon(I::Download)

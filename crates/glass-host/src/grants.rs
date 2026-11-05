@@ -59,6 +59,34 @@ pub const PROTECTED_APPS: &[&str] = &[
     "com.keepassxc.keepassxc",
     "com.apple.ScreenSharing",
     "dev.glassdesk.app",
+    // Windows, by executable (see platform::convert::app_id).
+    "cmd",
+    "powershell",
+    "powershell_ise",
+    "pwsh",
+    "windowsterminal",
+    "openconsole",
+    "conhost",
+    "wsl",
+    "wslhost",
+    "bash",
+    "regedit",
+    "mmc",
+    "taskmgr",
+    "systemsettings",
+    "sechealthui",
+    "consent",
+    "credentialuibroker",
+    "logonui",
+    "lockapp",
+    "mstsc",
+    "1password",
+    "bitwarden",
+    "keepass",
+    "keepassxc",
+    "glass",
+    "glassw",
+    "glass-host",
 ];
 
 /// System UI that takes input without being an app's window: an agent limited to some
@@ -70,6 +98,13 @@ pub const SYSTEM_UI: &[&str] = &[
     "com.apple.dock",
     "com.apple.systemuiserver",
     "com.apple.WindowManager",
+    // Windows: the taskbar, desktop and Start, search and notifications.
+    "explorer",
+    "startmenuexperiencehost",
+    "searchhost",
+    "searchapp",
+    "shellexperiencehost",
+    "shellhost",
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -191,12 +226,17 @@ fn audit_path() -> PathBuf {
     crate::config_dir().join("agent-audit.jsonl")
 }
 
+/// The store, with `enabled` as a policy says if one does (update() keeps the owner's).
 pub fn load() -> Store {
-    read().unwrap_or_else(|e| {
+    let mut store = read().unwrap_or_else(|e| {
         tracing::warn!("agents: can't read {}: {e:#}", path().display());
         // Unreadable: nothing is allowed (an empty store), and update() won't overwrite it.
         Store { enabled: false, ..Default::default() }
-    })
+    });
+    if let Some(on) = crate::policy::load().flag("agents") {
+        store.enabled = on;
+    }
+    store
 }
 
 fn read() -> Result<Store> {
@@ -392,6 +432,7 @@ pub fn app_token(client: &Client, domain: &str) -> Result<(Grant, Issued)> {
 /// Agents from other devices on or off. Off also stops publishing them with Funnel, since
 /// nothing there would answer; grants are kept for when they're back on.
 pub fn set_enabled(on: bool) -> Result<()> {
+    crate::policy::load().check("agents", if on { "on" } else { "off" })?;
     let published = update(|s| {
         s.enabled = on;
         s.public
@@ -725,12 +766,14 @@ pub fn current() -> Actor {
     ACTOR.try_with(Actor::clone).unwrap_or(Actor::Owner)
 }
 
-/// Where input is about to go: a point (global, in points) for the pointer, or wherever the
-/// keyboard is.
+/// Where input is about to go: a point (global, in points; pixels on Windows) for the
+/// pointer, wherever the keyboard is, or an app's element pressed through Accessibility
+/// (by process id).
 #[derive(Debug, Clone, Copy)]
 pub enum Target {
     Point(f64, f64),
     Keys,
+    App(i32),
 }
 
 /// Before input reaches the computer: an agent under a grant drives only allowed apps (as
@@ -766,41 +809,42 @@ pub fn check_input(target: Target) -> Result<(), String> {
     Ok(())
 }
 
-/// The app input to `target` would reach (macOS bundle id).
+/// The app input to `target` would reach (macOS bundle id, or Windows executable name).
 pub fn target_app(target: Target) -> Option<String> {
     if crate::testmode::enabled() {
         return std::env::var("GLASS_TEST_FRONTMOST").ok();
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         match target {
             Target::Point(x, y) => crate::platform::front::app_at(x, y),
             Target::Keys => crate::platform::front::key_app(),
+            Target::App(pid) => crate::platform::front::bundle_of(pid),
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = target;
         None
     }
 }
 
-/// The app in front (macOS bundle id), for the audit log.
+/// The app in front (macOS bundle id, or Windows executable name), for the audit log.
 pub fn frontmost_app() -> Option<String> {
     if crate::testmode::enabled() {
         return std::env::var("GLASS_TEST_FRONTMOST").ok();
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         crate::platform::front::frontmost_app()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     None
 }
 
 /// Glass can tell which app input reaches (and keep agents out of protected ones) here.
 pub fn app_guard_available() -> bool {
-    cfg!(target_os = "macos") || crate::testmode::enabled()
+    cfg!(any(target_os = "macos", windows)) || crate::testmode::enabled()
 }
 
 /// Someone used this computer's own keyboard or mouse in the last few seconds.
@@ -808,24 +852,30 @@ pub fn local_input_recent() -> bool {
     if crate::testmode::enabled() {
         return std::env::var_os("GLASS_TEST_LOCAL_INPUT").is_some();
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         crate::platform::front::local_input_age().is_some_and(|age| age < 5.0)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     false
 }
 
-/// A password field has the keyboard.
+/// A password field has the keyboard (macOS secure input; on Windows, as the focused
+/// control says), or, on Linux, the session is locked (there's no telling which field has
+/// the keyboard, but a lock screen's is one).
 pub fn secure_input() -> bool {
     if crate::testmode::enabled() {
         return std::env::var_os("GLASS_TEST_SECURE_INPUT").is_some();
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         crate::platform::front::secure_input()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::session::locked()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     false
 }
 

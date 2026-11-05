@@ -1,7 +1,8 @@
 name: Host
 
 # One OS: build in the `ci` profile (Cargo.toml) and run the unit tests. The browser e2e suite
-# is not run here: run it locally with scripts/test.sh e2e. Called by ci.yml for macOS and Linux.
+# is not run here: run it locally with scripts/test.sh e2e. Called by ci.yml for macOS, Linux
+# and Windows.
 on:
   workflow_call:
     inputs:
@@ -17,7 +18,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev libclang-dev pkg-config nasm
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev libclang-dev pkg-config nasm libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+      # NASM gives OpenH264 its assembly (much faster encoding); it builds without it.
+      - if: runner.os == 'Windows'
+        run: |
+          choco install nasm --no-progress -y
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -27,6 +33,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --profile ci
       - run: cargo build --profile ci -p glass-host
+      # The optional VA-API encoder (GLASS_ENCODER=vaapi) builds and its unit tests pass
+      # (the GPU test is ignored: runners have no VA device).
+      - if: runner.os == 'Linux'
+        run: cargo test --profile ci -p glass-host --features vaapi
       # Glass Microphone (native/glass-mic): builds, and loads as an audio plug-in.
       - if: runner.os == 'macOS'
         run: |

@@ -48,7 +48,7 @@ An agent running anywhere (Vercel, claude.ai, ChatGPT, a server) asks to use you
 
 | Scope | Allows |
 |---|---|
-| `computer:view` | Screenshots, `wait_for_change`, `list_displays` |
+| `computer:view` | Screenshots, `snapshot`, `wait_for_change`, `record`, `list_displays` |
 | `computer:use` | Pointer and keyboard. Includes `computer:view`. |
 
 - No scope, or `*`, means both. A call outside the grant gets 403 `insufficient_scope` naming what's missing (MCP step-up).

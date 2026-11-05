@@ -24,6 +24,33 @@ unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
 
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    fn IOPMAssertionDeclareUserActivity(name: *const std::ffi::c_void, user_type: u32, id: *mut u32) -> i32;
+}
+
+/// kIOPMUserActiveLocal: what a person at the keyboard declares (the remote kind doesn't
+/// wake the display).
+const USER_ACTIVE_LOCAL: u32 = 0;
+
+/// Tells macOS someone is using the computer. Posted events alone don't count while the
+/// display sleeps, and the lock screen won't check a password until someone does: without
+/// this, typing the right password from a viewer fails as "incorrect". At most once a second.
+fn declare_user_active() {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    static ID: AtomicU32 = AtomicU32::new(0);
+    static AT: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    if now.saturating_sub(AT.swap(now, Ordering::Relaxed)) < 1000 {
+        return;
+    }
+    let name = objc2_core_foundation::CFString::from_str("Glass remote input");
+    let mut id = ID.load(Ordering::Relaxed);
+    // SAFETY: a valid CFString; the same assertion is updated each time.
+    unsafe { IOPMAssertionDeclareUserActivity((&*name as *const objc2_core_foundation::CFString).cast(), USER_ACTIVE_LOCAL, &mut id) };
+    ID.store(id, Ordering::Relaxed);
+}
+
 /// Without Accessibility permission, posted events are silently dropped.
 pub fn has_accessibility() -> bool {
     unsafe { AXIsProcessTrusted() }
@@ -41,8 +68,11 @@ fn contains(b: CGRect, p: CGPoint) -> bool {
 
 pub struct Injector {
     source: Option<CFRetained<CGEventSource>>,
-    /// Global bounds of each streamed display, indexed by stream number.
-    bounds: Vec<CGRect>,
+    /// The streamed displays, indexed by stream number. Their bounds are looked up as
+    /// they're used: a display we just added or mirrored settles a moment later.
+    displays: Vec<CGDirectDisplayID>,
+    /// A streamed window's global bounds, instead of the displays.
+    window: Option<CGRect>,
     pos: CGPoint,
     buttons: [bool; 3],
     flags: CGEventFlags,
@@ -52,6 +82,8 @@ pub struct Injector {
     delta: (i64, i64),
     /// A pen in proximity (Apple Pencil): mouse events carry its tablet data.
     pen: Option<Pen>,
+    /// Scrolling not sent yet, under a point (x, y): trackpads send fractions.
+    scroll: (f32, f32),
 }
 
 /// The pen's latest state, from `InputEvent::Pen`.
@@ -75,33 +107,43 @@ unsafe impl Send for Injector {}
 
 impl Injector {
     pub fn new(display: CGDirectDisplayID) -> Self {
-        let bounds = CGDisplayBounds(display);
         Self {
             source: CGEventSource::new(CGEventSourceStateID::HIDSystemState),
-            bounds: vec![bounds],
-            pos: bounds.origin,
+            displays: vec![display],
+            window: None,
+            pos: CGDisplayBounds(display).origin,
             buttons: [false; 3],
             flags: CGEventFlags(0),
             last_click: None,
             click_count: 1,
             delta: (0, 0),
             pen: None,
+            scroll: (0.0, 0.0),
         }
     }
 
     /// Retargets absolute mouse coordinates after the streamed displays change.
     pub fn set_displays(&mut self, displays: &[CGDirectDisplayID]) {
         self.release_all();
-        self.bounds = displays.iter().map(|&d| CGDisplayBounds(d)).collect();
+        self.displays = displays.to_vec();
+        self.window = None;
+    }
+
+    /// Global bounds of a stream (or the first one).
+    fn bounds(&self, stream: usize) -> Option<CGRect> {
+        if let Some(w) = self.window {
+            return Some(w);
+        }
+        self.displays.get(stream).or(self.displays.first()).map(|&d| CGDisplayBounds(d))
     }
 
     pub fn handle(&mut self, ev: InputEvent) {
         match ev {
             InputEvent::MouseMove { x, y, stream } => {
-                let Some(b) = self.bounds.get(stream as usize).or(self.bounds.first()) else {
+                let Some(b) = self.bounds(stream as usize) else {
                     return;
                 };
-                self.move_to(to_global(*b, x, y));
+                self.move_to(to_global(b, x, y));
             }
             InputEvent::MouseDown { button } | InputEvent::MouseUp { button } => {
                 let down = matches!(ev, InputEvent::MouseDown { .. });
@@ -128,12 +170,15 @@ impl Injector {
             }
             InputEvent::MouseMoveBy { dx, dy } => {
                 // Stay on the display the pointer is on (or the first streamed one).
-                let b = self
-                    .bounds
-                    .iter()
-                    .find(|b| contains(**b, self.pos))
-                    .or(self.bounds.first())
-                    .copied();
+                let b = match self.window {
+                    Some(w) => Some(w),
+                    None => self
+                        .displays
+                        .iter()
+                        .map(|&d| CGDisplayBounds(d))
+                        .find(|b| contains(*b, self.pos))
+                        .or_else(|| self.bounds(0)),
+                };
                 let Some(b) = b else { return };
                 let to = CGPoint {
                     x: (self.pos.x + dx as f64).clamp(b.origin.x, b.origin.x + b.size.width - 1.0),
@@ -144,18 +189,17 @@ impl Injector {
                 self.delta = (0, 0);
             }
             InputEvent::Scroll { dx, dy } => {
-                let ev = CGEvent::new_scroll_wheel_event2(
-                    self.source.as_deref(),
-                    CGScrollEventUnit::Pixel,
-                    2,
-                    -dy.round() as i32,
-                    -dx.round() as i32,
-                    0,
-                );
+                // DOM: +dy scrolls down; CG: +wheel scrolls up. Pixel units are points.
+                let Some((x, y)) = whole_points(&mut self.scroll, -dx, -dy) else { return };
+                let ev = CGEvent::new_scroll_wheel_event2(self.source.as_deref(), CGScrollEventUnit::Pixel, 2, y, x, 0);
+                // Continuous, as a trackpad's: apps scroll by exactly these points rather
+                // than treating each event as a wheel notch.
+                // Adapted from voxl (MIT, github.com/tembo/voxl): src/mac/input.rs.
+                CGEvent::set_integer_value_field(ev.as_deref(), CGEventField::ScrollWheelEventIsContinuous, 1);
                 self.post(ev);
             }
-            // Routed to crate::gamepad by the server, never here.
-            InputEvent::Gamepad { .. } => {}
+            // Routed to crate::gamepad by the server, never here; text goes to type_text.
+            InputEvent::Gamepad { .. } | InputEvent::Text { .. } => {}
             InputEvent::KeyDown { keycode } | InputEvent::KeyUp { keycode } => {
                 let down = matches!(ev, InputEvent::KeyDown { .. });
                 if let Some(flag) = modifier_flag(keycode) {
@@ -289,6 +333,7 @@ impl Injector {
 
     fn post(&self, ev: Option<CFRetained<CGEvent>>) {
         if let Some(ev) = ev {
+            declare_user_active();
             CGEvent::set_flags(Some(&ev), self.flags);
             // Lets privacy mode's event tap tell these from the local keyboard and mouse.
             CGEvent::set_integer_value_field(
@@ -309,6 +354,20 @@ fn to_global(b: CGRect, x: f32, y: f32) -> CGPoint {
         x: b.origin.x + x.clamp(0.0, 1.0) as f64 * b.size.width,
         y: b.origin.y + y.clamp(0.0, 1.0) as f64 * b.size.height,
     }
+}
+
+/// Adds a scroll to what's waiting in `acc` and takes the whole points out of it, keeping
+/// the fraction for next time; `None` while there's less than a point either way.
+fn whole_points(acc: &mut (f32, f32), dx: f32, dy: f32) -> Option<(i32, i32)> {
+    if !dx.is_finite() || !dy.is_finite() {
+        return None;
+    }
+    acc.0 += dx;
+    acc.1 += dy;
+    let (x, y) = (acc.0.trunc(), acc.1.trunc());
+    acc.0 -= x;
+    acc.1 -= y;
+    (x != 0.0 || y != 0.0).then_some((x as i32, y as i32))
 }
 
 /// DOM button numbering: 0 left, 1 middle, 2 right.
@@ -348,13 +407,13 @@ impl crate::media::InputSink for Injector {
         // `None`: set_displays already put the display bounds back.
         // No release here: the window may be moving because it's being dragged.
         if let Some([x, y, w, h]) = rect {
-            self.bounds = vec![CGRect {
+            self.window = Some(CGRect {
                 origin: CGPoint { x, y },
                 size: objc2_core_foundation::CGSize {
                     width: w,
                     height: h,
                 },
-            }];
+            });
         }
     }
     fn set_displays(&mut self, displays: &[u32]) {
@@ -387,4 +446,18 @@ mod tests {
         let edge = to_global(window, 1.5, -1.0);
         assert_eq!((edge.x, edge.y), (900.0, 50.0), "clamped to the window");
     }
+
+    #[test]
+    fn scroll_fractions_add_up_instead_of_vanishing() {
+        let mut acc = (0.0, 0.0);
+        // A slow trackpad: a third of a point a frame used to round to nothing, every time.
+        assert_eq!(whole_points(&mut acc, 0.0, 0.4), None);
+        assert_eq!(whole_points(&mut acc, 0.0, 0.4), None);
+        assert_eq!(whole_points(&mut acc, 0.0, 0.4), Some((0, 1)));
+        assert_eq!(whole_points(&mut acc, -2.5, 0.0), Some((-2, 0)));
+        assert_eq!(whole_points(&mut acc, -0.5, 0.0), Some((-1, 0)));
+        assert_eq!(whole_points(&mut acc, f32::NAN, 1.0), None);
+        assert!(acc.0.abs() < 1e-6 && (acc.1 - 0.2).abs() < 1e-5);
+    }
 }
+

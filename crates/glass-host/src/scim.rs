@@ -360,9 +360,8 @@ fn body_json(body: &[u8]) -> Result<Value, Response> {
 }
 
 fn new_id() -> String {
-    use std::io::Read;
     let mut b = [0u8; 16];
-    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+    let _ = crate::control::getrandom(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 

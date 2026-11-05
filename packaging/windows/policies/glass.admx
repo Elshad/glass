@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Glass policies for Group Policy and Intune (import as a custom ADMX). Each one is a
+     value under SOFTWARE\Policies\Glass, in HKLM (Computer Configuration) or HKCU (User
+     Configuration); the computer's wins. Keep in step with crates/glass-host/src/policy.rs. -->
+<policyDefinitions xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" revision="1.0" schemaVersion="1.0" xmlns="http://schemas.microsoft.com/GroupPolicy/2006/07/PolicyDefinitions">
+  <policyNamespaces>
+    <target prefix="glass" namespace="Glassdesk.Policies.Glass" />
+  </policyNamespaces>
+  <resources minRequiredRevision="1.0" />
+  <supportedOn>
+    <definitions>
+      <definition name="SUPPORTED_Glass" displayName="$(string.SUPPORTED_Glass)" />
+    </definitions>
+  </supportedOn>
+  <categories>
+    <category name="Glass" displayName="$(string.Glass)" />
+  </categories>
+  <policies>
+    <policy name="AskGuests" class="Both" displayName="$(string.AskGuests)" explainText="$(string.AskGuests_Explain)" key="SOFTWARE\Policies\Glass" valueName="AskGuests">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="AskEveryone" class="Both" displayName="$(string.AskEveryone)" explainText="$(string.AskEveryone_Explain)" key="SOFTWARE\Policies\Glass" valueName="AskEveryone">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="PrivacyScreen" class="Both" displayName="$(string.PrivacyScreen)" explainText="$(string.PrivacyScreen_Explain)" key="SOFTWARE\Policies\Glass" valueName="PrivacyScreen">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="ReachFromAnywhere" class="Both" displayName="$(string.ReachFromAnywhere)" explainText="$(string.ReachFromAnywhere_Explain)" key="SOFTWARE\Policies\Glass" valueName="ReachFromAnywhere">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="Agents" class="Both" displayName="$(string.Agents)" explainText="$(string.Agents_Explain)" key="SOFTWARE\Policies\Glass" valueName="Agents">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="Relay" class="Both" displayName="$(string.Relay)" explainText="$(string.Relay_Explain)" key="SOFTWARE\Policies\Glass" presentation="$(presentation.Relay)">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <elements>
+        <text id="Relay" valueName="Relay" required="true" maxLength="255" />
+      </elements>
+    </policy>
+    <policy name="GuestLinks" class="Both" displayName="$(string.GuestLinks)" explainText="$(string.GuestLinks_Explain)" key="SOFTWARE\Policies\Glass" valueName="GuestLinks">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="QuickSupport" class="Both" displayName="$(string.QuickSupport)" explainText="$(string.QuickSupport_Explain)" key="SOFTWARE\Policies\Glass" valueName="QuickSupport">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="FileTransfer" class="Both" displayName="$(string.FileTransfer)" explainText="$(string.FileTransfer_Explain)" key="SOFTWARE\Policies\Glass" valueName="FileTransfer">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="Clipboard" class="Both" displayName="$(string.Clipboard)" explainText="$(string.Clipboard_Explain)" key="SOFTWARE\Policies\Glass" valueName="Clipboard">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="Terminal" class="Both" displayName="$(string.Terminal)" explainText="$(string.Terminal_Explain)" key="SOFTWARE\Policies\Glass" valueName="Terminal">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+    <policy name="Updates" class="Both" displayName="$(string.Updates)" explainText="$(string.Updates_Explain)" key="SOFTWARE\Policies\Glass" valueName="Updates">
+      <parentCategory ref="Glass" />
+      <supportedOn ref="SUPPORTED_Glass" />
+      <enabledValue><decimal value="1" /></enabledValue>
+      <disabledValue><decimal value="0" /></disabledValue>
+    </policy>
+  </policies>
+</policyDefinitions>

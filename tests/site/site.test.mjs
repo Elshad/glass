@@ -130,7 +130,7 @@ const hasReleases = existsSync(join(SITE, 'public/releases/glass-latest-darwin-u
 test('release downloads are served with checksums and counted', { skip: !hasReleases && 'no release built (scripts/package.sh)' }, async () => {
   const before = await statsFor();
   const count = (s, kind) => s.downloads.find((d) => d.kind === kind)?.total ?? 0;
-  for (const platform of ['darwin-universal', 'linux-x86_64']) {
+  for (const platform of ['darwin-universal', 'linux-x86_64', 'linux-aarch64']) {
     const res = await get(`/releases/glass-latest-${platform}.tar.gz`);
     assert.equal(res.status, 200, platform);
     const sum = await (await get(`/releases/glass-latest-${platform}.tar.gz.sha256`)).text();
@@ -139,7 +139,7 @@ test('release downloads are served with checksums and counted', { skip: !hasRele
   await get('/install.sh');
   await new Promise((r) => setTimeout(r, 300));
   const after = await statsFor();
-  assert.equal(count(after, 'release') - count(before, 'release'), 2);
+  assert.equal(count(after, 'release') - count(before, 'release'), 3);
   assert.ok(count(after, 'script') > count(before, 'script'));
 });
 
@@ -178,6 +178,34 @@ test('a tarball too big for the site redirects to the GitHub release', async () 
   const pinned = await get('/releases/glass-9.9.9-linux-x86_64.tar.gz');
   assert.equal(pinned.headers.get('location'), 'https://github.com/Ntarasiuk/glass/releases/download/v9.9.9/glass-9.9.9-linux-x86_64.tar.gz');
   assert.equal((await get('/releases/nope.tar.gz')).status, 404);
+  const windows = await get('/releases/glass-9.9.9-windows-arm64.zip');
+  assert.equal(windows.headers.get('location'), 'https://github.com/Ntarasiuk/glass/releases/download/v9.9.9/glass-9.9.9-windows-arm64.zip');
+  // A pinned MSI the site doesn't have redirects; the latest is served as an asset when the
+  // build fetched it (CI does) and it fits Cloudflare's 25 MiB limit.
+  const pinnedMsi = await get('/releases/glass-9.9.9-windows-x86_64.msi');
+  assert.equal(pinnedMsi.headers.get('location'), 'https://github.com/Ntarasiuk/glass/releases/download/v9.9.9/glass-9.9.9-windows-x86_64.msi');
+  const msi = await get('/releases/glass-latest-windows-x86_64.msi');
+  if (msi.status === 302) {
+    assert.equal(msi.headers.get('location'), `https://github.com/Ntarasiuk/glass/releases/download/v${version}/glass-${version}-windows-x86_64.msi`);
+  } else {
+    assert.equal(msi.status, 200);
+  }
+});
+
+test('PowerShell gets Windows quick support at /help', async () => {
+  for (const res of [await get('/help.ps1'), await get('/help', 'Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.26100; en-US) PowerShell/7.5.0')]) {
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /Glass quick support for Windows/);
+  }
+});
+
+test('PowerShell gets the Windows installer', async () => {
+  for (const res of [await get('/install.ps1'), await get('/', 'Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.26100; en-US) PowerShell/7.5.0'), await get('/', 'Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.1')]) {
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /^text\/plain/);
+    assert.match(await res.text(), /Glass installer for Windows/);
+  }
+  assert.doesNotMatch(await (await get('/', 'Mozilla/5.0 (Windows NT 10.0) Chrome/130')).text(), /Glass installer for Windows/);
 });
 
 // ---- Quick support ----

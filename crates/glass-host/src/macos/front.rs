@@ -34,7 +34,7 @@ unsafe extern "C" {
 const HID_SYSTEM_STATE: i32 = 1;
 const ANY_INPUT: u32 = u32::MAX;
 
-fn bundle_of(pid: i32) -> Option<String> {
+pub fn bundle_of(pid: i32) -> Option<String> {
     NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
         .and_then(|a| a.bundleIdentifier())
         .map(|id| id.to_string())

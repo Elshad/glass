@@ -191,7 +191,7 @@ export function createDevice({ ui, push, control, log, input, screens, streams, 
     input.setPointerLocked(Boolean(document.pointerLockElement && screens.contains(document.pointerLockElement)));
   });
 
-  // ---- Send this device's clipboard when coming back (Chromium) ----
+  // ---- Send this device's clipboard when coming back ----
 
   let clipboardSync = storage((s) => s.getItem(CLIPBOARD_KEY)) === '1';
   let lastSent; // a fingerprint of the last clipboard sent, so an unchanged one isn't resent
@@ -218,9 +218,35 @@ export function createDevice({ ui, push, control, log, input, screens, streams, 
       log('info', 'clipboard sent on return', { length: clip.text.length, html: Boolean(clip.html), image: clip.image?.size });
     } catch {}
   }
-  addEventListener('focus', () => setTimeout(sendClipboard, 50));
-  // Chromium only: Safari asks with a Paste button every single time.
-  const clipboardSupported = Boolean(navigator.clipboard?.readText && navigator.userAgentData?.brands?.some((b) => b.brand === 'Chromium'));
+  // Chromium reads it by itself once allowed. Safari (and Firefox) read only in a tap, then
+  // show their own Paste button, so coming back offers that tap instead.
+  const silentRead = Boolean(navigator.clipboard?.readText && navigator.userAgentData?.brands?.some((b) => b.brand === 'Chromium'));
+  const tapRead = !silentRead && Boolean(navigator.clipboard?.read);
+  const clipboardSupported = silentRead || tapRead;
+  let offered = false;
+  function offerClipboard() {
+    if (!clipboardSync || !connected || offered || document.visibilityState !== 'visible') return;
+    offered = true;
+    setTimeout(() => { offered = false; }, 8000);
+    ui.toast({
+      text: 'Copied something here? Send it to the computer.',
+      icon: 'info',
+      timeout: 8000,
+      action: {
+        label: 'Send',
+        // read() has to start inside the tap; readClipboard calls it before its first await.
+        run: () => readClipboard().then((clip) => {
+          if (!clip.text && !clip.image) return;
+          lastSent = fingerprint(clip);
+          sendClip(clip);
+          log('info', 'clipboard sent after a tap', { length: clip.text.length, html: Boolean(clip.html), image: clip.image?.size });
+        }).catch((e) => log('info', `clipboard not sent: ${e.message ?? e}`)),
+      },
+    });
+  }
+  const comeBack = () => setTimeout(silentRead ? sendClipboard : offerClipboard, 50);
+  addEventListener('focus', comeBack);
+  if (tapRead) document.addEventListener('visibilitychange', comeBack);
 
   // ---- Pause while away (Idle Detection) ----
 
@@ -371,13 +397,13 @@ export function createDevice({ ui, push, control, log, input, screens, streams, 
       }));
     }
     if (clipboardSupported) {
-      items.push(ui.menuItem('Sync clipboard', 'when you switch back', {
+      items.push(ui.menuItem('Sync clipboard', silentRead ? 'when you switch back' : 'offers to when you switch back', {
         checked: clipboardSync,
         onSelect: async () => {
           clipboardSync = !clipboardSync;
           storage((s) => s.setItem(CLIPBOARD_KEY, clipboardSync ? '1' : '0'));
           // Ask for permission now, in the tap.
-          if (clipboardSync) await readClipboard().then((c) => { lastSent = fingerprint(c); }).catch(() => {});
+          if (clipboardSync && silentRead) await readClipboard().then((c) => { lastSent = fingerprint(c); }).catch(() => {});
           render();
         },
       }));

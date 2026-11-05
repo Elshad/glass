@@ -119,9 +119,46 @@ pub fn char_key(c: char) -> Option<(u16, bool)> {
     })
 }
 
+/// The key presses that type `c` on a US keyboard (with Shift if it needs it).
+pub fn char_events(c: char) -> Option<Vec<glass_proto::InputEvent>> {
+    use glass_proto::InputEvent::{KeyDown, KeyUp};
+    let (key, shift) = char_key(c)?;
+    let mut events = Vec::with_capacity(4);
+    if shift {
+        events.push(KeyDown { keycode: SHIFT });
+    }
+    events.extend([KeyDown { keycode: key }, KeyUp { keycode: key }]);
+    if shift {
+        events.push(KeyUp { keycode: SHIFT });
+    }
+    Some(events)
+}
+
+/// `text` as key presses on a US keyboard, for hosts that can't type text as is (Linux),
+/// and how many characters had no key and were left out.
+pub fn text_key_events(text: &str) -> (Vec<glass_proto::InputEvent>, usize) {
+    let mut missing = 0;
+    let mut events = Vec::new();
+    for c in text.chars() {
+        match char_events(c) {
+            Some(e) => events.extend(e),
+            None => missing += 1,
+        }
+    }
+    (events, missing)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_without_a_text_path_is_typed_key_by_key() {
+        use glass_proto::InputEvent::{KeyDown, KeyUp};
+        let (events, missing) = text_key_events("Aé");
+        assert_eq!(events, [KeyDown { keycode: SHIFT }, KeyDown { keycode: 0 }, KeyUp { keycode: 0 }, KeyUp { keycode: SHIFT }]);
+        assert_eq!(missing, 1);
+    }
 
     #[test]
     fn combos_put_modifiers_first() {

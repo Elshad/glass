@@ -347,7 +347,9 @@ test.describe('input', () => {
     await expect.poll(async () => (await host.input('scroll')).events.length).toBeGreaterThan(0);
     const { events } = await host.input();
     expect(events.some((e) => e.t === 'down' && e.button === 2)).toBeTruthy();
-    expect((await host.input('scroll')).events.reduce((sum, e) => sum + e.dy, 0)).toBeCloseTo(120, 0);
+    // In the host's desktop points: the 640-point display is shown at another size.
+    const shown = Math.min(box.width / 640, box.height / 360) * 640;
+    expect((await host.input('scroll')).events.reduce((sum, e) => sum + e.dy, 0)).toBeCloseTo(120 * 640 / shown, 0);
   });
 
   it('sends typed keys as Mac keycodes', async ({ page, host }) => {
@@ -358,6 +360,25 @@ test.describe('input', () => {
     await page.keyboard.press('KeyI');
     await expect.poll(() => keys(host, 'keyup')).toEqual([K.H, K.Shift, K.I]);
     expect(await keys(host, 'keydown')).toEqual([K.Shift, K.H, K.I]);
+  });
+
+  it('types IME, emoji and accented text as text, in order with keys', async ({ page, host }) => {
+    await open(page, host);
+    await host.clearInput();
+    await page.locator('#keys').focus();
+    await page.keyboard.insertText('café 👍');
+    // An IME settling on what was composed.
+    await page.evaluate(() => {
+      const sink = document.getElementById('keys');
+      sink.dispatchEvent(new CompositionEvent('compositionstart', { data: '' }));
+      sink.dispatchEvent(new CompositionEvent('compositionend', { data: '日本語' }));
+    });
+    // Plain ASCII still goes as keys.
+    await page.keyboard.insertText('i');
+    await expect.poll(() => keys(host, 'keyup')).toEqual([K.I]);
+    const { events } = await host.input();
+    const typed = events.filter((e) => e.t === 'text' || e.t === 'keydown').map((e) => e.text ?? e.keycode);
+    expect(typed).toEqual(['café 👍', '日本語', K.I]);
   });
 
   it('PC keyboard mode turns Ctrl into ⌘ and Super into Ctrl', async ({ page, host }) => {
@@ -533,6 +554,33 @@ test.describe('clipboard and files', () => {
     expect((await host.input()).pastes).toBe(1);
   });
 
+  it('focuses the hidden key field while ⌘ is down, so Safari fires paste', async ({ page, host }) => {
+    await open(page, host);
+    await page.locator('#screens').click();
+    expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('keys');
+    await page.keyboard.down('Meta');
+    expect(await page.evaluate(() => document.activeElement?.id)).toBe('keys');
+    await page.keyboard.up('Meta');
+    expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('keys');
+  });
+
+  it('offers to send the clipboard on return where reading it needs a tap (Safari)', async ({ page, host }) => {
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: host.base });
+    await page.addInitScript(() => {
+      // Look like Safari: no userAgentData, so the clipboard can't be read without a tap.
+      Object.defineProperty(Navigator.prototype, 'userAgentData', { get: () => undefined });
+      localStorage.setItem('glass.clipboardSync', '1');
+    });
+    await open(page, host);
+    await page.evaluate(() => navigator.clipboard.writeText('copied on the iPad'));
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    const toast = page.locator('.toast', { hasText: 'Send it to the computer' });
+    await expect(toast).toHaveCount(1);
+    await toast.getByRole('button', { name: 'Send' }).click();
+    await expect.poll(() => host.get('/test/clipboard')).toBe('copied on the iPad');
+    expect((await host.input()).pastes).toBe(0);
+  });
+
   // A 1×1 PNG.
   const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 
@@ -616,7 +664,11 @@ test.describe('audio', () => {
     await open(page, host);
     await expect(page.locator('#btn-audio')).toBeVisible();
     await toolbarClick(page, 'btn-audio');
-    await expect.poll(async () => (await stats(page)).audioPackets, { timeout: 10_000 }).toBeGreaterThan(150);
+    // Opus (10 ms packets) where WebCodecs decodes it, else PCM (5 ms).
+    await expect.poll(async () => (await stats(page)).audioPackets, { timeout: 10_000 }).toBeGreaterThan(75);
+    const { audioCodec, audioPackets } = await stats(page);
+    expect(audioPackets).toBeGreaterThan(audioCodec === 'opus' ? 75 : 150);
+    expect(['pcm', 'opus']).toContain(audioCodec);
   });
 });
 
@@ -639,20 +691,18 @@ test.describe('resilience', () => {
     expect(host.clientLog('decoder error detail')).toHaveLength(0);
   });
 
-  it('backs off the bitrate under loss, and a quiet stream does not climb back', async ({ page, host }) => {
+  it('a few lost frames recover without cutting the bitrate, and a quiet stream does not climb', async ({ page, host }) => {
     await open(page, host);
     const bps = async () => (await host.get('/test/bitrate')).bps;
-    const max = await bps();
+    const before = await bps();
     await host.post('/test/drop?frames=4');
-    await expect.poll(bps, { timeout: 5_000 }).toBeLessThan(max);
+    // This viewer acknowledges frames, so its rate follows the queue (ack_rate tests in
+    // flow.rs): isolated loss isn't congestion. What it needs is the picture going again.
+    await expect.poll(async () => (await stats(page)).fps, { timeout: 5_000 }).toBeGreaterThan(10);
     await expect(page.locator('#hud')).toContainText('target');
-    // The test pattern uses a sliver of its allowance: no loss, but no evidence the link
-    // could take more, so the rate holds (it rises only when used; see rate.rs tests).
-    await page.waitForTimeout(3000);
-    const low = await bps();
+    // The test pattern uses a sliver of its allowance: no evidence the link could take more.
     await page.waitForTimeout(4000);
-    // Never climbs back; on a loaded test machine real loss can push it lower still.
-    expect(await bps()).toBeLessThanOrEqual(low);
+    expect(await bps()).toBeLessThanOrEqual(before);
   });
 
   it('never decodes a corrupted frame', async ({ page, host }) => {

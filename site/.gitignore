@@ -5,6 +5,8 @@ public/releases
 public/app
 public/docs
 public/docs.md
+public/changelog
+public/changelog.md
 public/llms-full.txt
 public/skill.md
 public/version.json

@@ -19,6 +19,8 @@ const SUPPORT_CODES_PER_HOUR = 20;
 const SUPPORT_MISSES_PER_HOUR = 20;
 // Command-line fetchers get the install script at the bare domain (`curl glassdesk.dev | sh`).
 const CLI_AGENT = /^(curl|wget|fetch|httpie|python-requests|go-http-client)\b/i;
+// Invoke-RestMethod / Invoke-WebRequest: `irm glassdesk.dev | iex` gets the Windows installer.
+const POWERSHELL = /\b(Windows)?PowerShell\/\d/i;
 
 // Agent discovery on the home page: Link relations, and a markdown twin for Accept: text/markdown.
 const HOME_LINKS = [
@@ -80,12 +82,27 @@ export default {
 
     // An agent asking for markdown gets the page's markdown twin, even from curl; `curl … | sh` never asks.
     const wantsMarkdown = /\btext\/markdown\b/i.test(request.headers.get('accept') ?? '');
+    // Quick support on Windows: `irm glassdesk.dev/help | iex`.
+    if (url.pathname === '/help.ps1' || (url.pathname === '/help' && POWERSHELL.test(ua) && !wantsMarkdown)) {
+      ctx.waitUntil(recordDownload(env, request, 'script', 'help.ps1', 'quick_support'));
+      const res = await env.ASSETS.fetch(new URL('/help.ps1', url));
+      return new Response(res.body, {
+        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'strict-transport-security': HSTS },
+      });
+    }
     // Quick support: `curl glassdesk.dev/help | sh` runs Glass for one session, installing nothing.
     if (url.pathname === '/help.sh' || (url.pathname === '/help' && CLI_AGENT.test(ua) && !wantsMarkdown)) {
       ctx.waitUntil(recordDownload(env, request, 'script', 'help.sh', 'quick_support'));
       const res = await env.ASSETS.fetch(new URL('/help.sh', url));
       return new Response(res.body, {
         headers: { 'content-type': 'text/x-shellscript; charset=utf-8', 'cache-control': 'no-store', 'strict-transport-security': HSTS },
+      });
+    }
+    if (url.pathname === '/install.ps1' || (url.pathname === '/' && POWERSHELL.test(ua) && !wantsMarkdown)) {
+      ctx.waitUntil(recordDownload(env, request, 'script', 'install.ps1', 'install_script'));
+      const res = await env.ASSETS.fetch(new URL('/install.ps1', url));
+      return new Response(res.body, {
+        headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', 'strict-transport-security': HSTS },
       });
     }
     const wantsScript = url.pathname === '/install.sh' || (url.pathname === '/' && CLI_AGENT.test(ua) && !wantsMarkdown);
@@ -117,7 +134,7 @@ export default {
 
     if (url.pathname.endsWith('.mp4')) return ranged(await env.ASSETS.fetch(request), request);
 
-    if (url.pathname.startsWith('/releases/') && url.pathname.endsWith('.tar.gz')) {
+    if (url.pathname.startsWith('/releases/') && /\.(tar\.gz|zip|msi)$/.test(url.pathname)) {
       const name = url.pathname.slice('/releases/'.length);
       ctx.waitUntil(recordDownload(env, request, 'release', name, 'download'));
       const res = await env.ASSETS.fetch(request);
@@ -129,14 +146,14 @@ export default {
   },
 };
 
-/** A tarball kept only on GitHub: `glass-latest-*` means the version in version.json. */
+/** A tarball, zip or MSI kept only on GitHub: `glass-latest-*` means the version in version.json. */
 export async function releaseRedirect(env, url, name) {
   let file = name;
   if (file.startsWith('glass-latest-')) {
     const { version } = await (await env.ASSETS.fetch(new URL('/version.json', url))).json();
     file = file.replace('glass-latest-', `glass-${version}-`);
   }
-  const version = file.match(/^glass-(\d+\.\d+\.\d+)-[\w.-]+\.tar\.gz$/)?.[1];
+  const version = file.match(/^glass-(\d+\.\d+\.\d+)-[\w.-]+\.(tar\.gz|zip|msi)$/)?.[1];
   if (!version) return new Response('Not found', { status: 404 });
   return Response.redirect(`https://github.com/Ntarasiuk/glass/releases/download/v${version}/${file}`, 302);
 }

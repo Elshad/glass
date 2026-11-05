@@ -1,0 +1,12 @@
+# Plays a tone into one audio output and records an input, for the Windows VM tests
+# (Glass Microphone). Its own workspace: built for Windows by basics.vm.mjs when needed.
+[package]
+name = "micprobe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cpal = "0.15"
+
+[workspace]

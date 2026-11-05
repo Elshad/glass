@@ -105,6 +105,23 @@ it('an agent sees, clicks, types and asks, and the viewer steers it', async ({ p
   }
 });
 
+it('keys pressed into a password field reach it, but viewers and the log are not told which', async ({ page }) => {
+  const host = await new Host({ env: { GLASS_TEST_SECURE_INPUT: '1' } }).start();
+  const agent = mcp(host);
+  try {
+    await agent.rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } });
+    await page.goto(host.url());
+    await expectVideo(page);
+    await host.clearInput();
+    expect((await agent.tool('press_keys', { keys: 'n' })).isError).toBeFalsy();
+    expect((await host.input()).events.map((e) => [e.t, e.keycode])).toEqual([['keydown', 0x2d], ['keyup', 0x2d]]);
+    await expect(page.locator('#agent-label')).toContainText('a key, into a password field');
+  } finally {
+    agent.close();
+    await host.stop();
+  }
+});
+
 it('drives another machine on the tailnet by name', async ({ browser, host }) => {
   const other = await new Host({ env: { GLASS_TEST_TRUST_LOOPBACK: '1' } }).start();
   const machines = [
