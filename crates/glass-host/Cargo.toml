@@ -13,7 +13,7 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 cliclack = "0.5.6"
 console = "0.16.6"
-glass-proto = { version = "0.13.1", path = "../glass-proto" }
+glass-proto = { version = "0.14.0", path = "../glass-proto" }
 openh264 = "0.9"
 # Vendored libopus (BSD), built by cmake and linked statically: no system library needed.
 opus = "0.4"
