@@ -312,6 +312,7 @@ impl Encoder {
         let force_keyframe = self.force_keyframe.clone();
         let hevc = self.hevc;
         let (bytes, last_size) = (self.bytes.clone(), self.last_size.clone());
+        let force_keyframe = self.force_keyframe.clone();
         let handler = RcBlock::new(
             move |status: i32, _flags: VTEncodeInfoFlags, sample: *mut CMSampleBuffer| {
                 if status != 0 {
@@ -323,7 +324,9 @@ impl Encoder {
                     // A keyframe someone is waiting for (never seen dropped; see
                     // `vt_at_low_bitrates`) would be asked for again.
                     note_skipped_frame();
+                    // A keyframe someone is waiting for is asked for again.
                     if keyframe {
+                        tracing::info!("encoder dropped a keyframe; asking again");
                         force_keyframe.store(true, Ordering::Relaxed);
                     }
                     return;

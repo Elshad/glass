@@ -8,7 +8,10 @@
 
 import { createSocket } from 'node:dgram';
 
-const [listen, target, mbps, rtt, lossPct = '0', queueMs = '200'] = process.argv.slice(2);
+const [listen, target, mbps, rtt, lossPct = '0', queueMs = '200', jitterMs = '0', bigOver = '0', bigLossPct = '0'] = process.argv.slice(2);
+const big = Number(bigOver); // packets over this many bytes are lost at bigLossPct: a path that
+const bigLoss = Number(bigLossPct) / 100; // lets some through, so packets grow, then loses them
+const jitter = Number(jitterMs); // up to this much extra delay per packet, so they reorder
 if (!target) {
   console.error('usage: udpshaper.mjs <listen> <target> <mbps> <rtt_ms> [loss_pct] [queue_ms]');
   process.exit(2);
@@ -30,8 +33,11 @@ function line(send) {
     if (queue.length) timer = setTimeout(pump, Math.max(0, queue[0].at - now));
   };
   return (bytes, at) => {
-    queue.push({ bytes, at });
-    if (!timer) timer = setTimeout(pump, Math.max(0, at - performance.now()));
+    let i = queue.length;
+    while (i > 0 && queue[i - 1].at > at) i--;
+    queue.splice(i, 0, { bytes, at });
+    if (i === 0 && timer) { clearTimeout(timer); timer = undefined; }
+    if (!timer) timer = setTimeout(pump, Math.max(0, queue[0].at - performance.now()));
   };
 }
 
@@ -55,12 +61,12 @@ function peer(address, port) {
       return;
     }
     if (bps) free = start + (bytes.length * 8 * 1000) / bps;
-    if (loss && Math.random() < loss) {
+    if ((loss && Math.random() < loss) || (big && bytes.length > big && Math.random() < bigLoss)) {
       counts.lossDrops++;
       return;
     }
     counts.down++;
-    down(bytes, (bps ? free : now) + delayMs);
+    down(bytes, (bps ? free : now) + delayMs + Math.random() * jitter);
   });
   back.bind(0, '127.0.0.1');
   p = { back, up };

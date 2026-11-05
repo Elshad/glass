@@ -31,6 +31,15 @@ export const LINKS = {
   phone: { mbps: 5, rtt: 288, loss: 0, queue: 3000 },
   phoneloss: { mbps: 5, rtt: 288, loss: 0.5, queue: 3000 },
   phoneslow: { mbps: 2, rtt: 288, loss: 0.5, queue: 3000 },
+  // A phone on cellular: fine when idle, but seconds of queue under load.
+  cell3: { mbps: 3, rtt: 70, loss: 1, queue: 2000 },
+  cell1: { mbps: 1, rtt: 70, loss: 1, queue: 2000 },
+  // As measured on an iPhone over Tailscale: long ping, and packets out of order.
+  phonejitter: { mbps: 3, rtt: 288, loss: 1, queue: 3000, jitter: 80 },
+  // A healthy Wi-Fi link whose large packets mostly don't survive (the tailnet's 1280 MTU).
+  bigloss: { mbps: 30, rtt: 40, loss: 0, queue: 500, bigOver: 1250, bigLoss: 75 },
+  phone0: { mbps: 3, rtt: 288, loss: 1, queue: 3000 },
+  phone1: { mbps: 1, rtt: 288, loss: 2, queue: 3000, jitter: 150 },
 };
 const WORKLOADS = ['anim', 'scroll', 'still', 'noise'];
 
@@ -153,7 +162,7 @@ export async function shape(o, link, port) {
     return { stop: async () => execFileSync('sudo', [join(ROOT, 'bench/shape.sh'), 'down'], { stdio: 'inherit' }) };
   }
   const listen = await freePort('udp');
-  const proc = spawn('node', [join(ROOT, 'bench/udpshaper.mjs'), String(listen), String(port), String(link.mbps), String(link.rtt), String(link.loss), String(link.queue ?? 200)], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const proc = spawn('node', [join(ROOT, 'bench/udpshaper.mjs'), String(listen), String(port), String(link.mbps), String(link.rtt), String(link.loss), String(link.queue ?? 200), String(link.jitter ?? 0), String(link.bigOver ?? 0), String(link.bigLoss ?? 0)], { stdio: ['ignore', 'pipe', 'inherit'] });
   let out = '';
   proc.stdout.on('data', (d) => { out += d; });
   for (let i = 0; i < 50 && !out.includes('udpshaper :'); i++) await sleep(50);

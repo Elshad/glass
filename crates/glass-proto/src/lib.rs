@@ -22,6 +22,10 @@ pub const KIND_PING: u8 = 2;
 pub const KIND_PONG: u8 = 3;
 pub const KIND_KEYFRAME_REQUEST: u8 = 4;
 pub const KIND_AUDIO: u8 = 5;
+/// client -> host: these fragments of a frame never arrived (see [`nack`]). host -> client,
+/// with no fragments: that frame is gone, stop waiting for it. (7 is Opus audio, 8 frame
+/// acks and 9 the cursor.)
+pub const KIND_NACK: u8 = 10;
 /// client -> host: the viewer's microphone, same layout as AUDIO (mono or stereo s16).
 pub const KIND_MIC: u8 = 6;
 /// host -> client: system audio as one Opus packet (48 kHz stereo), same 16-byte header as
@@ -115,6 +119,8 @@ pub const FLAG_HEVC: u8 = 2;
 /// A re-encode of a picture that hasn't changed (idle refinement, keyframe on request):
 /// a viewer showing a lossless refresh of it may keep that on top.
 pub const FLAG_REFRESH: u8 = 4;
+/// A fragment sent again because the viewer said it was lost.
+pub const FLAG_RETRANSMIT: u8 = 8;
 /// Upper nibble of `flags`: which display stream the frame belongs to.
 pub const STREAM_SHIFT: u8 = 4;
 pub const MAX_STREAMS: usize = 4;
@@ -161,6 +167,34 @@ impl VideoHeader {
             capture_us: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
         })
     }
+}
+
+/// kind u8 | stream u8 | count u16 | frame_id u32, then `count` fragment indices (u16).
+pub const NACK_HEADER_LEN: usize = 8;
+
+/// Asks for fragments of a frame again. No fragments: the whole frame (none of it arrived);
+/// from the host: that frame is gone.
+pub fn nack(stream: u8, frame_id: u32, fragments: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(NACK_HEADER_LEN + fragments.len() * 2);
+    out.push(KIND_NACK);
+    out.push(stream);
+    out.extend_from_slice(&(fragments.len() as u16).to_le_bytes());
+    out.extend_from_slice(&frame_id.to_le_bytes());
+    for f in fragments {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
+/// (stream, frame id, fragments) from a NACK datagram.
+pub fn read_nack(buf: &[u8]) -> Option<(u8, u32, Vec<u16>)> {
+    if buf.len() < NACK_HEADER_LEN || buf[0] != KIND_NACK {
+        return None;
+    }
+    let count = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+    let rest = buf.get(NACK_HEADER_LEN..NACK_HEADER_LEN + count * 2)?;
+    let fragments = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    Some((buf[1], u32::from_le_bytes(buf[4..8].try_into().ok()?), fragments))
 }
 
 /// Splits one encoded frame into datagrams no larger than `max_datagram`.
@@ -588,6 +622,19 @@ mod tests {
         assert_eq!(u32::from_le_bytes(p[4..8].try_into().unwrap()), 9);
         assert_eq!(u64::from_le_bytes(p[8..16].try_into().unwrap()), 77);
         assert_eq!(i16::from_le_bytes([p[18], p[19]]), 1);
+    }
+
+    #[test]
+    fn nack_layout() {
+        let n = nack(2, 0xA1B2_C3D4, &[1, 0x0203]);
+        // Same bytes as web/proto.js's nack test (tests/unit/proto.test.mjs).
+        assert_eq!(n, [KIND_NACK, 2, 2, 0, 0xD4, 0xC3, 0xB2, 0xA1, 1, 0, 3, 2]);
+        assert_eq!(read_nack(&n), Some((2, 0xA1B2_C3D4, vec![1, 0x0203])));
+        assert_eq!(read_nack(&nack(0, 7, &[])), Some((0, 7, vec![])));
+        // Says more fragments than it has; too short; another kind.
+        assert_eq!(read_nack(&n[..n.len() - 1]), None);
+        assert_eq!(read_nack(&n[..4]), None);
+        assert_eq!(read_nack(&[KIND_PING; 12]), None);
     }
 
     #[test]

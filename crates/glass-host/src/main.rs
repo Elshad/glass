@@ -57,6 +57,7 @@ mod rate;
 mod refresh;
 mod remote;
 mod resolution;
+mod retransmit;
 mod rtp;
 mod server;
 mod setup;

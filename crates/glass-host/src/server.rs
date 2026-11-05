@@ -11,7 +11,7 @@ use axum::Json;
 use axum::http::{HeaderValue, header};
 use axum::routing::{get, post};
 use glass_proto::{
-    INPUT_EVENT_LEN, InputEvent, KIND_KEYFRAME_REQUEST, KIND_MIC, KIND_PING, MAX_STREAMS,
+    INPUT_EVENT_LEN, InputEvent, KIND_KEYFRAME_REQUEST, KIND_MIC, KIND_NACK, KIND_PING, MAX_STREAMS,
 };
 use tokio::sync::{broadcast, mpsc};
 use tower_http::services::ServeDir;
@@ -337,8 +337,17 @@ fn wt_server_config(
             Ipv6DualStackConfig::Deny,
         ),
     };
+    // QUIC grows its window one round trip at a time from about 12 KB: on a phone's 300 ms,
+    // that alone takes a second to carry the first picture.
+    let mut transport = wtransport::config::QuicTransportConfig::default();
+    let mut cubic = wtransport::quinn::congestion::CubicConfig::default();
+    cubic.initial_window(QUIC_INITIAL_WINDOW);
+    transport.congestion_controller_factory(Arc::new(cubic));
+    // No growing packets: on cellular it would lose the large ones, then shrink back, and the
+    // fragments of a keyframe already sent could then never be sent again ("too large").
+    transport.mtu_discovery_config(None);
     let configured = builder
-        .with_identity(identity.clone_identity())
+        .with_custom_transport(identity.clone_identity(), transport)
         .keep_alive_interval(Some(Duration::from_secs(2)))
         .max_idle_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| WtBindError::Config(anyhow::anyhow!("WebTransport idle timeout: {err:?}")))?;
@@ -372,6 +381,11 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let authed = Arc::new(AtomicBool::new(false));
     let audio_tap = Arc::new(crate::opus_audio::AudioTap::default());
     let video_on = Arc::new(AtomicBool::new(true));
+    // Which streams this viewer has had a keyframe of: before that, nothing can be decoded.
+    let keyed = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    // Its screen's size is known (or waited for long enough). A keyframe before that is the
+    // wrong size: something else restarting the encoder as a viewer joins, say.
+    let sized = Arc::new(AtomicBool::new(false));
     let perms = Arc::new(std::sync::OnceLock::new());
     let mic_on = Arc::new(AtomicBool::new(false));
     // Draws the pointer itself (crate::cursor): gets its position as datagrams. Who it is
@@ -387,6 +401,10 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let mut next_frame_id = [0u32; MAX_STREAMS];
     // When this client last had a keyframe request honoured: [all streams, stream 0, …].
     let mut last_keyframe_request = [None::<std::time::Instant>; MAX_STREAMS + 1];
+    let session_started = std::time::Instant::now();
+    // Sent fragments, kept a moment for viewers that ask for lost ones again.
+    let mut sent_frames = crate::retransmit::SentFrames::default();
+    let nack_on = Arc::new(AtomicBool::new(false));
 
     // The page pings every 500 ms; a session that stops hearing from it is a page that's
     // gone (Safari can keep a dead page's connection alive), or one suspended in the
@@ -462,12 +480,24 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                     }
                     let Some(next_id) = next_frame_id.get_mut(frame.stream as usize) else { continue };
                     if authed.load(Ordering::Relaxed) && video_on.load(Ordering::Relaxed) {
+                        let bit = 1u8 << (frame.stream as usize).min(7);
+                        if keyed.load(Ordering::Relaxed) & bit == 0 {
+                            // The first display first: others wait for its first picture, then
+                            // their viewer asks for theirs.
+                            if !frame.keyframe || !sized.load(Ordering::Relaxed) || (frame.stream != 0 && keyed.load(Ordering::Relaxed) & 1 == 0) {
+                                *next_id = next_id.wrapping_add(1);
+                                continue;
+                            }
+                            keyed.fetch_or(bit, Ordering::Relaxed);
+                            info!("{peer}: first keyframe of stream {}: {} KB, {} ms after connecting", frame.stream, frame.data.len() / 1024, session_started.elapsed().as_millis());
+                        }
                         let now = std::time::Instant::now();
                         if acking.load(Ordering::Relaxed) {
                             link.expect_acks();
                         }
                         link.drained(datagrams_queued(&conn, datagram_capacity), now);
-                        let (id, bytes) = send_frame(&conn, &frame, next_id)?;
+                        let sent = nack_on.load(Ordering::Relaxed).then_some(&mut sent_frames);
+                        let (id, bytes) = send_frame(&conn, &frame, next_id, sent)?;
                         if bytes > 0 {
                             link.sent(frame.stream, id, bytes, now);
                         }
@@ -520,6 +550,24 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                                 shared.video.request_keyframe(stream);
                             }
                         }
+                        Some(&KIND_NACK) if authed.load(Ordering::Relaxed) => {
+                            if let Some((stream, id, fragments)) = glass_proto::read_nack(&dgram) {
+                                match sent_frames.again(stream, id, &fragments) {
+                                    Some(dgrams) => {
+                                        for d in dgrams {
+                                            // The path may have shrunk since it was first sent: the
+                                            // viewer gives up on it, and asks for a keyframe.
+                                            link.other(d.len());
+                                            if conn.send_datagram(d).is_err() {
+                                                conn.send_datagram(glass_proto::nack(stream, id, &[]))?;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    None => conn.send_datagram(glass_proto::nack(stream, id, &[]))?,
+                                }
+                            }
+                        }
                         Some(&KIND_MIC) if mic_on.load(Ordering::Relaxed) => crate::mic::packet(&dgram),
                         Some(&glass_proto::KIND_FRAME_ACK) => {
                             if let Some((stream, id)) = glass_proto::read_frame_ack(&dgram) {
@@ -544,6 +592,9 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         authed: authed.clone(),
                         audio: audio_tap.clone(),
                         video_on: video_on.clone(),
+                        keyed: keyed.clone(),
+                        sized: sized.clone(),
+                        nack_on: nack_on.clone(),
                         ctl_tx: ctl_tx.clone(),
                         relayed: relayed.clone(),
                         perms: perms.clone(),
@@ -566,6 +617,9 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         authed: authed.clone(),
                         audio: audio_tap.clone(),
                         video_on: video_on.clone(),
+                        keyed: keyed.clone(),
+                        sized: sized.clone(),
+                        nack_on: nack_on.clone(),
                         ctl_tx: ctl_tx.clone(),
                         relayed: relayed.clone(),
                         perms: perms.clone(),
@@ -606,6 +660,10 @@ struct SessionCtx {
     /// Which system audio it gets (off, PCM or Opus).
     audio: Arc<crate::opus_audio::AudioTap>,
     video_on: Arc<AtomicBool>,
+    keyed: Arc<std::sync::atomic::AtomicU8>,
+    sized: Arc<AtomicBool>,
+    /// The viewer asks for lost fragments again ("nack" in hello's codecs).
+    nack_on: Arc<AtomicBool>,
     ctl_tx: mpsc::UnboundedSender<ServerMsg>,
     /// The real address of a WebRTC viewer (the connection itself is loopback).
     relayed: Option<crate::remote::Relay>,
@@ -949,7 +1007,22 @@ async fn control(
     if let Some(r) = &ctx.relayed {
         crate::remote::bridge_authed(r.bridge);
     }
-    shared.video.request_keyframe(None);
+    // A viewer far away may be on a slow link: size the first keyframe for one.
+    if ctx.relayed.is_none() && ctx.conn.rtt() > FAR_RTT {
+        cautious_start();
+    }
+    // The first keyframe goes out at this viewer's size: it sends its viewport as soon as
+    // it's welcome (a viewer that doesn't, or an old one, gets it after a moment).
+    {
+        let (keyed, sized, shared) = (ctx.keyed.clone(), ctx.sized.clone(), shared.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(FIRST_VIEWPORT_WAIT).await;
+            let waited_for_it = !sized.swap(true, Ordering::Relaxed);
+            if waited_for_it && keyed.load(Ordering::Relaxed) == 0 {
+                shared.video.request_keyframe(None);
+            }
+        });
+    }
     match &auth {
         Auth::Token => info!("{peer}: authenticated via token"),
         Auth::Tailnet => info!("{peer}: authenticated via tailnet identity"),
@@ -1008,6 +1081,7 @@ async fn control(
     let _sharp = crate::sharp::joined(session_id, codecs.iter().any(|c| c == "hevc-rext"));
     // System audio as Opus where the viewer decodes it (WebCodecs); PCM otherwise (Safari < 26).
     ctx.audio.set_opus(codecs.iter().any(|c| c == "opus"));
+    ctx.nack_on.store(codecs.iter().any(|c| c == "nack"), Ordering::Relaxed);
     let mut sharp_on = false;
     let thumbs_busy = Arc::new(AtomicBool::new(false));
     let thumbs_sent = Arc::new(std::sync::Mutex::new(crate::thumbs::Sent::default()));
@@ -1081,6 +1155,7 @@ async fn control(
             && !ctx.relayed.as_ref().is_some_and(|r| r.rtp_video),
         push: crate::push::public_key(),
         browse: perms.owner && perms.files,
+        nack: true,
         extend: cfg!(target_os = "macos") || crate::testmode::enabled(),
         fit: cfg!(target_os = "macos") || crate::testmode::enabled(),
         support: crate::support::is_host()
@@ -1123,8 +1198,13 @@ async fn control(
         let path = Some(r.path.display().to_string());
         control::write_json(&mut send, &ServerMsg::Recording { on: true, path }).await?;
     }
+    // With its artwork (20 KB): after the first picture has had the link to itself.
     if let Some(info) = crate::now_playing::current() {
-        control::write_json(&mut send, &ServerMsg::NowPlaying { info }).await?;
+        let tx = ctx.ctl_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(NOW_PLAYING_AFTER).await;
+            let _ = tx.send(ServerMsg::NowPlaying { info });
+        });
     }
     for msg in crate::computer::snapshot() {
         control::write_json(&mut send, &msg).await?;
@@ -1304,7 +1384,16 @@ async fn control(
                     .take(MAX_STREAMS)
                     .map(|s| s.map(|[w, h]| [w.min(16_384), h.min(16_384)]))
                     .collect();
-                crate::resolution::set(viewport_id, Some(streams));
+                if ctx.sized.load(Ordering::Relaxed) {
+                    crate::resolution::set(viewport_id, Some(streams));
+                } else {
+                    info!("{peer}: first viewport {streams:?}");
+                    crate::resolution::set_now(viewport_id, streams).await;
+                    // Frames may go out from here. A new size's restart has just made a
+                    // keyframe, which they missed: ask for one in the size now in force.
+                    ctx.sized.store(true, Ordering::Relaxed);
+                    shared.video.request_keyframe(None);
+                }
             }
             ClientMsg::Log { lines } => {
                 if let Some(path) = CLIENT_LOG.get() {
@@ -2256,6 +2345,7 @@ fn send_frame(
     conn: &wtransport::Connection,
     frame: &EncodedFrame,
     next_id: &mut u32,
+    sent: Option<&mut crate::retransmit::SentFrames>,
 ) -> Result<(u32, usize)> {
     let max = conn.max_datagram_size().unwrap_or(1200);
     let id = *next_id;
@@ -2289,9 +2379,12 @@ fn send_frame(
         *byte ^= 0xff;
     }
     let mut bytes = 0;
-    for dgram in dgrams {
+    for dgram in &dgrams {
         bytes += dgram.len();
-        conn.send_datagram(dgram)?;
+        conn.send_datagram(dgram.as_slice())?;
+    }
+    if let Some(sent) = sent {
+        sent.remember(frame.stream, id, dgrams);
     }
     Ok((id, bytes))
 }
@@ -2613,17 +2706,29 @@ pub fn bridge_congestion(dropped_frames: u32) {
     }
 }
 
+const NOW_PLAYING_AFTER: Duration = Duration::from_secs(3);
+/// About a first picture's worth, sent evenly over the first round trip (quinn paces it).
+const QUIC_INITIAL_WINDOW: u64 = 128 * 1024;
+/// Where a viewer of unknown link starts; it climbs fast from here (`rate`).
+const CAUTIOUS_START_BPS: u32 = 2_000_000;
+/// Further than a LAN or nearby Wi-Fi: maybe cellular.
+const FAR_RTT: Duration = Duration::from_millis(40);
+/// How long frames wait for a new viewer's size before going out at the current one.
+const FIRST_VIEWPORT_WAIT: Duration = Duration::from_millis(600);
+
 /// A viewer arrived over the internet (WebRTC): start the stream at a rate such links
 /// usually take, instead of the LAN maximum, so the first keyframe isn't lost.
 pub fn remote_viewer_joined() {
+    cautious_start();
+}
+
+fn cautious_start() {
     if let Some(shared) = SHARED.get() {
-        let max = shared.rate.lock().unwrap().max();
-        let start = (max / 5).max(2_000_000);
         let changed = shared
             .rate
             .lock()
             .unwrap()
-            .start_cautiously(start, std::time::Instant::now());
+            .start_cautiously(CAUTIOUS_START_BPS, std::time::Instant::now());
         if changed.is_some() {
             apply_bitrate(shared);
         }

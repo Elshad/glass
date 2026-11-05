@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  fletcher16, inputEvent, penEvent, textEvents, Input, INPUT_EVENT_LEN, MAX_TEXT_BYTES, TEXT_CHUNK, ping, readPong, readVideoHeader, KIND_PING, KIND_PONG, VIDEO_HEADER_LEN, readCursor, KIND_CURSOR, CURSOR_VISIBLE, CURSOR_YOURS, frameAck, KIND_FRAME_ACK,
+  fletcher16, inputEvent, penEvent, textEvents, Input, INPUT_EVENT_LEN, MAX_TEXT_BYTES, TEXT_CHUNK, ping, readPong, readVideoHeader, KIND_PING, KIND_PONG, VIDEO_HEADER_LEN, readCursor, KIND_CURSOR, CURSOR_VISIBLE, CURSOR_YOURS, frameAck, KIND_FRAME_ACK, nack,
 } from '../../web/proto.js';
 
 test('fletcher16 matches the Rust implementation', () => {
@@ -142,4 +142,10 @@ test('frame acks are kind 8, stream, two spare bytes, then the frame id', () => 
   // Same bytes as glass_proto::frame_ack(2, 0xdeadbeef).
   assert.equal(KIND_FRAME_ACK, 8);
   assert.deepEqual([...frameAck(2, 0xdeadbeef)], [8, 2, 0, 0, 0xef, 0xbe, 0xad, 0xde]);
+});
+
+test('nacks match glass_proto::nack byte for byte', () => {
+  // Same bytes as nack_layout in crates/glass-proto.
+  assert.deepEqual([...nack(2, 0xa1b2c3d4, [1, 0x0203])], [10, 2, 2, 0, 0xd4, 0xc3, 0xb2, 0xa1, 1, 0, 3, 2]);
+  assert.deepEqual([...nack(0, 7)], [10, 0, 0, 0, 7, 0, 0, 0]);
 });

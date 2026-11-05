@@ -1101,6 +1101,10 @@ impl FrameGate {
                 Admit::Drop
             };
         };
+        // A lost fragment sent again: it isn't a new frame, and it's what ends a stall.
+        if h.flags & glass_proto::FLAG_RETRANSMIT != 0 {
+            return if outstanding < DATAGRAM_BACKLOG * 2 { Admit::Send } else { Admit::Drop };
+        }
         let s = (h.stream as usize).min(glass_proto::MAX_STREAMS - 1);
         if let Some((id, send)) = self.current[s]
             && id == h.frame_id

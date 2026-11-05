@@ -4,6 +4,7 @@ export const KIND_VIDEO = 1;
 export const KIND_PING = 2;
 export const KIND_PONG = 3;
 export const KIND_KEYFRAME_REQUEST = 4;
+export const KIND_NACK = 10;
 export const KIND_AUDIO = 5;
 export const KIND_MIC = 6;
 export const KIND_AUDIO_OPUS = 7; // system audio as one Opus packet, same header as KIND_AUDIO
@@ -82,6 +83,18 @@ export function readCursor(view) {
     x: view.getFloat32(8, true),
     y: view.getFloat32(12, true),
   };
+}
+
+/** Asks for fragments of a frame again (none: the whole frame). See glass_proto::nack. */
+export function nack(stream, frameId, fragments = []) {
+  const out = new Uint8Array(8 + fragments.length * 2);
+  const v = new DataView(out.buffer);
+  v.setUint8(0, KIND_NACK);
+  v.setUint8(1, stream);
+  v.setUint16(2, fragments.length, true);
+  v.setUint32(4, frameId, true);
+  fragments.forEach((f, i) => v.setUint16(8 + i * 2, f, true));
+  return out;
 }
 
 export function ping(nowMs) {

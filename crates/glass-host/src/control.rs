@@ -363,6 +363,8 @@ pub struct Features {
     pub lossless: bool,
     /// The key browsers subscribe to notifications with (VAPID, base64url).
     pub push: Option<String>,
+    /// Sends lost fragments again when asked (`KIND_NACK`).
+    pub nack: bool,
     /// The file browser (owners with files allowed).
     pub browse: bool,
     /// The viewer can become a second display ("Use as a second display").

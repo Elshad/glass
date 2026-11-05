@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 /// Fraction kept on congestion.
 const DECREASE: f64 = 0.7;
+/// After a cautious start: each clean report, until the link shows congestion.
+const RAMP: f64 = 1.5;
 /// Increase per clean report, as a fraction of the maximum.
 const INCREASE: f64 = 0.1;
 /// Near (and past) the rate where the link last choked, probe in steps this size instead.
@@ -53,6 +55,8 @@ pub struct RateControl {
     latencies: VecDeque<f64>,
     /// The target when congestion was last seen: where the link chokes.
     ceiling: Option<u32>,
+    /// Started low for an unknown link: climbing fast until it first shows congestion.
+    ramping: bool,
 }
 
 impl RateControl {
@@ -63,6 +67,7 @@ impl RateControl {
             last_decrease: None,
             latencies: VecDeque::new(),
             ceiling: None,
+            ramping: false,
         }
     }
 
@@ -81,8 +86,9 @@ impl RateControl {
             return None;
         }
         self.target = bps;
-        self.ceiling = Some(bps);
+        self.ceiling = None;
         self.last_decrease = Some(now);
+        self.ramping = true;
         Some(bps)
     }
 
@@ -111,7 +117,12 @@ impl RateControl {
             .is_none_or(|bps| bps >= self.target as f64 * USED_FOR_INCREASE);
 
         let min = (self.max as f64 * MIN_FRACTION) as u32;
-        let next = if congested {
+        let next = if self.ramping && !congested && r.frames > 0 && used {
+            ((self.target as f64 * RAMP) as u32).min(self.max)
+        } else if self.ramping && !congested {
+            self.target
+        } else if congested {
+            self.ramping = false;
             self.last_decrease = Some(now);
             self.ceiling = Some(self.target);
             ((self.target as f64 * DECREASE) as u32).max(min)
@@ -390,6 +401,29 @@ fn motion_policy(bps: u32, max_fps: u32) -> (u32, u32) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_cautious_start_climbs_fast_until_congestion() {
+        let now = Instant::now();
+        let mut rc = RateControl::new(30_000_000);
+        assert_eq!(rc.start_cautiously(2_000_000, now), Some(2_000_000));
+        let clean = || Report { dropped: 0, frames: 30, latency_ms: Some(80.0), received_bps: None };
+        let mut t = now;
+        for want in [3_000_000, 4_500_000, 6_750_000, 10_125_000] {
+            t += Duration::from_secs(1);
+            assert_eq!(rc.report(clean(), t), Some(want));
+        }
+        // Not using what it has: no reason to raise it (a still screen, or a link that only
+        // looks clean because little was tried).
+        t += Duration::from_secs(1);
+        assert_eq!(rc.report(Report { received_bps: Some(100_000.0), ..clean() }, t), None);
+        // A cut ends it: from here on it probes as usual.
+        t += Duration::from_secs(1);
+        rc.report(Report { dropped: 3, ..clean() }, t);
+        assert_eq!(rc.target(), 7_087_500);
+        t += Duration::from_secs(1);
+        assert_eq!(rc.report(clean(), t), None, "holds after a decrease");
+    }
+
     const MAX: u32 = 30_000_000;
     fn clean() -> Report {
         Report {
@@ -477,13 +511,13 @@ mod tests {
     }
 
     #[test]
-    fn a_cautious_start_climbs_gently() {
+    fn a_cautious_start_never_raises_the_target() {
         let mut rc = RateControl::new(MAX);
         let t0 = Instant::now();
         assert_eq!(rc.start_cautiously(6_000_000, t0), Some(6_000_000));
         assert_eq!(rc.start_cautiously(9_000_000, t0), None, "never raises");
         rc.report(clean(), t0 + Duration::from_secs(2));
-        assert_eq!(rc.target(), 6_600_000, "probes up from there");
+        assert_eq!(rc.target(), 9_000_000, "climbs from there");
     }
 
     #[test]

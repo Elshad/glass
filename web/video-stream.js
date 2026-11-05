@@ -4,6 +4,18 @@
 import { fletcher16, FLAG_HEVC, FLAG_KEYFRAME, FLAG_REFRESH, VIDEO_HEADER_LEN } from './proto.js';
 
 const KEYFRAME_RETRY_MS = 250;
+// Doubles until a keyframe arrives: each request adds another large frame to a full queue.
+const KEYFRAME_RETRY_MAX_MS = 1000;
+// With a host that sends lost fragments again (`repair`):
+const NACK_REORDER_MS = 60; // a gap this old is loss, not reordering (cellular reorders)
+// How often it asks: the host limits what it sends (retransmit.rs), and tying this to the
+// round trip would stretch it exactly when the queue is full.
+const NACK_RETRY_MS = 250;
+const HOLD_DELTA_MIN_MS = 250; // how long frames wait for a missing one, at least
+const HOLD_KEY_MS = 4000; // and for a keyframe that's still on its way
+const HOLD_FRAMES = 300;
+const FIRST_KEYFRAME_MS = 1000; // how long a new connection waits before asking for one
+const NACK_MAX_FRAGMENTS = 500; // fits a datagram
 
 // Safari's hardware decoder occasionally rejects valid frames (checksums match). If a
 // configuration fails repeatedly, every stream steps down to the next one.
@@ -60,7 +72,7 @@ export function setDecoderStep(step) {
 export class VideoStream {
   /**
    * @param index   stream number (matches the host's)
-   * @param env     { log, post, requestKeyframe(index), hostNowUs(), stats, probe?(index, frame, hostNowUs) }
+   * @param env     { log, post, requestKeyframe(index), hostNowUs(), stats, probe?(index, frame, hostNowUs), firstFrame?(), nackOn?(), nack?(index, frameId, fragments) }
    */
   constructor(index, env) {
     this.index = index;
@@ -68,13 +80,16 @@ export class VideoStream {
     this.ctx = undefined;
     this.pending = new Map(); // frameId -> { parts, received, keyframe, captureUs, checksum }
     this.acks = new Map(); // capture time -> frameId, for frames being decoded
+    this.ready = new Map(); // frameId -> complete frames waiting for an earlier one (repair)
+    this.counts = { nacks: 0, asked: 0, keyRequests: 0 };
+    this.keyframeRetry = KEYFRAME_RETRY_MS;
     this.reset();
     this.decoder = undefined;
     this.codec = undefined;
     this.currentSps = undefined;
     this.lastChunk = undefined;
     this.sinceKeyframe = 0;
-    this.lastKeyframeRequest = 0;
+    this.lastKeyframeRequest = -Infinity;
   }
 
   /** `wide`: this screen shows Display P3, so draw in it (a P3 stream isn't clipped). */
@@ -91,7 +106,13 @@ export class VideoStream {
   /** New session: frame ids restart, so forget reassembly state. */
   reset() {
     this.pending.clear();
+    this.ready.clear();
+    this.newestId = undefined;
+    this.floorId = undefined; // frames up to this one were given up on
+    this.gapSince = undefined;
+    this.keyframeRetry = KEYFRAME_RETRY_MS;
     this.lastDecodedId = undefined;
+    this.waitingSince = performance.now();
     this.waitingForKeyframe = true;
     this.dropLossless();
   }
@@ -143,6 +164,10 @@ export class VideoStream {
 
   onFragment(h, bytes) {
     this.env.stats.bytes += bytes.byteLength;
+    const repairing = this.env.nackOn?.();
+    // A fragment sent again for a frame that got here in the end, or was given up on.
+    if (repairing && (this.ready.has(h.frameId) || h.frameId <= (this.floorId ?? -1) || h.frameId <= (this.lastDecodedId ?? -1))) return;
+    const now = performance.now();
     let frame = this.pending.get(h.frameId);
     if (!frame) {
       frame = {
@@ -153,13 +178,149 @@ export class VideoStream {
         refresh: (h.flags & FLAG_REFRESH) !== 0,
         captureUs: h.captureUs,
         checksum: h.checksum,
+        firstAt: now,
+        lastAt: now,
+        maxIdx: 0,
+        nackedAt: -Infinity,
       };
       this.pending.set(h.frameId, frame);
     }
+    if (this.newestId === undefined || h.frameId > this.newestId) this.newestId = h.frameId;
+    frame.lastAt = now;
+    frame.maxIdx = Math.max(frame.maxIdx, h.fragIdx);
     if (frame.parts[h.fragIdx]) return;
     // Copy, don't view: the browser may reuse the datagram's buffer for later datagrams.
     frame.parts[h.fragIdx] = bytes.slice(VIDEO_HEADER_LEN);
-    if (++frame.received === h.fragCount) this.onFrame(h.frameId, frame);
+    if (++frame.received !== h.fragCount) return;
+    if (!repairing) {
+      this.onFrame(h.frameId, frame);
+      return;
+    }
+    this.pending.delete(h.frameId);
+    this.ready.set(h.frameId, frame);
+    this.advance();
+  }
+
+  /** Decodes what's complete, in order. A complete keyframe restarts the chain. */
+  advance() {
+    for (;;) {
+      const next = this.lastDecodedId === undefined ? undefined : (this.lastDecodedId + 1) >>> 0;
+      let id = !this.waitingForKeyframe && this.ready.has(next) ? next : undefined;
+      if (id === undefined) {
+        for (const [k, f] of this.ready) if (f.keyframe && (id === undefined || k < id)) id = k;
+      }
+      if (id === undefined) return;
+      const frame = this.ready.get(id);
+      this.ready.delete(id);
+      if (frame.keyframe) this.forgetBefore(id);
+      this.gapSince = undefined;
+      this.decodeFrame(id, frame);
+    }
+  }
+
+  /** Stops waiting for frames up to `id`. */
+  forgetBefore(id) {
+    for (const key of this.pending.keys()) if (key < id) this.pending.delete(key);
+    for (const key of this.ready.keys()) if (key < id) this.ready.delete(key);
+    this.floorId = Math.max(this.floorId ?? -1, id - 1);
+  }
+
+  /** Gives up on what's missing: only a keyframe gets the picture going again. */
+  giveUp() {
+    if (this.newestId !== undefined) this.forgetBefore(this.newestId + 1);
+    this.gapSince = undefined;
+    this.env.stats.dropped++;
+    this.requestKeyframe();
+  }
+
+  /** The host no longer has a frame this viewer asked for. */
+  frameGone(id) {
+    if (this.waitingForKeyframe) {
+      // The keyframe it's waiting for can't be completed: only a new one will do.
+      if (this.pending.get(id)?.keyframe) {
+        this.pending.delete(id);
+        this.requestKeyframe();
+      }
+      return;
+    }
+    if (id === ((this.lastDecodedId + 1) >>> 0)) this.giveUp();
+  }
+
+  /** For the log, while there's no picture yet. */
+  waitingState() {
+    let key;
+    for (const [id, f] of this.pending) if (f.keyframe && (key === undefined || id < key)) key = [id, f];
+    return {
+      ...this.counts,
+      pending: this.pending.size,
+      ready: this.ready.size,
+      key: key && { id: key[0], got: key[1].received, of: key[1].parts.length, age: Math.round(performance.now() - key[1].firstAt) },
+    };
+  }
+
+  /** Asks again for what's missing; called every few ms. */
+  repair(rttMs) {
+    const now = performance.now();
+    if (this.waitingForKeyframe && !this.pending.size && !this.ready.size) {
+      // Nothing at all yet: the encoder may have dropped it, and nothing else would ask.
+      if (now - this.waitingSince > FIRST_KEYFRAME_MS) this.requestKeyframe();
+      return;
+    }
+    const retry = NACK_RETRY_MS;
+    const ask = (id, frame) => {
+      if (now - frame.nackedAt < retry) return;
+      const newer = this.newestId > id;
+      const missing = [];
+      for (let i = 0; i < frame.parts.length && missing.length < NACK_MAX_FRAGMENTS; i++) {
+        if (frame.parts[i]) continue;
+        const past = i < frame.maxIdx ? now - frame.lastAt > NACK_REORDER_MS : newer || now - frame.lastAt > retry;
+        if (past) missing.push(i);
+      }
+      if (!missing.length) return;
+      frame.nackedAt = now;
+      this.counts.nacks++;
+      this.counts.asked += missing.length;
+      this.env.nack(this.index, id, missing);
+    };
+
+    if (this.waitingForKeyframe) {
+      let key;
+      for (const [id, f] of this.pending) if (f.keyframe && (key === undefined || id < key)) key = id;
+      if (key !== undefined) {
+        const frame = this.pending.get(key);
+        if (now - frame.firstAt > HOLD_KEY_MS) {
+          this.pending.delete(key);
+          this.requestKeyframe();
+        } else {
+          ask(key, frame);
+        }
+      } else if (this.pending.size || this.ready.size) {
+        // Frames but no keyframe in sight (the first ones may have been lost altogether).
+        this.requestKeyframe();
+      }
+      return;
+    }
+
+    const next = (this.lastDecodedId + 1) >>> 0;
+    if (this.ready.has(next) || this.newestId === undefined || this.newestId < next) {
+      this.gapSince = undefined;
+      return;
+    }
+    this.gapSince ??= now;
+    if (now - this.gapSince > Math.max(HOLD_DELTA_MIN_MS, rttMs * 3) || this.ready.size > HOLD_FRAMES) {
+      this.giveUp();
+      return;
+    }
+    for (const [id, frame] of this.pending) ask(id, frame);
+    // Frames with nothing at all here yet: ask for all of each.
+    this.wholeAskedAt ??= new Map();
+    for (let id = next; id < this.newestId && id < next + 32; id++) {
+      if (this.pending.has(id) || this.ready.has(id)) continue;
+      if (now - (this.wholeAskedAt.get(id) ?? -Infinity) < retry) continue;
+      this.wholeAskedAt.set(id, now);
+      this.env.nack(this.index, id, []);
+    }
+    if (this.wholeAskedAt.size > 64) this.wholeAskedAt.clear();
   }
 
   onFrame(id, frame) {
@@ -178,7 +339,10 @@ export class VideoStream {
       skip();
       return;
     }
+    this.decodeFrame(id, frame);
+  }
 
+  decodeFrame(id, frame) {
     const data = join(frame.parts);
     if (fletcher16(data) !== frame.checksum) {
       // Corrupted in transit or reassembly: never feed it to the decoder.
@@ -195,6 +359,7 @@ export class VideoStream {
       return;
     }
     this.waitingForKeyframe = false;
+    if (frame.keyframe) this.keyframeRetry = KEYFRAME_RETRY_MS;
     this.lastDecodedId = id;
     this.lastChunk = { type: frame.keyframe ? 'key' : 'delta', size: data.byteLength, id, nals: nalTypes(data, frame.hevc) };
     this.sinceKeyframe = frame.keyframe ? 0 : this.sinceKeyframe + 1;
@@ -211,8 +376,10 @@ export class VideoStream {
   requestKeyframe() {
     this.waitingForKeyframe = true;
     const now = performance.now();
-    if (now - this.lastKeyframeRequest < KEYFRAME_RETRY_MS) return;
+    if (now - this.lastKeyframeRequest < this.keyframeRetry) return;
     this.lastKeyframeRequest = now;
+    this.counts.keyRequests++;
+    this.keyframeRetry = Math.min(this.keyframeRetry * 2, KEYFRAME_RETRY_MAX_MS);
     this.env.requestKeyframe(this.index);
   }
 
@@ -297,6 +464,7 @@ export class VideoStream {
       this.acks.delete(videoFrame.timestamp);
       this.env.ack?.(this.index, id);
     }
+    this.env.firstFrame?.();
     this.env.probe?.(this.index, videoFrame, hostNow);
     videoFrame.close();
 

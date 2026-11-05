@@ -682,20 +682,18 @@ test.describe('resilience', () => {
     expect(host.clientLog('decoder error detail')).toHaveLength(0);
   });
 
-  it('backs off the bitrate under loss, and a quiet stream does not climb back', async ({ page, host }) => {
+  it('a few lost frames recover without cutting the bitrate, and a quiet stream does not climb', async ({ page, host }) => {
     await open(page, host);
     const bps = async () => (await host.get('/test/bitrate')).bps;
-    const max = await bps();
+    const before = await bps();
     await host.post('/test/drop?frames=4');
-    await expect.poll(bps, { timeout: 5_000 }).toBeLessThan(max);
+    // This viewer acknowledges frames, so its rate follows the queue (ack_rate tests in
+    // flow.rs): isolated loss isn't congestion. What it needs is the picture going again.
+    await expect.poll(async () => (await stats(page)).fps, { timeout: 5_000 }).toBeGreaterThan(10);
     await expect(page.locator('#hud')).toContainText('target');
-    // The test pattern uses a sliver of its allowance: no loss, but no evidence the link
-    // could take more, so the rate holds (it rises only when used; see rate.rs tests).
-    await page.waitForTimeout(3000);
-    const low = await bps();
+    // The test pattern uses a sliver of its allowance: no evidence the link could take more.
     await page.waitForTimeout(4000);
-    // Never climbs back; on a loaded test machine real loss can push it lower still.
-    expect(await bps()).toBeLessThanOrEqual(low);
+    expect(await bps()).toBeLessThanOrEqual(before);
   });
 
   it('never decodes a corrupted frame', async ({ page, host }) => {

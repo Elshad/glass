@@ -171,6 +171,7 @@ const areaObserver = new ResizeObserver((entries) => {
 });
 matchMedia(`(resolution: ${devicePixelRatio}dppx)`).addEventListener?.('change', () => queueViewport());
 let viewportTimer;
+let firstViewport = false; // this connection hasn't sent its viewport
 let lastViewport = '';
 
 // Remote: no host serves this page, so there's no config to fetch.
@@ -202,6 +203,7 @@ let session = 0; // this session's id, from welcome (chat from it is our own)
 let perms = { input: true, clipboard: true, files: true, owner: true };
 let features = {};
 let sharpWanted = storage((s) => s.getItem(SHARP_KEY)) === '1';
+let sharpPending = false; // to ask for once the first picture is up
 let sharpMode = 'off'; // what the host is doing: 'off', 'sharp' or '4:2:2'
 let deniedMsg; // why the host last turned us away
 
@@ -358,6 +360,7 @@ const ui = createUI({
   onSelectDisplay: (id) => control(id === 'all' ? { t: 'showAll' } : { t: 'selectDisplay', id }),
   onSharp: (on) => {
     sharpWanted = on;
+    sharpPending = false;
     storage((s) => s.setItem(SHARP_KEY, on ? '1' : '0'));
     ui.setSharp({ on });
     control({ t: 'sharp', on });
@@ -747,6 +750,13 @@ worker.onmessage = ({ data }) => {
       if (data.fps > 0) hideStatus();
       renderHud(data);
       break;
+    case 'firstFrame':
+      window.glassFirstFrame ??= performance.now();
+      // Sharp text restarts capture and the encoder: not while the first picture is coming.
+      if (sharpPending) control({ t: 'sharp', on: true });
+      sharpPending = false;
+      startAfterFirstPicture(0);
+      break;
     case 'bench':
       // One second of the bench probe, for bench/run.mjs to collect.
       (window.glassBench ??= []).push(data);
@@ -785,10 +795,29 @@ worker.onmessage = ({ data }) => {
   }
 };
 
+// On a slow link the first picture has to share it with everything else, so it goes first:
+// the main screen, then sound and the mic (the worker), then the other displays' previews,
+// then the rest. Only a picture that never comes (a hidden page) holds them to the wait.
+const FIRST_PICTURE_WAIT_MS = 6000;
+const PREVIEWS_AFTER_MS = 1000;
+const REST_AFTER_MS = 2000;
+let startTimers = [];
+function cancelStart() {
+  startTimers.forEach(clearTimeout);
+  startTimers = [];
+}
+function startAfterFirstPicture(wait) {
+  cancelStart();
+  startTimers = [
+    setTimeout(() => thumbs.setConnected(true), wait + PREVIEWS_AFTER_MS),
+    setTimeout(() => { if (remoteKey) setLogSink((lines) => control({ t: 'log', lines })); }, wait + REST_AFTER_MS),
+  ];
+}
+
 function onControl(msg) {
   switch (msg.t) {
     case 'welcome':
-      thumbs.setConnected(true);
+      startAfterFirstPicture(FIRST_PICTURE_WAIT_MS);
       cursor.reset();
       cursor.setHostSupports(Boolean(msg.features?.cursor));
       agent.reset();
@@ -810,10 +839,7 @@ function onControl(msg) {
       ui.setHostOs(msg.host_os ?? 'macos');
       applyKeyboard(msg.host_os ?? 'macos');
       files.setHostOs(msg.host_os ?? 'macos');
-      if (remoteKey) {
-        setLogSink((lines) => control({ t: 'log', lines }));
-        rememberRemote(msg.computer);
-      }
+      if (remoteKey) rememberRemote(msg.computer);
       guest = Boolean(msg.guest);
       // Remote: other machines aren't reachable from here, so no machines menu either.
       ui.setGuest(guest || Boolean(remoteKey));
@@ -849,7 +875,7 @@ function onControl(msg) {
       // Sharp text is this device's choice: ask again on every (re)connect.
       sharpMode = 'off';
       ui.setSharp({ available: perms.input, on: sharpWanted && perms.input, mode: 'off' });
-      if (sharpWanted && perms.input) control({ t: 'sharp', on: true });
+      sharpPending = sharpWanted && perms.input;
       {
         // Controllers and the mic count as input: not for view-only links.
         const canInput = msg.perms?.input ?? true;
@@ -870,7 +896,10 @@ function onControl(msg) {
       recordButton.classList.toggle('hidden', !(msg.features?.record && msg.perms?.owner));
       if (guest && resolutionMode.startsWith('fit:')) setResolution('auto');
       onLayout(msg.streams);
-      queueViewport(true);
+      // At once: the host holds the first picture for it, to send it at this size.
+      firstViewport = true;
+      lastViewport = '';
+      sendViewport();
       // A reload or reconnect: the host put the displays back when the session ended.
       if (resolutionMode.startsWith('fit:') && !guest) sendFit();
       log('info', 'welcome', { displays: displays.length, streams: msg.streams.map((d) => d.id), audio: msg.audio });
@@ -1049,12 +1078,14 @@ let elsewhere;
 
 function onConnectionStatus(text) {
   if (elsewhere) {
+    cancelStart();
     thumbs.setConnected(false);
     device.setConnected(false);
     showStatus('error', ...elsewhere);
     return;
   }
   if (text !== 'connected') {
+    cancelStart();
     thumbs.setConnected(false);
     device.setConnected(false);
   }
@@ -1194,7 +1225,8 @@ function sendViewport() {
       streams.push([1, 1]);
       continue;
     }
-    const area = areas.get(elements[i]);
+    // Before the first layout: this window, near enough for the first picture's size.
+    const area = areas.get(elements[i])?.[0] ? areas.get(elements[i]) : firstViewport ? [innerWidth, innerHeight] : undefined;
     if (resolutionMode !== 'auto' || !area || !area[0]) {
       streams.push(null);
       continue;
@@ -1202,6 +1234,7 @@ function sendViewport() {
     const scale = devicePixelRatio * zoomScale * pressureScale;
     streams.push([Math.round(area[0] * scale), Math.round(area[1] * scale)]);
   }
+  firstViewport = false;
   const msg = JSON.stringify(streams);
   if (msg === lastViewport) return;
   lastViewport = msg;

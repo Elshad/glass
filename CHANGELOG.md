@@ -4,6 +4,7 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 
 ## Unreleased
 
+- **The first picture on a slow link takes about a second, not ten.** Lost video fragments are sent again instead of whole new keyframes piling onto a full queue. A new viewer's first keyframe goes out at its screen's size, and viewers far away start at a lower bitrate and climb quickly. Sharp text turns on after the first picture.
 - The file browser downloads folders: select one and press Download to get it as a zip, made as it downloads (nothing is staged on the computer, however big the folder). On the computer's own page you can also drag a folder out. Symlinks inside the folder are left out.
 - On a Mac or Windows PC, the pointer moves with your mouse at once instead of trailing it by the connection's delay, and moving it no longer costs a video frame: your browser draws it, at the size the screen is shown. When someone or something else moves it (another viewer, an agent, the person at the computer) you still see where it is. It stays in the video while it's needed there: during a recording, in trackpad mode, for an older viewer, and on Windows while an agent works. Linux keeps the pointer in the video.
 - Agents can record the screen (`record`): for some seconds, or started and stopped by id. It's the video Glass already encodes, saved as an MP4 without re-encoding, at most 10 minutes. The agent gets the MP4 back (when it's 20 MB or less) and its path on the computer; recordings are removed after a day.

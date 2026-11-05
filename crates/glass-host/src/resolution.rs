@@ -51,6 +51,18 @@ pub fn set(session: u64, request: Option<Request>) {
     });
 }
 
+/// A new viewer's first size, at once: its first keyframe waits for this, and it would
+/// otherwise cross a slow link at the wrong size just before the right one.
+pub async fn set_now(session: u64, request: Request) {
+    REQUESTS.lock().unwrap().get_or_insert_with(Default::default).insert(session, request);
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(shared) = crate::server::shared() {
+        let widths = widths(&shared.video.streams(), &snapshot());
+        tracing::info!("resolution: encoding widths {widths:?} (None = native)");
+        let _ = tokio::task::spawn_blocking(move || shared.video.set_target_widths(&widths)).await;
+    }
+}
+
 fn snapshot() -> Vec<Request> {
     REQUESTS
         .lock()
