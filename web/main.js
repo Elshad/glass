@@ -531,6 +531,35 @@ const standalone = matchMedia('(display-mode: standalone), (display-mode: fullsc
 if (standalone) document.getElementById('btn-fullscreen').classList.add('hidden');
 log('info', 'display mode', { standalone: !!standalone });
 
+// A page can be reported hidden while it is on screen and in use: Edge on Windows did, for
+// minutes at a time (its window-occlusion check misfires, e.g. under an always-on-top
+// overlay), which froze the picture while clicks still reached the computer. Input only
+// reaches a page that's on screen, so it counts as being seen. Declared above createDevice:
+// its idle watcher can call syncVideo while this file is still loading.
+let away = false; // "Pause while away" says nobody is here
+let padOn = false; // keyboard and mouse mode: see setPad
+let usedAt = -Infinity; // while hidden: when it was hidden (desktop only), or the last input
+let videoOn = true;
+let pauseTimer;
+
+function floating() {
+  return Boolean(document.pictureInPictureElement || window.documentPictureInPicture?.window);
+}
+/** Whether video should run. Everything that can change the answer calls syncVideo. */
+function wantsVideo() {
+  if (away || padOn) return false;
+  return document.visibilityState === 'visible' || floating() || performance.now() - usedAt < PAUSE_HIDDEN_AFTER_MS;
+}
+function syncVideo() {
+  clearTimeout(pauseTimer);
+  videoOn = wantsVideo();
+  worker.postMessage({ type: 'visible', visible: videoOn });
+  // On only because it was used lately: look again when that runs out. Input just moves usedAt.
+  if (videoOn && document.visibilityState !== 'visible' && !floating()) {
+    pauseTimer = setTimeout(syncVideo, usedAt + PAUSE_HIDDEN_AFTER_MS - performance.now());
+  }
+}
+
 const device = createDevice({
   ui,
   push,
@@ -541,7 +570,10 @@ const device = createDevice({
   streams: () => (rtpVideo ? videos : canvases).slice(0, streamCount),
   sendClip: (clip) => sendClip(clip),
   displays: () => displays,
-  onPause: (away) => worker.postMessage({ type: 'visible', visible: !away && !padOn && document.visibilityState === 'visible' }),
+  onPause: (isAway) => {
+    away = isAway;
+    syncVideo();
+  },
   onPressure: (scale) => {
     if (scale === pressureScale) return;
     pressureScale = scale;
@@ -1541,71 +1573,44 @@ async function toggleFullscreen() {
   await navigator.keyboard?.lock?.().catch(() => {});
 }
 
-// A page can be reported hidden while it is on screen and in use: Edge on Windows did, for
-// minutes at a time (its window-occlusion check misfires, e.g. under an always-on-top
-// overlay), which froze the picture while clicks still reached the Mac. Input only reaches a
-// page that's on screen, so it counts: a hidden page pauses only after going
-// PAUSE_HIDDEN_AFTER_MS without input, and input resumes a paused one (on mobile too, which
-// then waits like a desktop page: it was evidently on screen).
-let pauseTimer;
-let hiddenAt = 0;
-let lastInputAt = -Infinity;
-let pausedHidden = false;
-
-function pause() {
-  pausedHidden = true;
-  worker.postMessage({ type: 'visible', visible: false });
-}
-
-/** Pauses a hidden page once it has gone PAUSE_HIDDEN_AFTER_MS unused. */
-function pauseWhenIdle() {
-  clearTimeout(pauseTimer);
-  const wait = Math.max(hiddenAt, lastInputAt) + PAUSE_HIDDEN_AFTER_MS - performance.now();
-  if (wait > 0) pauseTimer = setTimeout(pauseWhenIdle, wait);
-  else pause();
-}
-
+// Input on a page reported hidden: keep its video going, and resume it if it was paused (on
+// mobile too, which then waits like a desktop page: it was evidently on screen).
 for (const type of ['pointerdown', 'pointermove', 'keydown', 'wheel']) {
   addEventListener(type, () => {
-    lastInputAt = performance.now();
-    if (!pausedHidden) return;
-    pausedHidden = false;
+    if (document.visibilityState === 'visible') return;
+    usedAt = performance.now();
+    if (videoOn) return;
+    syncVideo();
+    if (!videoOn) return;
     log('info', 'input while reported hidden: video resumed');
-    worker.postMessage({ type: 'visible', visible: true });
     worker.postMessage({ type: 'wake' });
-    if (document.visibilityState === 'hidden') pauseWhenIdle();
   }, { capture: true, passive: true });
 }
 
+function onHidden() {
+  // Floating in picture in picture: still on screen, so that decides, not this.
+  // Mobile pauses synchronously: the page may be frozen before a timer could run.
+  if (!floating()) usedAt = mobile ? -Infinity : performance.now();
+  syncVideo();
+}
 // iPadOS suspends background tabs; reconnect as soon as we're back.
 document.addEventListener('visibilitychange', () => {
   log('info', `visibility: ${document.visibilityState}`);
-  clearTimeout(pauseTimer);
-  if (document.visibilityState === 'visible') {
-    pausedHidden = false;
-    worker.postMessage({ type: 'visible', visible: !padOn });
-    worker.postMessage({ type: 'wake' });
-    reloadIfUpdated('visible');
+  if (document.visibilityState !== 'visible') {
+    onHidden();
     return;
   }
-  // Floating in picture in picture: still on screen, so keep the video going.
-  if (floating()) return;
-  onHidden();
+  usedAt = -Infinity;
+  syncVideo();
+  worker.postMessage({ type: 'wake' });
+  reloadIfUpdated('visible');
 });
-function floating() {
-  return Boolean(document.pictureInPictureElement || window.documentPictureInPicture?.window);
-}
 // Back from picture in picture with the page still hidden: pause now.
 document.addEventListener('leavepictureinpicture', () => {
-  if (document.visibilityState === 'hidden') pause();
+  if (document.visibilityState !== 'hidden') return;
+  usedAt = -Infinity;
+  syncVideo();
 }, true);
-
-function onHidden() {
-  hiddenAt = performance.now();
-  // Synchronously on mobile: the page may be frozen before a timer could run.
-  if (mobile) pause();
-  else pauseWhenIdle();
-}
 // Opened in a background tab, or reloaded while reported hidden.
 if (document.visibilityState !== 'visible') onHidden();
 addEventListener('online', () => worker.postMessage({ type: 'wake' }));
@@ -1773,7 +1778,6 @@ async function onFirstWelcome() {
 const TRACKPAD_KEY = 'glass.trackpad';
 const touchScreen = matchMedia('(hover: none)').matches || navigator.maxTouchPoints > 0;
 const phone = touchScreen && Math.min(screen.width, screen.height) < 600;
-let padOn = false; // keyboard and mouse mode: see setPad
 let trackpadOn = touchScreen && (storage((s) => s.getItem(TRACKPAD_KEY)) ?? (phone ? '1' : '0')) === '1';
 function setTrackpad(on, chosen = false) {
   trackpadOn = on;
@@ -1807,7 +1811,7 @@ function setPad(on, chosen = false) {
   } else {
     setTrackpad(padWasTrackpad);
   }
-  worker.postMessage({ type: 'visible', visible: !on && document.visibilityState === 'visible' });
+  syncVideo();
   sendViewport();
   ui.setPad({ available: touchScreen, on });
   log('info', `keyboard and mouse mode ${on ? 'on' : 'off'}`);
