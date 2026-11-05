@@ -4,26 +4,47 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 
 ## Unreleased
 
-- **The first picture on a slow link takes about a second, not ten.** Lost video fragments are sent again instead of whole new keyframes piling onto a full queue. A new viewer's first keyframe goes out at its screen's size, and viewers far away start at a lower bitrate and climb quickly. Sharp text turns on after the first picture.
-- The file browser downloads folders: select one and press Download to get it as a zip, made as it downloads (nothing is staged on the computer, however big the folder). On the computer's own page you can also drag a folder out. Symlinks inside the folder are left out.
-- On a Mac or Windows PC, the pointer moves with your mouse at once instead of trailing it by the connection's delay, and moving it no longer costs a video frame: your browser draws it, at the size the screen is shown. When someone or something else moves it (another viewer, an agent, the person at the computer) you still see where it is. It stays in the video while it's needed there: during a recording, in trackpad mode, for an older viewer, and on Windows while an agent works. Linux keeps the pointer in the video.
-- Agents can record the screen (`record`): for some seconds, or started and stopped by id. It's the video Glass already encodes, saved as an MP4 without re-encoding, at most 10 minutes. The agent gets the MP4 back (when it's 20 MB or less) and its path on the computer; recordings are removed after a day.
-- Agents' `wait_for_change` follows what capture says changed instead of comparing small screenshots, so a caret, a spinner or one text field changing counts. It waits for the screen to settle (`idle_ms`), or for a change first (`change`), in part of the screen if asked (`region`). Screenshots and actions return a `seq` that a wait takes as `since`, so a change that happened before the wait isn't missed. A Mac display no viewer is watching is followed while an agent uses it, and stops a minute after.
-- Your own tailnet devices connect without a token even when Tailscale isn't ready when Glass starts (common right after signing in to Windows). Glass checks again on the next connection and then remembers the owner. For a minute and a half after startup, a viewer who didn't bring a token or a link reconnects instead of seeing the token screen.
-- If macOS's screen capture service stops answering (it can after Glass restarts), Glass restarts it and carries on, instead of hanging with no picture until someone restarts the Mac. Tailscale commands Glass runs at startup time out instead of holding it up.
-- Letting someone in after more than 10 seconds no longer leaves them with a picture but no mouse or keyboard.
-- `glass support` on a computer already running Glass shares through it, instead of starting a second copy that fought it for the screen (the picture froze in one of them). Ending support removes the helper's access and nothing else.
-- If `glass support` is closed without ending the session (killed, crashed), Glass removes the helper's access within seconds.
-- Viewers whose browser can't take WebRTC video (a Tesla's, for one) on a slow or relayed connection get a steadier picture: Glass keeps about a tenth of a second of video waiting and lowers the bitrate to what the link carries, instead of queuing most of a second and dropping frames in bursts.
-- Web pages on other sites can no longer drive or read your computer through a browser on one of your devices. Glass answers only for its own names (its tailnet name, IP addresses, localhost; `glass config allowed-hosts` adds more), so a site can't point its own domain at it (DNS rebinding), and it turns away requests and WebTransport sessions from other sites' pages (`glass config allowed-origins` lets one in). A refused request gets a 403 that says why. `POST /agent/v1/act` now needs `Content-Type: application/json`.
+## 0.14.0
+
+November 4, 2026
+
+### Faster on slow links
+
+- **The first picture on a slow link usually takes about a second, not ten.** Lost video fragments are sent again instead of whole new keyframes piling onto a full queue. A new viewer's first keyframe goes out at its screen's size, and viewers far away start at a lower bitrate and climb quickly. Sharp text turns on after the first picture.
 - Sound from the computer takes about a tenth of the bandwidth: browsers that can decode Opus (Chrome, Edge, Firefox, Safari 26) get it as Opus at 96 kbps instead of 1.5 Mbps of raw audio, so on a slow or relayed connection (a car's browser) sound no longer crowds out the picture. Older Safari keeps getting raw audio.
-- Scrolling keeps up with your fingers on a phone or tablet: two-finger and wheel scrolling move the remote content as far as they move it on your screen, whatever size the remote display is shown at (before, a Mac shown at a quarter size scrolled about four times too slowly). On a Mac, slow trackpad scrolling no longer gets lost to rounding, and apps scroll as smoothly as with a trackpad.
-- Chinese, Japanese and Korean input methods, emoji, and accented letters from a phone or tablet keyboard now type on the remote computer (before, they were dropped). On Linux hosts, characters a US keyboard doesn't have still can't be typed.
 - On a slow or lossy link, the picture no longer sticks waiting for a keyframe: while a viewer's connection is still busy with the last frames, Glass waits before capturing the next one, and that frame then carries everything that changed. Fewer frames get through, but none are dropped.
 - On a slow link, below 3 Mbps frames may be coarser so they fit, instead of huge ones holding up everything behind them; a still screen sharpens afterwards. On Windows and Linux hardware encoders, no single frame takes much more than its share of the bitrate.
 - A still screen sharpens without slowing down what comes next on a slow link: on the Mac, Glass refines it a few times (fewer and smaller the lower the bitrate) and only once the frames before have arrived, instead of re-sending the whole picture a dozen times a second for 3 seconds.
 - The viewer tells Glass when each frame is on screen. Glass uses that to send the next frame only when there's room, and to set the bitrate ten times a second from how long frames take to arrive and how much gets through: it backs off before a queue builds, and finds a fast link's rate within a second or two. It can go as low as 0.25 Mbps when that's all the link carries, but a keyframe arriving, a hidden tab, or the delay swings of a phone network don't count against it. Older viewers keep the once-a-second adjustment.
-- For developers: `bench/` measures frame rate and end-to-end latency on a test host (no screen capture) through LAN and slow shaped links, to catch regressions. See `bench/README.md`.
+- Viewers whose browser can't take WebRTC video (a Tesla's, for one) on a slow or relayed connection get a steadier picture: Glass keeps about a tenth of a second of video waiting and lowers the bitrate to what the link carries, instead of queuing most of a second and dropping frames in bursts.
+
+### Security
+
+- Web pages on other sites can no longer drive or read your computer through a browser on one of your devices. Glass answers only for its own names (its tailnet name, IP addresses, localhost; `glass config allowed-hosts` adds more), so a site can't point its own domain at it (DNS rebinding), and it turns away requests and WebTransport sessions from other sites' pages (`glass config allowed-origins` lets one in). A refused request gets a 403 that says why. `POST /agent/v1/act` now needs `Content-Type: application/json`.
+
+### Using the remote computer
+
+- On a Mac or Windows PC, the pointer moves with your mouse at once instead of trailing it by the connection's delay, and moving it no longer costs a video frame: your browser draws it, at the size the screen is shown. When someone or something else moves it (another viewer, an agent, the person at the computer) you still see where it is. It stays in the video while it's needed there: during a recording, in trackpad mode, for an older viewer, and on Windows while an agent works. Linux keeps the pointer in the video.
+- Scrolling keeps up with your fingers on a phone or tablet: two-finger and wheel scrolling move the remote content as far as they move it on your screen, whatever size the remote display is shown at (before, a Mac shown at a quarter size scrolled about four times too slowly). On a Mac, slow trackpad scrolling no longer gets lost to rounding, and apps scroll as smoothly as with a trackpad.
+- Chinese, Japanese and Korean input methods, emoji, and accented letters from a phone or tablet keyboard now type on the remote computer (before, they were dropped). On Linux hosts, characters a US keyboard doesn't have still can't be typed.
+- The file browser downloads folders: select one and press Download to get it as a zip, made as it downloads (nothing is staged on the computer, however big the folder). On the computer's own page you can also drag a folder out. Symlinks inside the folder are left out.
+
+### Agents
+
+- Agents can record the screen (`record`): for some seconds, or started and stopped by id. It's the video Glass already encodes, saved as an MP4 without re-encoding, at most 10 minutes. The agent gets the MP4 back (when it's 20 MB or less) and its path on the computer; recordings are removed after a day.
+- Agents' `wait_for_change` follows what capture says changed instead of comparing small screenshots, so a caret, a spinner or one text field changing counts. It waits for the screen to settle (`idle_ms`), or for a change first (`change`), in part of the screen if asked (`region`). Screenshots and actions return a `seq` that a wait takes as `since`, so a change that happened before the wait isn't missed. A Mac display no viewer is watching is followed while an agent uses it, and stops a minute after.
+
+### Reliability
+
+- If macOS's screen capture service stops answering (it can after Glass restarts), Glass restarts it and carries on, instead of hanging with no picture until someone restarts the Mac. Tailscale commands Glass runs at startup time out instead of holding it up.
+- Letting someone in after more than 10 seconds no longer leaves them with a picture but no mouse or keyboard.
+- `glass support` on a computer already running Glass shares through it, instead of starting a second copy that fought it for the screen (the picture froze in one of them). Ending support removes the helper's access and nothing else.
+- If `glass support` is closed without ending the session (killed, crashed), Glass removes the helper's access within seconds.
+- Your own tailnet devices connect without a token even when Tailscale isn't ready when Glass starts (common right after signing in to Windows). Glass checks again on the next connection and then remembers the owner. For a minute and a half after startup, a viewer who didn't bring a token or a link reconnects instead of seeing the token screen.
+
+### For developers
+
+- `bench/` measures frame rate and end-to-end latency on a test host (no screen capture) through LAN and slow shaped links, to catch regressions. See `bench/README.md`.
 
 ## 0.13.1
 
