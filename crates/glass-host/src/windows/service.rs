@@ -278,11 +278,15 @@ fn uninstall(remove_host_rule: bool) -> Result<()> {
     // Only a full MSI uninstall asks for this. That action runs this file, so the
     // program is current_exe, including a custom install directory. A manual
     // `glass service uninstall` leaves the desktop host's rule alone.
-    if remove_host_rule
-        && let Ok(exe) = std::env::current_exe()
-        && !super::firewall::remove_rule_quietly(&exe)
-    {
-        println!("Couldn't remove the Glass firewall rule for {}.", exe.display());
+    if remove_host_rule {
+        if let Ok(exe) = std::env::current_exe()
+            && !super::firewall::remove_rule_quietly(&exe)
+        {
+            println!("Couldn't remove the Glass firewall rule for {}.", exe.display());
+        }
+        if let Err(e) = super::firewall::clear_machine_scope() {
+            println!("{e}");
+        }
     }
     use windows::Win32::System::Services::{
         ControlService, DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_ALL_ACCESS, SERVICE_ALL_ACCESS,

@@ -50,8 +50,6 @@ fn service_step() -> Result<()> {
     Ok(())
 }
 
-/// Without a rule, Windows asks the first time the host listens, on this screen, and
-/// "Cancel" there leaves Glass blocked. Adding the rule now asks once, here, with context.
 fn warn_other_allows(rules: &[firewall::Rule]) -> Result<()> {
     let names = firewall::other_allow_names(rules);
     if names.is_empty() {
@@ -62,6 +60,8 @@ fn warn_other_allows(rules: &[firewall::Rule]) -> Result<()> {
     Ok(())
 }
 
+/// Without a rule, Windows asks the first time the host listens, on this screen, and
+/// "Cancel" there leaves Glass blocked. Adding the rule now asks once, here, with context.
 fn firewall_step() -> Result<()> {
     log::step("Windows Defender Firewall")?;
     let exe = std::env::current_exe()?;
@@ -109,7 +109,7 @@ fn firewall_step() -> Result<()> {
     if firewall::in_sync(&exe, remote) == Some(true) {
         log::success(firewall::ready_sentence(remote))?;
     } else {
-        log::warning("The firewall rule wasn't updated, so an existing Glass rule was left as it was. Run `glass setup` again.")?;
+        log::warning("The firewall rule wasn't updated. Run `glass setup` again.")?;
     }
     Ok(())
 }

@@ -79,8 +79,8 @@
          Glass up. A silent install (/qn) leaves that to sign-in. -->
     <CustomAction Id="OpenGlass" Directory="BinFolder" ExeCommand="&quot;[#GlasswExe]&quot; app" Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
     <!-- Uninstalled for good (not upgraded): removes the secure-desktop service, if it
-         was installed, and this program's Glass firewall rule. An upgrade keeps both:
-         the installer closes glass.exe, and Windows starts it again on the new copy. -->
+         was installed, this program's Glass firewall rule, and FirewallScope. An upgrade
+         keeps all three: the installer closes glass.exe, and Windows starts it again. -->
     <CustomAction Id="RemoveSecureDesktop" FileRef="GlassExe" ExeCommand="service uninstall --remove-host-rule" Execute="deferred" Impersonate="no" Return="ignore" />
     <!-- After the new files are in place (the old product is already removed): restore
          the firewall rule from the saved machine scope. Not a full uninstall. -->

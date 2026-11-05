@@ -71,6 +71,9 @@ pub fn everything() -> Result<()> {
     let exe = std::env::current_exe()?;
     let service = matches!(super::service::status(), Ok(Some(_)));
     let rule = firewall::named_rule_present(&exe) == Some(true);
+    // An MSI install owns the machine-wide scope. Clearing it here would make the next
+    // upgrade restore the older any-address rule.
+    let clear_scope = super::agent::machine_dir().is_none();
     if service || rule {
         let mut admin = String::from("$ErrorActionPreference = 'Continue'; ");
         if service {
@@ -78,25 +81,28 @@ pub fn everything() -> Result<()> {
         }
         if rule {
             admin += &format!(
-                "Get-NetFirewallApplicationFilter -Program {} | Get-NetFirewallRule | Where-Object {{ $_.DisplayName -eq 'Glass' -or $_.DisplayName -eq 'Glass-new' }} | Remove-NetFirewallRule; ",
+                "Get-NetFirewallApplicationFilter -Program {} | Get-NetFirewallRule | Where-Object DisplayName -eq 'Glass' | Remove-NetFirewallRule; ",
                 ps(&exe.display().to_string())
             );
         }
-        // A missing value is success. Any other failure fails this step.
-        admin += "try { Remove-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Glass' -Name FirewallScope -ErrorAction Stop } catch { $id = [string]$_.FullyQualifiedErrorId; if ($id -notlike '*PathNotFound*' -and $id -notlike '*ItemNotFound*' -and $id -notlike 'System.Management.Automation.PSArgumentException*') { Write-Error 'Could not remove HKLM\\SOFTWARE\\Glass FirewallScope.'; exit 1 } }; ";
+        if clear_scope {
+            // A missing value is success. Any other failure fails this step.
+            admin += "try { Remove-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Glass' -Name FirewallScope -ErrorAction Stop } catch { $id = [string]$_.FullyQualifiedErrorId; if ($id -notlike '*PathNotFound*' -and $id -notlike '*ItemNotFound*' -and $id -notlike 'System.Management.Automation.PSArgumentException*') { Write-Error 'Could not remove HKLM\\SOFTWARE\\Glass FirewallScope.'; exit 1 } }; ";
+        }
         let done = if super::service::is_elevated() {
             super::powershell(&admin).status().is_ok_and(|s| s.success())
         } else {
             elevated(&admin)
         };
         if !done {
-            eprintln!("The secure-desktop service, firewall rule, and saved firewall scope weren't removed (administrator approval was declined?). Remove the service later with: glass service uninstall");
+            let which = if clear_scope { "service, firewall rule, and saved firewall scope" } else { "service and firewall rule" };
+            eprintln!("The secure-desktop {which} weren't removed (administrator approval was declined?). Remove the service later with: glass service uninstall");
         }
-    } else if super::service::is_elevated() {
+    } else if clear_scope && super::service::is_elevated() {
         if let Err(e) = firewall::clear_machine_scope() {
             eprintln!("{e}");
         }
-    } else if firewall::machine_scope().is_some() {
+    } else if clear_scope && firewall::machine_scope().is_some() {
         eprintln!("The saved firewall scope wasn't removed. That needs administrator.");
     }
 
