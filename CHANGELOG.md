@@ -4,10 +4,8 @@ What changed in each release of Glass. `glass update` (or the Glass app) install
 
 ## Unreleased
 
-- The picture no longer freezes while you're using a page the browser wrongly reports as hidden (Edge on Windows did this under an always-on-top overlay, for minutes at a time). Input now counts as the page being on screen: video keeps going, and resumes if it had paused. A tab that's really in the background still pauses as before.
-- If Glass starts before Tailscale, as it can at boot and at the sign-in screen, it picks up its HTTPS certificate once Tailscale is up and restarts itself, instead of staying on plain HTTP and out of reach of the tailnet until someone restarts it.
-- If Glass starts before Tailscale, as it can at boot, it no longer stays on plain HTTP and out of reach of the tailnet until someone restarts it. For five minutes it watches for Tailscale, then restarts itself with its HTTPS certificate as soon as nobody is connected. Applies to the background service and the sign-in screen, not to `glass` run in a terminal.
 - If Glass starts before Tailscale, as it can at boot, it no longer stays on plain HTTP and out of reach of the tailnet until someone restarts it. For five minutes it watches for Tailscale, then restarts itself with its HTTPS certificate as soon as nobody is connected. On Windows this covers the background app and the sign-in screen; on macOS and Linux, the background service once `glass setup` has run again. `glass` run in a terminal stays as it is.
+- The picture no longer freezes while you're using a page the browser wrongly reports as hidden (Edge on Windows did this under an always-on-top overlay, for minutes at a time). Input now counts as the page being on screen: video keeps going, and resumes if it had paused. A tab that's really in the background still pauses as before.
 
 ## 0.14.0
 
