@@ -1,6 +1,6 @@
-//! The Glass menu bar icon: a screen sharing symbol (with a count) while anyone is viewing this Mac, badged
-//! while a permission is missing, and a menu listing who, with controls to end it. Runs the app's main thread; the host itself
-//! runs on a background tokio runtime.
+//! The Glass menu bar icon: a screen sharing symbol (with a count) while anyone is viewing
+//! this Mac, badged while a permission is missing, and a menu listing who, with controls to
+//! end it. Runs the app's main thread; the host itself runs on a background tokio runtime.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
