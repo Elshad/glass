@@ -1,6 +1,7 @@
 //! Whether this session is locked, for treating keys as a password: logind's LockedHint
 //! (GNOME, KDE and lockers that set it) or a screen locker running (hyprlock, swaylock and
-//! others that don't). Checked at most once a second.
+//! others that don't), or on X11 a screensaver daemon saying it is active. Checked at most
+//! once a second.
 
 use std::process::Command;
 use std::sync::Mutex;
@@ -17,7 +18,7 @@ pub fn locked() -> bool {
     {
         return locked;
     }
-    let locked = locker_running() || locked_hint();
+    let locked = locker_running() || locked_hint() || (super::is_x11() && screensaver_active());
     *last = Some((Instant::now(), locked));
     locked
 }
@@ -26,6 +27,23 @@ fn locker_running() -> bool {
     let Ok(procs) = std::fs::read_dir("/proc") else { return false };
     procs.flatten().any(|p| {
         std::fs::read_to_string(p.path().join("comm")).is_ok_and(|name| LOCKERS.contains(&name.trim()))
+    })
+}
+
+/// X11 screensavers run all the time, so their process says nothing; they answer over
+/// D-Bus instead (xfce4-screensaver, and light-locker and others on the freedesktop name).
+fn screensaver_active() -> bool {
+    [
+        ("org.xfce.ScreenSaver", "/org/xfce/ScreenSaver", "org.xfce.ScreenSaver.GetActive"),
+        ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver.GetActive"),
+    ]
+    .iter()
+    .any(|(name, path, method)| {
+        Command::new("gdbus")
+            .args(["call", "--session", "--timeout", "1", "--dest", name, "--object-path", path, "--method", method])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).contains("true"))
     })
 }
 

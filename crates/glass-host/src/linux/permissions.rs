@@ -1,5 +1,6 @@
 //! On Linux, "screen recording" is the portal's screen-cast approval and "accessibility"
-//! is write access to /dev/uinput (see `input::has_accessibility`).
+//! is write access to /dev/uinput (see `input::has_accessibility`). X11 asks for neither:
+//! any client may read the screen and, through XTEST, send input.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

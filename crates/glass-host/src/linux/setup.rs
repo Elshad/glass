@@ -1,5 +1,6 @@
 //! Linux-specific setup: desktop dependencies, input access (uinput), and approving
-//! screen sharing in the compositor's picker.
+//! screen sharing in the compositor's picker. An X11 session needs only xclip: there is
+//! no portal, no picker, and input goes through XTEST.
 
 use std::process::Command;
 use std::time::Duration;
@@ -8,7 +9,7 @@ use anyhow::Result;
 use cliclack::{confirm, log, note, spinner};
 use console::style;
 
-use super::{has_command, input};
+use super::{has_command, input, is_x11};
 use crate::setup::ask_retry;
 use crate::status::{self, Status};
 
@@ -22,16 +23,14 @@ pub async fn prepare() -> Result<()> {
 
 fn dependencies_step() -> Result<()> {
     log::step("Desktop integration")?;
-    if std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t == "x11") {
-        log::warning(
-            "This is an X11 session. Glass on Linux needs Wayland: log out, pick a Wayland \
-             session (e.g. \"GNOME\" rather than \"GNOME on Xorg\"), and run `glass setup` there.",
-        )?;
-    }
     loop {
         let missing = missing_dependencies();
         if missing.is_empty() {
-            log::success("PipeWire, screen-sharing portal and wl-clipboard found")?;
+            if is_x11() {
+                log::success("X11 session: PipeWire and xclip found")?;
+            } else {
+                log::success("PipeWire, screen-sharing portal and wl-clipboard found")?;
+            }
             return Ok(());
         }
         let Some(pm) = PackageManager::detect() else {
@@ -122,6 +121,16 @@ fn portal_package() -> &'static str {
 
 fn input_access_step() -> Result<()> {
     log::step("Mouse and keyboard access")?;
+    if is_x11() {
+        if input::has_accessibility() {
+            log::success("Glass can send input through the X server (XTEST)")?;
+        } else {
+            log::warning(
+                "The X server has no XTEST extension: viewing works, but remote mouse and keyboard won't.",
+            )?;
+        }
+        return Ok(());
+    }
     if input::has_accessibility() {
         log::success("Glass can create its virtual mouse and keyboard")?;
         return Ok(());
@@ -170,6 +179,15 @@ fn sudo_n(script: &str) -> bool {
 }
 
 fn missing_dependencies() -> Vec<&'static str> {
+    if is_x11() {
+        return [
+            (!has_command("pipewire")).then_some("pipewire"),
+            (!has_command("xclip")).then_some("xclip"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+    }
     let portal = std::path::Path::new("/usr/share/xdg-desktop-portal/portals")
         .read_dir()
         .is_ok_and(|mut d| {
@@ -212,7 +230,13 @@ pub fn prepare_unattended() -> Vec<crate::setup::Need> {
             });
         }
     }
-    if !input::has_accessibility() {
+    if !input::has_accessibility() && is_x11() {
+        needs.push(crate::setup::Need {
+            step: "input-access",
+            action: "Enable the XTEST extension in the X server (remote input needs it)".into(),
+            on_screen: false,
+        });
+    } else if !input::has_accessibility() {
         let script = format!(
             "echo 'KERNEL==\"uinput\", TAG+=\"uaccess\", OPTIONS+=\"static_node=uinput\"' > {UDEV_RULE} && \
              echo uinput > {MODULES_LOAD} && modprobe uinput && \
@@ -245,11 +269,17 @@ pub fn open_url(url: &str) {
 
 /// Where to allow screen capture, for messages.
 pub fn screen_settings() -> String {
+    if is_x11() {
+        return "the X session (the service needs DISPLAY and XAUTHORITY; run `glass setup` there)".into();
+    }
     "the desktop's screen-share picker (run `glass setup` on the machine)".into()
 }
 
 /// Where to allow remote input, for messages.
 pub fn input_settings() -> String {
+    if is_x11() {
+        return "the X server's configuration (the XTEST extension is missing)".into();
+    }
     "`glass setup` (grants /dev/uinput access, then log out and back in)".into()
 }
 
@@ -260,14 +290,26 @@ pub fn try_tailscale_operator() -> bool {
 
 pub fn permission_needs(status: &Status) -> Vec<crate::setup::Need> {
     let mut needs = Vec::new();
-    if !status.capturing {
+    if !status.capturing && is_x11() {
+        needs.push(crate::setup::Need {
+            step: "screen-share",
+            action: "The service can't reach the X server: run `glass setup` inside the desktop session".into(),
+            on_screen: false,
+        });
+    } else if !status.capturing {
         needs.push(crate::setup::Need {
             step: "screen-share",
             action: "Approve screen sharing in the desktop's share picker (shown on the machine's screen)".into(),
             on_screen: true,
         });
     }
-    if !status.accessibility {
+    if !status.accessibility && is_x11() {
+        needs.push(crate::setup::Need {
+            step: "input-access",
+            action: "Enable the XTEST extension in the X server (remote input needs it)".into(),
+            on_screen: false,
+        });
+    } else if !status.accessibility {
         needs.push(crate::setup::Need {
             step: "input-access",
             action: "Log out and back in so the uinput rule applies, or run `glass setup` there"
@@ -282,6 +324,20 @@ pub fn permissions(status: Status) -> Result<()> {
     log::step("Screen sharing")?;
     if status.capturing {
         log::success("Already sharing")?;
+    } else if is_x11() {
+        // Nothing to approve on X11: capture starts as soon as the service is up.
+        let sp = spinner();
+        sp.start("Waiting for screen capture to start");
+        let started = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(500));
+            status::read().is_some_and(|s| s.is_fresh() && s.capturing)
+        });
+        if started {
+            sp.stop("Capturing the X11 screen");
+        } else {
+            sp.stop("Screen capture hasn't started");
+            log::warning(format!("The service isn't capturing yet.{}", super::agent::LOG_HINT))?;
+        }
     } else {
         note(
             "Choose what to share",
@@ -298,7 +354,7 @@ pub fn permissions(status: Status) -> Result<()> {
         }
         sp.stop("Screen sharing approved");
     }
-    if !status::read().is_some_and(|s| s.accessibility) {
+    if !is_x11() && !status::read().is_some_and(|s| s.accessibility) {
         log::warning(
             "The service can't open /dev/uinput yet, so remote input is off. Re-run `glass setup` after logging out and in.",
         )?;

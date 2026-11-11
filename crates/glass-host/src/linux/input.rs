@@ -1,6 +1,7 @@
 //! Injects client input through uinput: a virtual keyboard and an absolute pointer.
 //! Needs write access to /dev/uinput (`glass setup` installs a udev rule granting it to
-//! the logged-in user).
+//! the logged-in user). On X11 the same events go through XTEST instead (`x11_input`),
+//! which needs no device access.
 
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -16,6 +17,7 @@ use super::keymap::{
     self, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_RIGHTMETA, KEY_V,
 };
 use super::video::{self, Rect};
+use super::x11_input::{self, X11Input};
 
 /// Absolute pointer resolution across the whole desktop layout.
 const ABS_MAX: i32 = 65535;
@@ -23,10 +25,15 @@ const ABS_MAX: i32 = 65535;
 const HI_RES_PER_PIXEL: f32 = 3.0;
 
 pub fn has_accessibility() -> bool {
+    if super::is_x11() {
+        return x11_input::available();
+    }
     OpenOptions::new().write(true).open("/dev/uinput").is_ok()
 }
 
 pub struct Injector {
+    /// Set on X11, where XTEST replaces the two virtual devices.
+    x11: Option<X11Input>,
     keyboard: Option<VirtualDevice>,
     pointer: Option<VirtualDevice>,
     /// Logical rect of each streamed display, by stream number.
@@ -43,6 +50,7 @@ pub struct Injector {
 impl Injector {
     pub fn new(display: u32) -> Self {
         let mut this = Self {
+            x11: None,
             keyboard: None,
             pointer: None,
             bounds: Vec::new(),
@@ -60,7 +68,15 @@ impl Injector {
     /// Creates the virtual devices if they don't exist yet (e.g. access was granted
     /// after the host started).
     fn ensure_devices(&mut self) {
-        if self.keyboard.is_some() && self.pointer.is_some() {
+        if self.x11.is_some() || (self.keyboard.is_some() && self.pointer.is_some()) {
+            return;
+        }
+        if super::is_x11() {
+            self.x11 = X11Input::open();
+            match self.x11 {
+                Some(_) => tracing::info!("input: XTEST ready"),
+                None => tracing::warn!("input: the X server has no XTEST extension; remote input is off"),
+            }
             return;
         }
         match build_devices() {
@@ -91,6 +107,10 @@ impl Injector {
 
     fn move_to(&mut self, gx: f64, gy: f64) {
         self.pos = (gx, gy);
+        if let Some(x11) = &self.x11 {
+            // Root-window pixels are the logical coordinates on X11.
+            return x11.motion(gx, gy);
+        }
         let l = self.layout;
         let ax = (((gx - l.x) / l.w.max(1.0)) * ABS_MAX as f64).round() as i32;
         let ay = (((gy - l.y) / l.h.max(1.0)) * ABS_MAX as f64).round() as i32;
@@ -141,6 +161,9 @@ impl Injector {
                     _ => return,
                 };
                 self.buttons[button as usize] = down;
+                if let Some(x11) = &self.x11 {
+                    return x11.button([1, 2, 3][button as usize], down);
+                }
                 self.pointer(&[InputEvent::new(EventType::KEY.0, code, down as i32)]);
             }
             Ev::Scroll { dx, dy } => {
@@ -148,6 +171,16 @@ impl Injector {
                 let (v, h) = (-dy * HI_RES_PER_PIXEL, dx * HI_RES_PER_PIXEL);
                 self.wheel.0 += v;
                 self.wheel.1 += h;
+                // Whole notches, for X11 and for apps that ignore hi-res scrolling.
+                let notches = (
+                    (self.wheel.0 / 120.0).trunc(),
+                    (self.wheel.1 / 120.0).trunc(),
+                );
+                self.wheel.0 -= notches.0 * 120.0;
+                self.wheel.1 -= notches.1 * 120.0;
+                if let Some(x11) = &self.x11 {
+                    return x11.scroll(notches.0 as i32, notches.1 as i32);
+                }
                 let mut events = vec![
                     InputEvent::new(
                         EventType::RELATIVE.0,
@@ -160,18 +193,12 @@ impl Injector {
                         h.round() as i32,
                     ),
                 ];
-                // Legacy whole-notch events for apps that ignore hi-res scrolling.
-                let notches = (
-                    (self.wheel.0 / 120.0).trunc(),
-                    (self.wheel.1 / 120.0).trunc(),
-                );
                 if notches.0 != 0.0 {
                     events.push(InputEvent::new(
                         EventType::RELATIVE.0,
                         RelativeAxisCode::REL_WHEEL.0,
                         notches.0 as i32,
                     ));
-                    self.wheel.0 -= notches.0 * 120.0;
                 }
                 if notches.1 != 0.0 {
                     events.push(InputEvent::new(
@@ -179,7 +206,6 @@ impl Injector {
                         RelativeAxisCode::REL_HWHEEL.0,
                         notches.1 as i32,
                     ));
-                    self.wheel.1 -= notches.1 * 120.0;
                 }
                 self.pointer(&events);
             }
@@ -230,6 +256,9 @@ impl Injector {
     }
 
     fn key(&mut self, code: u16, down: bool) {
+        if let Some(x11) = self.x11.as_mut() {
+            return x11.key(code, down);
+        }
         if let Some(kb) = self.keyboard.as_mut()
             && let Err(e) = kb.emit(&[InputEvent::new(EventType::KEY.0, code, down as i32)])
         {

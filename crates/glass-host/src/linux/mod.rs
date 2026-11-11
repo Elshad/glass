@@ -1,5 +1,7 @@
-//! Linux (Wayland): xdg-desktop-portal + PipeWire capture, VA-API or OpenH264 encode, uinput input,
-//! wl-clipboard, and a systemd user service. Built and tested against Hyprland (Omarchy).
+//! Linux. On Wayland: xdg-desktop-portal + PipeWire capture, uinput input and wl-clipboard,
+//! built and tested against Hyprland (Omarchy). On X11 (`is_x11`): MIT-SHM capture of the
+//! root window, XTEST input and xclip, built and tested against XFCE. Both: VA-API or
+//! OpenH264 encode, PipeWire audio, and a systemd user service.
 
 pub mod agent;
 pub mod audio;
@@ -15,6 +17,8 @@ pub mod setup;
 #[cfg(feature = "vaapi")]
 pub mod va_encode;
 pub mod video;
+mod x11_capture;
+mod x11_input;
 
 use std::process::{Command, Stdio};
 
@@ -61,11 +65,27 @@ pub fn keep_awake() -> Option<std::process::Child> {
         .ok()
 }
 
-/// Turns monitors back on if the compositor powered them off (Hyprland).
+/// Whether this is an X11 session: an X display and no Wayland compositor. Decided once,
+/// when first asked.
+pub fn is_x11() -> bool {
+    static X11: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *X11.get_or_init(|| {
+        let set = |name| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+        set("DISPLAY") && !set("WAYLAND_DISPLAY")
+    })
+}
+
+/// Turns monitors back on if they were powered off (X11 DPMS, or Hyprland's).
 pub fn wake_displays() {
-    let _ = Command::new("hyprctl")
-        .args(["dispatch", "dpms", "on"])
+    let (command, args): (_, &[&str]) = if is_x11() {
+        ("xset", &["dpms", "force", "on"])
+    } else {
+        ("hyprctl", &["dispatch", "dpms", "on"])
+    };
+    let _ = Command::new(command)
+        .args(args)
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
 

@@ -1,5 +1,6 @@
-//! Wayland clipboard via wl-clipboard's `wl-copy` / `wl-paste`: text, and images.
-//! TODO: rich text (HTML). `wl-copy` offers one type per call, so setting HTML would drop
+//! The clipboard via wl-clipboard's `wl-copy` / `wl-paste` on Wayland and `xclip` on X11:
+//! text, and images.
+//! TODO: rich text (HTML). Both tools offer one type per call, so setting HTML would drop
 //! the plain text other apps need; it needs a clipboard owner offering several types.
 
 use std::io::Write;
@@ -18,10 +19,23 @@ const POLL: Duration = Duration::from_millis(500);
 /// the text, or for an image its size.
 static LAST: Mutex<Option<String>> = Mutex::new(None);
 
+/// X11 names UTF-8 text by its own target, not by a MIME type.
+fn x11_target(mime: &str) -> &str {
+    if mime.starts_with("text/plain") { "UTF8_STRING" } else { mime }
+}
+
 fn copy(bytes: &[u8], mime: &str) {
-    // wl-copy forks a process that keeps serving the selection after we return.
-    let child = Command::new("wl-copy")
-        .args(["--type", mime])
+    // Both tools fork a process that keeps serving the selection after we return.
+    let mut command = if super::is_x11() {
+        let mut c = Command::new("xclip");
+        c.args(["-selection", "clipboard", "-in", "-target", x11_target(mime)]);
+        c
+    } else {
+        let mut c = Command::new("wl-copy");
+        c.args(["--type", mime]);
+        c
+    };
+    let child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -33,6 +47,7 @@ fn copy(bytes: &[u8], mime: &str) {
             }
             let _ = child.wait();
         }
+        Err(e) if super::is_x11() => tracing::warn!("xclip: {e} (install xclip)"),
         Err(e) => tracing::warn!("wl-copy: {e} (install wl-clipboard)"),
     }
 }
@@ -59,11 +74,16 @@ fn image_marker(len: usize) -> String {
 }
 
 fn paste(mime: &str) -> Option<Vec<u8>> {
-    let out = Command::new("wl-paste")
-        .args(["--no-newline", "--type", mime])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let mut command = if super::is_x11() {
+        let mut c = Command::new("xclip");
+        c.args(["-selection", "clipboard", "-out", "-target", x11_target(mime)]);
+        c
+    } else {
+        let mut c = Command::new("wl-paste");
+        c.args(["--no-newline", "--type", mime]);
+        c
+    };
+    let out = command.stderr(Stdio::null()).output().ok()?;
     out.status.success().then_some(out.stdout)
 }
 
@@ -72,7 +92,16 @@ fn types() -> Vec<String> {
 }
 
 fn paste_types() -> Option<Vec<String>> {
-    let out = Command::new("wl-paste").arg("--list-types").stderr(Stdio::null()).output().ok()?;
+    let mut command = if super::is_x11() {
+        let mut c = Command::new("xclip");
+        c.args(["-selection", "clipboard", "-out", "-target", "TARGETS"]);
+        c
+    } else {
+        let mut c = Command::new("wl-paste");
+        c.arg("--list-types");
+        c
+    };
+    let out = command.stderr(Stdio::null()).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).lines().map(str::to_owned).collect())
