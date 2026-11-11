@@ -42,7 +42,18 @@ pub enum ClientMsg {
         /// The browser's user agent, for device posture checks.
         #[serde(default)]
         ua: Option<String>,
+        /// The viewer draws the pointer itself (`cursor` messages, KIND_CURSOR datagrams)
+        /// rather than needing it in the video. See `crate::cursor`.
+        #[serde(default)]
+        cursor: bool,
+        /// The viewer acknowledges frames (KIND_FRAME_ACK), so its bitrate comes from those
+        /// from the start, not from its reports. See `rate::AckRate`.
+        #[serde(default)]
+        acks: bool,
     },
+    /// The viewer now draws the pointer itself, or (trackpad mode, which has its own) wants
+    /// it back in the video.
+    LocalCursor { on: bool },
     /// The browser's answer to a `passkey` request (WebAuthn), all fields base64url.
     Passkey(crate::passkey::Response),
     /// A chat message to the host and the other viewers.
@@ -60,6 +71,9 @@ pub enum ClientMsg {
     ListWindows,
     /// Previews of every display (answered with `thumbs`, only the ones that changed).
     Thumbs,
+    /// Send Ctrl+Alt+Del (Windows secure attention sequence). Needs the Glass secure-desktop
+    /// service; a no-op elsewhere. Input permission required.
+    Sas,
     /// The owner steering an agent: `pause`, `resume`, `stop`, `allow`.
     Agent { op: String },
     /// The owner's answer to an agent's question (`agentAsk`).
@@ -283,6 +297,18 @@ pub enum ServerMsg {
         name: String,
         path: String,
     },
+    /// The pointer's image (to viewers drawing it themselves): `id` is what datagrams name,
+    /// `w`×`h` straight RGBA (base64) at `scale` pixels to a point, hotspot `hx`, `hy` in
+    /// pixels.
+    Cursor {
+        id: u32,
+        w: u32,
+        h: u32,
+        hx: u32,
+        hy: u32,
+        scale: f32,
+        rgba: String,
+    },
     Error {
         msg: String,
     },
@@ -337,12 +363,18 @@ pub struct Features {
     pub lossless: bool,
     /// The key browsers subscribe to notifications with (VAPID, base64url).
     pub push: Option<String>,
+    /// Sends lost fragments again when asked (`KIND_NACK`).
+    pub nack: bool,
     /// The file browser (owners with files allowed).
     pub browse: bool,
     /// The viewer can become a second display ("Use as a second display").
     pub extend: bool,
+    /// The host's desktop can be reshaped to the viewer's screen ("Fit this device", macOS).
+    pub fit: bool,
     /// A quick-support session (`glass support`): the viewer is someone helping.
     pub support: bool,
+    /// The viewer may draw the pointer itself (`localCursor`).
+    pub cursor: bool,
 }
 
 /// Header that follows the `STREAM_FILE` tag in either direction.
@@ -354,6 +386,10 @@ pub struct FileHeader {
     /// Downloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
+    /// host -> client: a folder zipped as it's sent, so `size` isn't known (0). It's
+    /// complete when the stream ends with the zip's end record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub streamed: bool,
 }
 
 pub async fn read_json<T: for<'de> Deserialize<'de>>(stream: &mut RecvStream) -> Result<Option<T>> {
@@ -448,10 +484,12 @@ pub fn save_token(path: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
-fn getrandom(buf: &mut [u8]) -> Result<()> {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")?.read_exact(buf)?;
-    Ok(())
+/// Fills `buf` from the system's secure random source (any OS).
+pub fn getrandom(buf: &mut [u8]) -> Result<()> {
+    use ring::rand::SecureRandom;
+    ring::rand::SystemRandom::new()
+        .fill(buf)
+        .map_err(|_| anyhow::anyhow!("no system randomness"))
 }
 
 /// Constant-time comparison so the token can't be guessed byte by byte from timing.

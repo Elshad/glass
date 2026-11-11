@@ -2,3 +2,5 @@
 /certs
 /logs
 /dist
+/tests/e2e/windows-vm/micprobe/target
+/tests/e2e/windows-vm/micprobe/Cargo.lock

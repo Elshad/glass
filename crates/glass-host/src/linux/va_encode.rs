@@ -66,6 +66,8 @@ pub struct VaEncoder {
     layout: gstreamer_video::VideoInfo,
     next_pts: Option<gst::ClockTime>,
     frame_duration: gst::ClockTime,
+    /// Frames a second it was made for (sizes the rate controller's buffer).
+    fps: u32,
     /// Bitrate (bps) the encoder runs at, the latest target, and when it last changed.
     bitrate: (u32, u32, Instant),
     pub name: &'static str,
@@ -161,8 +163,10 @@ impl VaEncoder {
             next_pts: None,
             frame_duration: gst::ClockTime::from_nseconds(1_000_000_000 / fps.max(1) as u64),
             bitrate: (bitrate, bitrate, Instant::now()),
+            fps: fps.max(1),
             name,
         };
+        this.set_cpb(bitrate);
         this.pipeline
             .set_state(gst::State::Playing)
             .map_err(|_| this.error("starting the VA-API pipeline"))?;
@@ -174,6 +178,16 @@ impl VaEncoder {
         self.source
     }
 
+    /// The rate controller's buffer: about two frames at the target (rate::short_window),
+    /// so one frame can't take a second's worth of bits on a slow link. Older va plugins
+    /// have no such property; they keep their default.
+    fn set_cpb(&self, bps: u32) {
+        if self.encoder.find_property("cpb-size").is_some() {
+            let kbits = (crate::rate::short_window(bps, self.fps).0 * 8.0 / 1000.0) as u32;
+            self.encoder.set_property("cpb-size", kbits.max(1));
+        }
+    }
+
     /// Sets the target bitrate; `should_apply` decides when the encoder follows it.
     pub fn set_bitrate(&mut self, bps: u32) {
         self.bitrate.1 = bps;
@@ -183,6 +197,7 @@ impl VaEncoder {
         let (applied, wanted, at) = self.bitrate;
         if should_apply(applied, wanted, at.elapsed()) {
             self.encoder.set_property("bitrate", (wanted / 1000).max(100));
+            self.set_cpb(wanted);
             self.bitrate = (wanted, wanted, Instant::now());
         }
     }

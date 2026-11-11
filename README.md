@@ -56,7 +56,7 @@ And the viewer is just a web page. No app to install, no account to create.
 - **Full control.** Mouse, trackpad, keyboard, touch and pinch to zoom, or trackpad mode on a phone (drag the pointer, the zoomed view follows it). ⌘Tab works on iPad. Unlock a locked Mac from the lock screen, even a MacBook with its lid closed (`glass config lid-awake on`, while it's plugged in).
 - **Apple Pencil.** Pressure and tilt reach the Mac as tablet input, so drawing apps respond as they do to a drawing tablet.
 - **Keyboards per machine.** ⌘↔Ctrl, PC-keyboard and ⌘/⌥ swaps remembered for each computer, and a shortcut bar for touch screens.
-- **Games.** Capture the mouse (relative motion) for games and 3D apps; game controllers reach Linux hosts.
+- **Games.** Capture the mouse (relative motion) for games and 3D apps; game controllers reach Linux hosts, and Windows hosts with the free ViGEmBus driver.
 - **Every machine.** All your computers in one menu; wake sleeping ones (Wake-on-LAN), restart Glass or the whole computer and reconnect.
 
 ### Between your devices
@@ -84,7 +84,7 @@ And the viewer is just a web page. No app to install, no account to create.
 - **Agent-ready setup.** Ask Claude Code to "set up Glass on my Mac mini" and it does it over SSH ([skill](#set-up-with-an-ai-agent)).
 
 ### The Mac app, the console and the command line
-- **A real Mac app.** Glass.app does everything the CLI does in a native, GPU-drawn window: setup in a few clicks, who's connected and chat, links with QR codes, machines, history, AI agents, settings and teams, and a one-click update.
+- **A real desktop app.** Glass.app on a Mac, and Glass in the Start menu on Windows, does everything the CLI does in a native, GPU-drawn window: setup in a few clicks, who's connected and chat, links with QR codes, machines, history, AI agents, settings and teams, and a one-click update.
 - **A console.** `https://<computer>/admin/`: who's connected, requests to allow, links, devices, history, settings, access rules, and an address book of your machines.
 - **Beyond the desktop.** Stream a single app's window, a resizable full-screen terminal in the viewer, local web ports (`/fwd/3000/`) from your tailnet, and recording to MP4.
 
@@ -109,7 +109,7 @@ And the viewer is just a web page. No app to install, no account to create.
 **Host** (the computer you control):
 
 - macOS 13 Ventura or newer, Apple Silicon or Intel.
-- Linux x86_64 on Wayland with PipeWire (beta). Built on Hyprland/Omarchy; works on GNOME and KDE. Arch, Fedora 40+, Ubuntu 24.04+.
+- Linux (x86_64 or ARM64) on Wayland with PipeWire (beta). Built on Hyprland/Omarchy; works on GNOME and KDE. Arch, Fedora 40+, Ubuntu 24.04+.
   Video is encoded in software (OpenH264), so the ~20 ms above is the Mac figure. A build with `--features vaapi` (needs the GStreamer libraries) can encode on an Intel or AMD GPU instead: set `GLASS_ENCODER=vaapi` for the service.
 
 ```sh
@@ -216,7 +216,7 @@ Found a security issue? Please open a [private security advisory](https://github
 
 **Do I need an app on the iPad?** No, just Safari. Tailscale is optional when you use `glass link --anywhere`.
 
-**Can Windows be the host?** Not yet. Windows works as a viewer in any modern browser.
+**Can Windows be the host?** Yes, in beta: Windows 10 or 11, x64 or Arm. In PowerShell, `irm glassdesk.dev/install.ps1 | iex`. See [Windows host](https://glassdesk.dev/docs#windows-host-beta).
 
 **Can I control a locked Mac?** Yes, type your password at the lock screen. After a reboot, FileVault still needs one local login.
 
@@ -249,6 +249,10 @@ cd site && npm install && npm run dev       # site locally (wrangler dev)
 Issues and pull requests are welcome. For anything bigger than a fix, open an issue first so we can agree on the approach. Feedback also works from the app (`glass feedback "…"`) or at [glassdesk.dev](https://glassdesk.dev/features#feedback).
 
 If Glass is useful to you, a ⭐ helps other people find it.
+
+## Code signing policy
+
+Releases are signed in GitHub Actions from this repository's source; Windows signing is being set up through SignPath Foundation. See the [code signing policy](https://glassdesk.dev/docs#code-signing-policy).
 
 ## License
 

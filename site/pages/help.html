@@ -104,7 +104,7 @@
   <main class="help wrap">
     <section>
       <h1>Help someone with their computer.</h1>
-      <p class="lead"><strong>Glass quick support is a free way to see and control someone's Mac or Linux computer from your browser, with nothing left installed on theirs.</strong> They run one line and read you a code. You see and control their screen from this browser, once they allow it. When they stop, nothing stays on their computer.</p>
+      <p class="lead"><strong>Glass quick support is a free way to see and control someone's Mac, Windows or Linux computer from your browser, with nothing left installed on theirs.</strong> They run one line and read you a code. You see and control their screen from this browser, once they allow it. When they stop, nothing stays on their computer.</p>
     </section>
 
     <ol>
@@ -114,6 +114,11 @@
           <span>On a Mac: Spotlight (⌘ Space), type Terminal. If they already have Glass, <code>glass support</code> does the same.</span>
           <div class="command lg-glass-surface" data-lg-preset="control" data-copy="curl -fsSL glassdesk.dev/help | sh">
             <code><span class="prompt" aria-hidden="true">$</span> curl -fsSL glassdesk.dev/help | sh</code>
+            <button type="button" class="copy">Copy</button>
+          </div>
+          <span>On Windows: Start menu, type PowerShell, and paste this instead.</span>
+          <div class="command lg-glass-surface" data-lg-preset="control" data-copy="irm glassdesk.dev/help | iex">
+            <code><span class="prompt" aria-hidden="true">&gt;</span> irm glassdesk.dev/help | iex</code>
             <button type="button" class="copy">Copy</button>
           </div>
         </div>

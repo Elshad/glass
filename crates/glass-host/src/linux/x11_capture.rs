@@ -7,6 +7,9 @@
 //! interval, and never while the screen is still. The mailbox keeps only the newest
 //! picture, so a frame the encoder was too busy for is dropped, not queued. The pointer
 //! isn't part of a root-window grab; XFIXES supplies its image and it is drawn in.
+//!
+//! What changed is also passed on to `crate::damage`, which agents wait on: the region
+//! DAMAGE collected since the last grab, plus where the pointer was and is.
 
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
@@ -210,6 +213,16 @@ impl Cursor {
         })
     }
 
+    /// The root-window rectangle the cursor covers with its hotspot at `at`.
+    fn area(&self, at: (i16, i16)) -> xproto::Rectangle {
+        xproto::Rectangle {
+            x: (at.0 as i32 - self.hot.0).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            y: (at.1 as i32 - self.hot.1).clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+            width: self.w as u16,
+            height: self.h as u16,
+        }
+    }
+
     /// Blends the cursor into a `w`×`h` frame with its hotspot at `at`.
     fn draw(&self, frame: &mut [u8], w: i32, h: i32, at: (i32, i32), format: PixelFormat) {
         let (left, top) = (at.0 - self.hot.0, at.1 - self.hot.1);
@@ -272,8 +285,19 @@ fn run(
         conn.randr_select_input(root, randr::NotifyMask::SCREEN_CHANGE)?;
     }
     let mut cursor = has_xfixes.then(|| Cursor::fetch(&conn)).flatten();
+    // Receives what DAMAGE collected, so its rectangles can be read back.
+    let parts = match damage {
+        Some(_) if has_xfixes => {
+            let id = conn.generate_id()?;
+            conn.xfixes_create_region(id, &[])?.check()?;
+            Some(id)
+        }
+        _ => None,
+    };
 
     let mut pointer = (0i16, 0i16);
+    // Pointer positions since the last grab, for damage: where it was drawn, where it is.
+    let mut pointer_trail: Vec<(i16, i16)> = Vec::new();
     let (mut dirty, mut resized, mut first) = (true, false, true);
     let mut last = Instant::now() - interval;
     loop {
@@ -281,6 +305,7 @@ fn run(
         if has_xfixes {
             let p = conn.query_pointer(root)?.reply()?;
             if (p.root_x, p.root_y) != pointer {
+                pointer_trail.push(pointer);
                 pointer = (p.root_x, p.root_y);
                 dirty = true;
             }
@@ -308,16 +333,32 @@ fn run(
         }
         if dirty && last.elapsed() >= interval {
             // Cleared before the grab: anything drawn after it is reported again.
-            if let Some(id) = damage {
-                conn.damage_subtract(id, x11rb::NONE, x11rb::NONE)?;
+            let mut changed = match (damage, parts) {
+                (Some(id), Some(parts)) => {
+                    conn.damage_subtract(id, x11rb::NONE, parts)?;
+                    Some(conn.xfixes_fetch_region(parts)?.reply()?.rectangles)
+                }
+                (Some(id), None) => {
+                    conn.damage_subtract(id, x11rb::NONE, x11rb::NONE)?;
+                    None
+                }
+                _ => None,
+            };
+            if let (Some(rects), Some(c)) = (changed.as_mut(), cursor.as_ref()) {
+                rects.extend(pointer_trail.drain(..).chain([pointer]).map(|p| c.area(p)));
             }
+            pointer_trail.clear();
             last = Instant::now();
             dirty = false;
             let mut failed = false;
             for (i, target) in targets.iter_mut().enumerate() {
                 match grab(&conn, root, target, format, cursor.as_ref(), pointer) {
-                    Ok(()) if first => info!("screen {i}: first frame"),
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if first {
+                            info!("screen {i}: first frame");
+                        }
+                        note_damage(i, target.area, first, changed.as_deref());
+                    }
                     // Usually a grab that raced a resolution change.
                     Err(e) => {
                         tracing::debug!("screen {i}: grab failed: {e:#}");
@@ -335,6 +376,32 @@ fn run(
         let timeout = if dirty { interval.saturating_sub(last.elapsed()) } else { interval };
         wait(fd, timeout);
     }
+}
+
+/// Tells `crate::damage` what changed on monitor `i`: `rects` are on the root window,
+/// `None` when the server can't say (every pixel, then). The first frame shows how the
+/// monitor looks rather than a change.
+fn note_damage(i: usize, area: Area, first: bool, rects: Option<&[xproto::Rectangle]>) {
+    let size = (area.w as usize, area.h as usize);
+    let display = i as u32;
+    if first {
+        return crate::damage::note(display, size, &[]);
+    }
+    let Some(rects) = rects else {
+        return crate::damage::note_all(display, size);
+    };
+    let local: Vec<_> = rects.iter().filter_map(|r| clip(area, r)).collect();
+    crate::damage::note(display, size, &local);
+}
+
+/// `r`'s part inside `area`, as (x0, y0, x1, y1) in `area`'s pixels.
+fn clip(area: Area, r: &xproto::Rectangle) -> Option<(u32, u32, u32, u32)> {
+    let (ax, ay) = (area.x as i32, area.y as i32);
+    let x0 = (r.x as i32).max(ax);
+    let y0 = (r.y as i32).max(ay);
+    let x1 = (r.x as i32 + r.width as i32).min(ax + area.w as i32);
+    let y1 = (r.y as i32 + r.height as i32).min(ay + area.h as i32);
+    (x0 < x1 && y0 < y1).then(|| ((x0 - ax) as u32, (y0 - ay) as u32, (x1 - ax) as u32, (y1 - ay) as u32))
 }
 
 /// Follows a resolution or arrangement change (xrandr, or an xrdp client resizing its
@@ -427,6 +494,16 @@ mod tests {
         let mut frame = vec![0u8; 4];
         cursor(0xffff_0000).draw(&mut frame, 1, 1, (0, 0), PixelFormat::Rgbx);
         assert_eq!(frame[..3], [255, 0, 0]);
+    }
+
+    #[test]
+    fn damage_is_clipped_to_each_monitor() {
+        let right = Area { x: 1920, y: 0, w: 1280, h: 1024 };
+        let rect = |x, y, width, height| xproto::Rectangle { x, y, width, height };
+        // Straddling the two monitors: only the right part, in that monitor's pixels.
+        assert_eq!(clip(right, &rect(1900, 10, 40, 20)), Some((0, 10, 20, 30)));
+        assert_eq!(clip(right, &rect(0, 0, 100, 100)), None);
+        assert_eq!(clip(right, &rect(3190, 1020, 50, 50)), Some((1270, 1020, 1280, 1024)));
     }
 
     #[test]

@@ -83,6 +83,13 @@ header.site nav a:hover, footer.site a:hover { color: var(--text); }
 .command code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; font-size: 15px; scrollbar-width: none; }
 .command code::-webkit-scrollbar { display: none; }
 .prompt { color: var(--text-faint); user-select: none; }
+/* The install commands for this visitor's OS (html.os-win: Windows, set in <head>). */
+.os-win .only-unix, html:not(.os-win) .only-win { display: none; }
+.os-switch {
+  padding: 0; border: 0; background: none; cursor: pointer;
+  color: var(--text-dim); font: inherit; text-decoration: underline; text-underline-offset: 3px;
+}
+.os-switch:hover { color: var(--text); }
 .copy {
   flex: none; padding: 9px 16px; border: 0; border-radius: 11px; cursor: pointer;
   background: var(--text); color: var(--bg); font: 600 14px var(--body);
@@ -101,6 +108,7 @@ header.site nav a:hover, footer.site a:hover { color: var(--text); }
 .works b { font-weight: 600; letter-spacing: -0.01em; }
 .works .apple { width: 15px; height: 15px; margin-top: -2px; }
 .works .omarchy { height: 12px; width: auto; }
+.works .windows { width: 13px; height: 13px; margin-top: -1px; }
 
 /* Single-column hero */
 .hero-solo { grid-template-columns: 1fr; justify-items: center; text-align: center; padding-bottom: clamp(40px, 6vw, 72px); }

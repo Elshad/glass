@@ -11,7 +11,7 @@ use axum::Json;
 use axum::http::{HeaderValue, header};
 use axum::routing::{get, post};
 use glass_proto::{
-    INPUT_EVENT_LEN, InputEvent, KIND_KEYFRAME_REQUEST, KIND_MIC, KIND_PING, MAX_STREAMS,
+    INPUT_EVENT_LEN, InputEvent, KIND_KEYFRAME_REQUEST, KIND_MIC, KIND_NACK, KIND_PING, MAX_STREAMS,
 };
 use tokio::sync::{broadcast, mpsc};
 use tower_http::services::ServeDir;
@@ -43,8 +43,8 @@ pub struct Shared {
     /// Failed sign-ins per address, for brute-force protection.
     pub auth_failures:
         Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>,
-    /// Tailnet login of this Mac's owner; their devices skip the token.
-    pub tailnet_owner: Option<String>,
+    /// Tailnet login of this computer's owner. Filled in later if Tailscale wasn't up yet.
+    pub tailnet_owner: tailscale::TailnetOwner,
     pub audio: AudioPackets,
     pub rate: Mutex<crate::rate::RateControl>,
 }
@@ -68,6 +68,21 @@ pub async fn run(
     client_log: PathBuf,
     extra_routes: Option<axum::Router>,
 ) -> Result<()> {
+    // Quick support's helper links outlive a `glass support` that was killed: take them,
+    // and the access they gave, away once it's gone.
+    {
+        let file = crate::access::file_for(&shared.token_file);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                match crate::access::reap_orphaned_support(&file, crate::platform::process_alive) {
+                    Ok(0) => {}
+                    Ok(n) => info!("support: removed {n} helper link(s) left by an ended glass support"),
+                    Err(e) => warn!("support: couldn't clean up helper links: {e:#}"),
+                }
+            }
+        });
+    }
     let identity = match &tls {
         Some(t) => Identity::load_pemfiles(&t.cert, &t.key).await?,
         None => self_signed_identity(wt_host.as_deref()).await?,
@@ -88,12 +103,17 @@ pub async fn run(
     };
     info!("WebTransport listening on {wt_where} udp/{wt_port}");
     crate::remote::watch(wt_port, listen.wt_dial());
-    crate::fleet::watch();
-    // What the computer is playing, for viewers' media controls (while anyone is connected).
-    crate::now_playing::watch(shared.events.clone());
-    // A mic left on when the host last stopped left BlackHole as the default input.
-    crate::mic::recover();
+    crate::cursor::start(shared.clone());
+    // Fleet's scripts and the microphone belong to a signed-in user, not the sign-in screen.
+    if !crate::signin::active() {
+        crate::fleet::watch();
+        // What the computer is playing, for viewers' media controls (while anyone is connected).
+        crate::now_playing::watch(shared.events.clone());
+        // A mic left on when the host last stopped left BlackHole as the default input.
+        crate::mic::recover();
+    }
 
+    crate::origin::start(wt_host.as_deref()).await;
     let cert_hash = cert_hash.map(|h| serde_json::from_str::<Vec<u8>>(&h).unwrap());
     let version_dir = web_dir.clone();
     let client_config = move || {
@@ -118,18 +138,26 @@ pub async fn run(
     let machines_cache: MachinesCache = Arc::new(tokio::sync::Mutex::new(None));
     let manifest_cache = machines_cache.clone();
     let manifest_dir = web_dir.clone();
+    // The sign-in host (SYSTEM) serves the viewer and nothing else: forwarded ports, the
+    // admin console, single sign-on, agents and file links would all act as SYSTEM.
+    let extras = if crate::signin::active() {
+        axum::Router::new()
+    } else {
+        axum::Router::new()
+            .merge(crate::forward::routes())
+            .merge(crate::oidc::routes())
+            .merge(crate::admin::routes())
+            .merge(crate::ldap::routes())
+            .merge(crate::scim::routes())
+            .merge(crate::acl::routes())
+            .merge(crate::computer::routes())
+            .merge(crate::oauth::routes())
+            .merge(crate::push::routes())
+            .merge(crate::browse::routes())
+    };
     let app = axum::Router::new()
         .merge(extra_routes.unwrap_or_default())
-        .merge(crate::forward::routes())
-        .merge(crate::oidc::routes())
-        .merge(crate::admin::routes())
-        .merge(crate::ldap::routes())
-        .merge(crate::scim::routes())
-        .merge(crate::acl::routes())
-        .merge(crate::computer::routes())
-        .merge(crate::oauth::routes())
-        .merge(crate::push::routes())
-        .merge(crate::browse::routes())
+        .merge(extras)
         .route("/config.json", get(client_config))
         .route(
             "/manifest.webmanifest",
@@ -148,11 +176,15 @@ pub async fn run(
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
-        ));
+        ))
+        // Before anything else: no other site's page, and no rebound host name.
+        .layer(axum::middleware::from_fn(crate::origin::check));
     // Agents from anywhere: only the OAuth and MCP routes, on this computer alone, for
     // Tailscale Funnel to publish (glass agents public on). This listener is loopback-only
     // and does not follow --bind.
-    crate::oauth::serve_public();
+    if !crate::signin::active() {
+        crate::oauth::serve_public();
+    }
     let web_port = http_listeners
         .first()
         .context("no web listener")?
@@ -305,8 +337,17 @@ fn wt_server_config(
             Ipv6DualStackConfig::Deny,
         ),
     };
+    // QUIC grows its window one round trip at a time from about 12 KB: on a phone's 300 ms,
+    // that alone takes a second to carry the first picture.
+    let mut transport = wtransport::config::QuicTransportConfig::default();
+    let mut cubic = wtransport::quinn::congestion::CubicConfig::default();
+    cubic.initial_window(QUIC_INITIAL_WINDOW);
+    transport.congestion_controller_factory(Arc::new(cubic));
+    // No growing packets: on cellular it would lose the large ones, then shrink back, and the
+    // fragments of a keyframe already sent could then never be sent again ("too large").
+    transport.mtu_discovery_config(None);
     let configured = builder
-        .with_identity(identity.clone_identity())
+        .with_custom_transport(identity.clone_identity(), transport)
         .keep_alive_interval(Some(Duration::from_secs(2)))
         .max_idle_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| WtBindError::Config(anyhow::anyhow!("WebTransport idle timeout: {err:?}")))?;
@@ -315,6 +356,13 @@ fn wt_server_config(
 
 async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let request = incoming.await?;
+    // Any site's page may open a session, and the owner's devices sign in by who they are:
+    // only Glass's own pages (this host's, or another of the owner's machines') may.
+    if let Some(why) = crate::origin::refuse_session(request.authority(), request.origin()) {
+        warn!("{}: refused a session: {why}", request.remote_address());
+        request.forbidden().await;
+        return Ok(());
+    }
     // A WebRTC viewer arrives through the local bridge, which vouches for its real address.
     let relayed = crate::remote::relayed_peer(request.path());
     let conn = request.accept().await?;
@@ -331,10 +379,20 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let rtp_video = relayed.as_ref().is_some_and(|r| r.rtp_video);
 
     let authed = Arc::new(AtomicBool::new(false));
-    let audio_on = Arc::new(AtomicBool::new(false));
+    let audio_tap = Arc::new(crate::opus_audio::AudioTap::default());
     let video_on = Arc::new(AtomicBool::new(true));
+    // Which streams this viewer has had a keyframe of: before that, nothing can be decoded.
+    let keyed = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    // Its screen's size is known (or waited for long enough). A keyframe before that is the
+    // wrong size: something else restarting the encoder as a viewer joins, say.
+    let sized = Arc::new(AtomicBool::new(false));
     let perms = Arc::new(std::sync::OnceLock::new());
     let mic_on = Arc::new(AtomicBool::new(false));
+    // Draws the pointer itself (crate::cursor): gets its position as datagrams. Who it is
+    // when it moves the pointer, to tell it whether the pointer is where its mouse is.
+    let local_cursor = Arc::new(AtomicBool::new(false));
+    let driver = crate::cursor::new_driver();
+    let mut cursor = crate::cursor::subscribe();
     let mut audio = shared.audio.subscribe();
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<ServerMsg>();
     let mut ctl_rx = Some(ctl_rx);
@@ -343,6 +401,10 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let mut next_frame_id = [0u32; MAX_STREAMS];
     // When this client last had a keyframe request honoured: [all streams, stream 0, …].
     let mut last_keyframe_request = [None::<std::time::Instant>; MAX_STREAMS + 1];
+    let session_started = std::time::Instant::now();
+    // Sent fragments, kept a moment for viewers that ask for lost ones again.
+    let mut sent_frames = crate::retransmit::SentFrames::default();
+    let nack_on = Arc::new(AtomicBool::new(false));
 
     // The page pings every 500 ms; a session that stops hearing from it is a page that's
     // gone (Safari can keep a dead page's connection alive), or one suspended in the
@@ -350,9 +412,49 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     let mut last_heard = std::time::Instant::now();
     let mut quiet_check = tokio::time::interval(QUIET_CHECK);
 
+    // Flow control (crate::flow): frames still in QUIC's datagram buffer hold capture
+    // back, so a slow link gets fewer frames instead of a growing queue.
+    let datagram_capacity = conn.quic_connection().datagram_send_buffer_space();
+    let mut link = crate::flow::Link::default();
+    let mut flow = crate::flow::Viewer::new();
+    let mut flow_poll = tokio::time::interval(crate::flow::POLL);
+    flow_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // A viewer that acknowledges frames (it says so in hello; KIND_FRAME_ACK) gets its own
+    // bitrate from them (rate::AckRate), as a cap on the shared encoders like a remote
+    // viewer's; its once-a-second reports then don't drive the shared rate, from the start.
+    // Older viewers stay on the reports. Its acks also say when frames are gone
+    // (crate::flow).
+    let acking = Arc::new(AtomicBool::new(false));
+    let mut ack_rate: Option<crate::rate::AckRate> = None;
+    let mut last_cap = None;
+    let cap = AckCap(ACK_CAP_KEYS + flow.id());
+    let mut rate_tick = tokio::time::interval(crate::rate::ACK_TICK);
+    rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     let result: Result<()> = async {
         loop {
             tokio::select! {
+                _ = flow_poll.tick(), if link.busy() => {
+                    let now = std::time::Instant::now();
+                    link.set_rtt(conn.rtt(), now);
+                    link.drained(datagrams_queued(&conn, datagram_capacity), now);
+                    // Paused: what's in flight says nothing about the link.
+                    if !video_on.load(Ordering::Relaxed) {
+                        link.forget();
+                    }
+                    flow.update(&mut link, now);
+                }
+                // While paused nothing's sent, so there's nothing to learn about the link.
+                _ = rate_tick.tick(), if acking.load(Ordering::Relaxed) && video_on.load(Ordering::Relaxed) => {
+                    let now = std::time::Instant::now();
+                    let rate = ack_rate.get_or_insert_with(|| crate::rate::AckRate::new(shared.rate.lock().unwrap().max()));
+                    let bps = rate.update(link.ack_sample(now), now);
+                    link.set_pace(bps);
+                    if last_cap != Some(bps) {
+                        last_cap = Some(bps);
+                        set_remote_cap(cap.0, Some(bps));
+                    }
+                }
                 _ = quiet_check.tick() => {
                     if last_heard.elapsed() > QUIET_LIMIT {
                         bail!("viewer went quiet for {}s", QUIET_LIMIT.as_secs());
@@ -378,15 +480,46 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                     }
                     let Some(next_id) = next_frame_id.get_mut(frame.stream as usize) else { continue };
                     if authed.load(Ordering::Relaxed) && video_on.load(Ordering::Relaxed) {
-                        send_frame(&conn, &frame, next_id)?;
+                        let bit = 1u8 << (frame.stream as usize).min(7);
+                        if keyed.load(Ordering::Relaxed) & bit == 0 {
+                            // The first display first: others wait for its first picture, then
+                            // their viewer asks for theirs.
+                            if !frame.keyframe || !sized.load(Ordering::Relaxed) || (frame.stream != 0 && keyed.load(Ordering::Relaxed) & 1 == 0) {
+                                *next_id = next_id.wrapping_add(1);
+                                continue;
+                            }
+                            keyed.fetch_or(bit, Ordering::Relaxed);
+                            info!("{peer}: first keyframe of stream {}: {} KB, {} ms after connecting", frame.stream, frame.data.len() / 1024, session_started.elapsed().as_millis());
+                        }
+                        let now = std::time::Instant::now();
+                        if acking.load(Ordering::Relaxed) {
+                            link.expect_acks();
+                        }
+                        link.drained(datagrams_queued(&conn, datagram_capacity), now);
+                        let sent = nack_on.load(Ordering::Relaxed).then_some(&mut sent_frames);
+                        let (id, bytes) = send_frame(&conn, &frame, next_id, sent)?;
+                        if bytes > 0 {
+                            link.sent(frame.stream, id, bytes, now);
+                        }
+                        flow.update(&mut link, now);
                     } else {
                         // Keep ids moving so a resumed client sees a gap and waits for a keyframe.
                         *next_id = next_id.wrapping_add(1);
                     }
                 }
+                changed = cursor.changed(), if local_cursor.load(Ordering::Relaxed) => {
+                    // (The sender lives as long as the host.)
+                    if changed.is_ok() && authed.load(Ordering::Relaxed) && video_on.load(Ordering::Relaxed) {
+                        let pos = *cursor.borrow_and_update();
+                        let dgram = pos.datagram(driver);
+                        link.other(dgram.len());
+                        conn.send_datagram(dgram)?;
+                    }
+                }
                 packet = audio.recv() => {
                     match packet {
-                        Ok(p) if audio_on.load(Ordering::Relaxed) => {
+                        Ok(p) if audio_tap.wants(&p) => {
+                            link.other(p.len());
                             conn.send_datagram(p.as_slice())?;
                         }
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -402,6 +535,7 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                     match dgram.first() {
                         Some(&KIND_PING) => {
                             if let Some(pong) = glass_proto::pong(&dgram, now_us()) {
+                                link.other(pong.len());
                                 conn.send_datagram(pong)?;
                             }
                         }
@@ -416,7 +550,35 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                                 shared.video.request_keyframe(stream);
                             }
                         }
+                        Some(&KIND_NACK) if authed.load(Ordering::Relaxed) => {
+                            if let Some((stream, id, fragments)) = glass_proto::read_nack(&dgram) {
+                                match sent_frames.again(stream, id, &fragments) {
+                                    Some(dgrams) => {
+                                        for d in dgrams {
+                                            // The path may have shrunk since it was first sent: the
+                                            // viewer gives up on it, and asks for a keyframe.
+                                            link.other(d.len());
+                                            if conn.send_datagram(d).is_err() {
+                                                conn.send_datagram(glass_proto::nack(stream, id, &[]))?;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    None => conn.send_datagram(glass_proto::nack(stream, id, &[]))?,
+                                }
+                            }
+                        }
                         Some(&KIND_MIC) if mic_on.load(Ordering::Relaxed) => crate::mic::packet(&dgram),
+                        Some(&glass_proto::KIND_FRAME_ACK) => {
+                            if let Some((stream, id)) = glass_proto::read_frame_ack(&dgram) {
+                                if !acking.swap(true, Ordering::Relaxed) {
+                                    info!("{peer}: frames acknowledged: pacing video by them");
+                                }
+                                let now = std::time::Instant::now();
+                                link.acked(stream, id, now);
+                                flow.update(&mut link, now);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -428,12 +590,18 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         conn: conn.clone(),
                         shared: shared.clone(),
                         authed: authed.clone(),
-                        audio_on: audio_on.clone(),
+                        audio: audio_tap.clone(),
                         video_on: video_on.clone(),
+                        keyed: keyed.clone(),
+                        sized: sized.clone(),
+                        nack_on: nack_on.clone(),
                         ctl_tx: ctl_tx.clone(),
                         relayed: relayed.clone(),
                         perms: perms.clone(),
                         mic_on: mic_on.clone(),
+                        local_cursor: local_cursor.clone(),
+                        driver,
+                        acking: acking.clone(),
                     };
                     tokio::spawn(async move {
                         if let Err(e) = control(ctx, send, recv, rx).await {
@@ -447,12 +615,18 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
                         conn: conn.clone(),
                         shared: shared.clone(),
                         authed: authed.clone(),
-                        audio_on: audio_on.clone(),
+                        audio: audio_tap.clone(),
                         video_on: video_on.clone(),
+                        keyed: keyed.clone(),
+                        sized: sized.clone(),
+                        nack_on: nack_on.clone(),
                         ctl_tx: ctl_tx.clone(),
                         relayed: relayed.clone(),
                         perms: perms.clone(),
                         mic_on: mic_on.clone(),
+                        local_cursor: local_cursor.clone(),
+                        driver,
+                        acking: acking.clone(),
                     };
                     tokio::spawn(async move {
                         if let Err(e) = uni_stream(ctx, stream).await {
@@ -468,7 +642,9 @@ async fn session(incoming: IncomingSession, shared: Arc<Shared>) -> Result<()> {
     // task holds the connection, and with it this viewer's place in the list.
     conn.close(0u32.into(), b"session ended");
 
-    if authed.load(Ordering::Relaxed) {
+    // Anything still held, when no one else is giving input: another viewer may be holding
+    // Shift right now (each input stream lets go of its own keys when it ends).
+    if authed.load(Ordering::Relaxed) && INPUT_STREAMS.load(Ordering::Relaxed) == 0 {
         shared.injector.lock().unwrap().release_all();
         crate::gamepad::release_all();
     }
@@ -481,14 +657,41 @@ struct SessionCtx {
     conn: wtransport::Connection,
     shared: Arc<Shared>,
     authed: Arc<AtomicBool>,
-    audio_on: Arc<AtomicBool>,
+    /// Which system audio it gets (off, PCM or Opus).
+    audio: Arc<crate::opus_audio::AudioTap>,
     video_on: Arc<AtomicBool>,
+    keyed: Arc<std::sync::atomic::AtomicU8>,
+    sized: Arc<AtomicBool>,
+    /// The viewer asks for lost fragments again ("nack" in hello's codecs).
+    nack_on: Arc<AtomicBool>,
     ctl_tx: mpsc::UnboundedSender<ServerMsg>,
     /// The real address of a WebRTC viewer (the connection itself is loopback).
     relayed: Option<crate::remote::Relay>,
     /// What it may do, set once signed in.
     perms: Arc<std::sync::OnceLock<control::Perms>>,
     mic_on: Arc<AtomicBool>,
+    /// Draws the pointer itself (crate::cursor).
+    local_cursor: Arc<AtomicBool>,
+    /// Who this session is when it moves the pointer (`crate::cursor::moved_by`).
+    driver: u64,
+    /// The viewer acknowledges frames: its bitrate comes from those, not its reports.
+    acking: Arc<AtomicBool>,
+}
+
+/// Bitrate-cap keys of viewers paced by frame acknowledgements, apart from the WebRTC
+/// bridges' (which count up from 1).
+const ACK_CAP_KEYS: u64 = 1 << 62;
+
+/// A viewer's ack-driven cap, removed when its session ends.
+struct AckCap(u64);
+
+impl Drop for AckCap {
+    fn drop(&mut self) {
+        let had = REMOTE_CAPS.lock().unwrap().as_ref().is_some_and(|c| c.contains_key(&self.0));
+        if had {
+            set_remote_cap(self.0, None);
+        }
+    }
 }
 
 async fn control(
@@ -519,7 +722,7 @@ async fn control(
         return Ok(());
     }
     let hello_ok = matches!(hello, Ok(Some(ClientMsg::Hello { .. })));
-    let (token, link, pass, hello_device, codecs, ua) = match hello {
+    let (token, link, pass, hello_device, codecs, ua, hello_cursor) = match hello {
         Ok(Some(ClientMsg::Hello {
             token,
             link,
@@ -527,8 +730,15 @@ async fn control(
             device,
             codecs,
             ua,
-        })) => (token, link, pass, device, codecs, ua),
-        _ => (None, None, None, None, Vec::new(), None),
+            cursor,
+            acks,
+        })) => {
+            if acks {
+                ctx.acking.store(true, Ordering::Relaxed);
+            }
+            (token, link, pass, device, codecs, ua, cursor)
+        }
+        _ => (None, None, None, None, Vec::new(), None, false),
     };
     let mut device = crate::viewers::clean_device(hello_device.as_deref());
     let remote = ctx.relayed.is_some();
@@ -554,14 +764,63 @@ async fn control(
     {
         auth = Some(Auth::Token);
     }
+    // Over WebRTC the address is public, never a tailnet device's.
+    let mut tailnet_pending = false;
+    // Test mode pretends every direct viewer is on the tailnet (loopback has no tailnet IP).
+    // A relayed address stays excluded: over WebRTC it is public.
     if auth.is_none()
         && hello_ok
-        // Over WebRTC the address is public, never a tailnet device's.
         && ctx.relayed.is_none()
-        && let Some(owner) = &shared.tailnet_owner
-        && tailscale::is_trusted(peer, owner).await
+        && (crate::testmode::enabled() || tailscale::is_tailscale_ip(peer))
     {
-        auth = Some(Auth::Tailnet);
+        let owner = shared.tailnet_owner.get_or_resolve(peer).await;
+        // Nothing presented, and only while Tailscale may still be starting. A wrong token,
+        // a link, `--test` (no owner to wait for), or a later connection is `unauthorized`.
+        let retry = owner.is_none()
+            && token.is_none()
+            && link.is_none()
+            && shared.tailnet_owner.retry_unknown();
+        if let Some(login) = tailscale::identity(peer).await {
+            if owner.as_deref() == Some(login.as_str()) {
+                auth = Some(Auth::Tailnet);
+            } else if let Some(scope) = tailnet_guest_scope(&login) {
+                // Someone else on the tailnet: the access rules name them, or the owner lets the
+                // whole tailnet in (tailnet-members).
+                auth = Some(Auth::TailnetGuest { login, scope });
+            } else if retry {
+                tailnet_pending = true;
+            }
+        } else if retry {
+            tailnet_pending = true;
+        }
+    }
+    // A policy can turn guest links (or, in its own host, quick support) off: new links and
+    // devices already let in by one are refused.
+    let policy = crate::policy::load();
+    // Quick support's helper, in its own host or on the running service (its link says so).
+    let support_guest = crate::support::is_host()
+        || link
+            .as_deref()
+            .and_then(|l| crate::access::link_scope(&access_file, l))
+            .is_some_and(|s| s.support)
+        || pass
+            .as_deref()
+            .and_then(|p| crate::access::check_pass(&access_file, p))
+            .is_some_and(|v| v.scope.support);
+    if auth.is_none()
+        && !policy.allows(if support_guest { "support" } else { "links" })
+        && (link.is_some()
+            || pass
+                .as_deref()
+                .and_then(|p| crate::access::check_pass(&access_file, p))
+                .is_some_and(|v| v.from_link))
+    {
+        refused(&device, "guest links are off by policy");
+        let msg = "Guest links are turned off on this computer by its organization.".into();
+        control::write_json(&mut send, &ServerMsg::Denied { msg }).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ctx.conn.close(1u32.into(), b"links off");
+        return Ok(());
     }
     if auth.is_none()
         && let Some(p) = &pass
@@ -594,6 +853,13 @@ async fn control(
         }
     }
     let Some(auth) = auth else {
+        // Tailscale still starting is not a bad token; the page reconnects.
+        if tailnet_pending && !link_failed {
+            info!("{peer}: tailscale isn't ready; reconnecting");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            ctx.conn.close(1u32.into(), b"tailscale unavailable");
+            return Ok(());
+        }
         record_auth_failure(shared, peer);
         warn!("{peer}: rejected (bad or missing token)");
         refused(&device, if link_failed { "used or expired link" } else { "no valid token" });
@@ -660,19 +926,33 @@ async fn control(
             return Ok(());
         }
     }
-    let perms = match &auth {
-        Auth::Guest { scope, .. } => control::Perms::guest(scope),
+    let mut perms = match &auth {
+        Auth::Guest { scope, .. } | Auth::TailnetGuest { scope, .. } => control::Perms::guest(scope),
         _ => control::Perms::owner(),
     };
+    // Files and the clipboard can be off for everyone, by policy.
+    perms.files &= policy.allows("files");
+    perms.clipboard &= policy.allows("clipboard");
+    let terminal = crate::terminal::SUPPORTED && policy.allows("terminal");
+    // The sign-in host runs as SYSTEM: its owner-only features would be the whole computer.
+    // Everyone gets the screen and input there, and nothing else.
+    let signin = crate::signin::active();
+    let asked = !perms.owner;
+    if signin {
+        perms.owner = false;
+        perms.files = false;
+        perms.clipboard = false;
+    }
+    let terminal = terminal && !signin;
     let guest = !perms.owner;
-    if matches!(auth, Auth::Tailnet)
+    if matches!(auth, Auth::Tailnet | Auth::TailnetGuest { .. })
         && let Some(name) = tailscale::device_name(peer).await
     {
         device = format!("{name} ({device})");
     }
     let how = match &auth {
         Auth::Token => crate::viewers::How::Token,
-        Auth::Tailnet => crate::viewers::How::Tailnet,
+        Auth::Tailnet | Auth::TailnetGuest { .. } => crate::viewers::How::Tailnet,
         Auth::Guest { .. } => crate::viewers::How::Guest,
     };
     let session_id = crate::viewers::next_id();
@@ -686,6 +966,7 @@ async fn control(
     };
     let scope_detail = match &auth {
         Auth::Guest { scope, .. } => scope.describe(),
+        Auth::TailnetGuest { login, scope } => format!("{login}, {}", scope.describe()),
         _ => String::new(),
     };
 
@@ -702,8 +983,9 @@ async fn control(
 
     // Ask before connecting: the person at the computer allows (or denies) this viewer.
     let settings = crate::settings::load();
-    let scope_asks = matches!(&auth, Auth::Guest { scope, .. } if scope.ask);
-    if settings.ask_everyone || (guest && (settings.ask_guests || scope_asks)) {
+    let scope_asks = matches!(&auth, Auth::Guest { scope, .. } | Auth::TailnetGuest { scope, .. } if scope.ask);
+    // (Nobody is at the sign-in screen to ask.)
+    if !signin && (settings.ask_everyone || (asked && (settings.ask_guests || scope_asks))) {
         let msg = "Waiting for the person at this computer to let you in…".into();
         control::write_json(&mut send, &ServerMsg::Waiting { msg }).await?;
         let mut who = viewer.describe();
@@ -725,10 +1007,28 @@ async fn control(
     if let Some(r) = &ctx.relayed {
         crate::remote::bridge_authed(r.bridge);
     }
-    shared.video.request_keyframe(None);
+    // A viewer far away may be on a slow link: size the first keyframe for one.
+    if ctx.relayed.is_none() && ctx.conn.rtt() > FAR_RTT {
+        cautious_start();
+    }
+    // The first keyframe goes out at this viewer's size: it sends its viewport as soon as
+    // it's welcome (a viewer that doesn't, or an old one, gets it after a moment).
+    {
+        let (keyed, sized, shared) = (ctx.keyed.clone(), ctx.sized.clone(), shared.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(FIRST_VIEWPORT_WAIT).await;
+            let waited_for_it = !sized.swap(true, Ordering::Relaxed);
+            if waited_for_it && keyed.load(Ordering::Relaxed) == 0 {
+                shared.video.request_keyframe(None);
+            }
+        });
+    }
     match &auth {
         Auth::Token => info!("{peer}: authenticated via token"),
         Auth::Tailnet => info!("{peer}: authenticated via tailnet identity"),
+        Auth::TailnetGuest { login, scope } => {
+            info!("{peer}: authenticated via tailnet identity {login}, a guest ({})", scope.describe())
+        }
         Auth::Guest {
             expires,
             new,
@@ -779,6 +1079,9 @@ async fn control(
         ctx.relayed.as_ref().is_some_and(|r| r.rtp_video),
     );
     let _sharp = crate::sharp::joined(session_id, codecs.iter().any(|c| c == "hevc-rext"));
+    // System audio as Opus where the viewer decodes it (WebCodecs); PCM otherwise (Safari < 26).
+    ctx.audio.set_opus(codecs.iter().any(|c| c == "opus"));
+    ctx.nack_on.store(codecs.iter().any(|c| c == "nack"), Ordering::Relaxed);
     let mut sharp_on = false;
     let thumbs_busy = Arc::new(AtomicBool::new(false));
     let thumbs_sent = Arc::new(std::sync::Mutex::new(crate::thumbs::Sent::default()));
@@ -838,7 +1141,7 @@ async fn control(
         mic: crate::mic::supported(),
         mic_install: perms.owner && !crate::mic::supported(),
         windows: shared.video.supports_windows(),
-        terminal: crate::terminal::SUPPORTED,
+        terminal,
         restart: true,
         record: crate::recording::supported(),
         hevc: shared.video.supports_hevc(),
@@ -852,8 +1155,12 @@ async fn control(
             && !ctx.relayed.as_ref().is_some_and(|r| r.rtp_video),
         push: crate::push::public_key(),
         browse: perms.owner && perms.files,
+        nack: true,
         extend: cfg!(target_os = "macos") || crate::testmode::enabled(),
-        support: crate::support::is_host(),
+        fit: cfg!(target_os = "macos") || crate::testmode::enabled(),
+        support: crate::support::is_host()
+            || matches!(&auth, Auth::Guest { scope, .. } if scope.support),
+        cursor: crate::cursor::active(),
     };
     // Someone other than the owner is in: worth a notification on the owner's devices.
     if !perms.owner {
@@ -891,8 +1198,13 @@ async fn control(
         let path = Some(r.path.display().to_string());
         control::write_json(&mut send, &ServerMsg::Recording { on: true, path }).await?;
     }
+    // With its artwork (20 KB): after the first picture has had the link to itself.
     if let Some(info) = crate::now_playing::current() {
-        control::write_json(&mut send, &ServerMsg::NowPlaying { info }).await?;
+        let tx = ctx.ctl_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(NOW_PLAYING_AFTER).await;
+            let _ = tx.send(ServerMsg::NowPlaying { info });
+        });
     }
     for msg in crate::computer::snapshot() {
         control::write_json(&mut send, &msg).await?;
@@ -910,6 +1222,14 @@ async fn control(
         .await?;
     }
 
+    // Until it says it draws the pointer itself, this viewer needs it in the video.
+    let mut cursor_viewer = crate::cursor::Viewer::new(hello_cursor, ctx.local_cursor.clone());
+    if ctx.local_cursor.load(Ordering::Relaxed)
+        && let Some(shape) = crate::cursor::current_shape()
+    {
+        control::write_json(&mut send, &shape).await?;
+    }
+    let local_cursor = ctx.local_cursor.clone();
     let mut events = shared.events.subscribe();
     tokio::spawn(async move {
         loop {
@@ -923,6 +1243,10 @@ async fn control(
             };
             // A link without clipboard access never sees the host's clipboard.
             if matches!(msg, ServerMsg::Clipboard { .. }) && !perms.clipboard {
+                continue;
+            }
+            // Pointer images only to viewers that draw it (they're up to 350 KB of JSON).
+            if matches!(msg, ServerMsg::Cursor { .. }) && !local_cursor.load(Ordering::Relaxed) {
                 continue;
             }
             if control::write_json(&mut send, &msg).await.is_err() {
@@ -948,6 +1272,16 @@ async fn control(
         };
         match msg {
             ClientMsg::Hello { .. } | ClientMsg::Passkey(_) => {}
+            ClientMsg::LocalCursor { on } => {
+                let was = ctx.local_cursor.load(Ordering::Relaxed);
+                cursor_viewer.set(on);
+                if !was
+                    && ctx.local_cursor.load(Ordering::Relaxed)
+                    && let Some(shape) = crate::cursor::current_shape()
+                {
+                    let _ = ctx.ctl_tx.send(shape);
+                }
+            }
             ClientMsg::SelectDisplay { id } => set_layout(&ctx, Layout::Single(Some(id))).await?,
             ClientMsg::ShowAll => set_layout(&ctx, Layout::All).await?,
             ClientMsg::Clipboard { .. } if !perms.clipboard => {
@@ -1050,7 +1384,16 @@ async fn control(
                     .take(MAX_STREAMS)
                     .map(|s| s.map(|[w, h]| [w.min(16_384), h.min(16_384)]))
                     .collect();
-                crate::resolution::set(viewport_id, Some(streams));
+                if ctx.sized.load(Ordering::Relaxed) {
+                    crate::resolution::set(viewport_id, Some(streams));
+                } else {
+                    info!("{peer}: first viewport {streams:?}");
+                    crate::resolution::set_now(viewport_id, streams).await;
+                    // Frames may go out from here. A new size's restart has just made a
+                    // keyframe, which they missed: ask for one in the size now in force.
+                    ctx.sized.store(true, Ordering::Relaxed);
+                    shared.video.request_keyframe(None);
+                }
             }
             ClientMsg::Log { lines } => {
                 if let Some(path) = CLIENT_LOG.get() {
@@ -1068,12 +1411,24 @@ async fn control(
                     append_client_log(path.clone(), body).await;
                 }
             }
+            // A viewer that acknowledges frames has its own rate (rate::AckRate), so its
+            // loss and latency no longer cut the shared one; how much it used still lets
+            // that climb (it would otherwise stay wherever a cautious start left it).
+            ClientMsg::NetStats(report) if ctx.acking.load(Ordering::Relaxed) => {
+                apply_rate_report(shared, crate::rate::Report { dropped: 0, latency_ms: None, ..report });
+            }
             ClientMsg::NetStats(report) => {
                 apply_rate_report(shared, report);
             }
             ClientMsg::Audio { on } => {
-                ctx.audio_on.store(on, Ordering::Relaxed);
+                ctx.audio.set_on(on);
                 info!("{peer}: audio {}", if on { "on" } else { "off" });
+                #[cfg(windows)]
+                if on && crate::platform::audio::unavailable().is_some() {
+                    let _ = ctx.ctl_tx.send(ServerMsg::Notice {
+                        msg: "No sound to share: this computer has no sound output right now.".into(),
+                    });
+                }
             }
             ClientMsg::FilesList { .. }
             | ClientMsg::FilesFetch { .. }
@@ -1095,7 +1450,7 @@ async fn control(
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     let result = match crate::browse::resolve(&crate::browse::root(), &path) {
-                        Ok(p) if p.is_dir() => Err(anyhow::anyhow!("folders can't be downloaded; open it and pick files")),
+                        Ok(p) if p.is_dir() => files::send_folder(&ctx.conn, &p).await,
                         Ok(p) => files::send(&ctx.conn, &p).await,
                         Err(e) => Err(e),
                     };
@@ -1194,6 +1549,15 @@ async fn control(
                 }
                 Err(e) => refuse(&format!("Couldn't wake {dns}: {e:#}")),
             },
+            ClientMsg::Sas if !perms.input => refuse("This link is view only."),
+            ClientMsg::Sas => {
+                #[cfg(windows)]
+                if !crate::platform::secure::send_sas() {
+                    refuse("Ctrl+Alt+Del needs the Glass secure-desktop service. Install it with `glass service install`.");
+                }
+                #[cfg(not(windows))]
+                refuse("Ctrl+Alt+Del is only available on Windows.");
+            }
             ClientMsg::Agent { .. } | ClientMsg::AgentAnswer { .. } if guest => refuse(OWNER_ONLY),
             ClientMsg::Agent { op } => crate::computer::control(&op),
             ClientMsg::AgentAnswer { id, ok, note } => {
@@ -1292,6 +1656,7 @@ async fn control(
                 info!("{peer}: microphone {}", if on { "on" } else { "off" });
             }
             ClientMsg::Term(_) if guest => refuse(OWNER_ONLY),
+            ClientMsg::Term(_) if !terminal => refuse("The terminal is turned off on this computer by its organization."),
             ClientMsg::Term(msg) => {
                 if let Err(e) = term.handle(msg, ctx.ctl_tx.clone()) {
                     refuse(&format!("{e:#}"));
@@ -1536,7 +1901,7 @@ async fn fit(ctx: &SessionCtx, _session: u64, size: Option<[u32; 2]>) -> Result<
         return Ok(());
     }
     if size.is_some() {
-        let msg = "Fitting the desktop to this device isn't available on Linux yet.".into();
+        let msg = "Fitting the desktop to this device is only available on a Mac for now.".into();
         let _ = ctx.ctl_tx.send(ServerMsg::Error { msg });
     }
     Ok(())
@@ -1770,6 +2135,11 @@ async fn set_layout(ctx: &SessionCtx, layout: Layout) -> Result<()> {
 enum Auth {
     Token,
     Tailnet,
+    /// Someone else's tailnet device, let in by the access rules or `tailnet-members`.
+    TailnetGuest {
+        login: String,
+        scope: crate::access::Scope,
+    },
     /// Via a magic link: `new` when the link was opened just now (the pass is sent back).
     Guest {
         pass: String,
@@ -1778,6 +2148,15 @@ enum Auth {
         scope: crate::access::Scope,
         passkey: Option<crate::access::Passkey>,
     },
+}
+
+/// What someone else on the tailnet (`login`) may do: the access rules' first match, else a
+/// guest's default if the owner lets the whole tailnet in; `None`: they need the token.
+fn tailnet_guest_scope(login: &str) -> Option<crate::access::Scope> {
+    if let Some((scope, _)) = crate::acl::decide(&crate::acl::effective(), login, &[]) {
+        return Some(scope);
+    }
+    crate::settings::load().tailnet_members.then(crate::access::Scope::default)
 }
 
 /// How often a guest session re-checks that its pass is still valid.
@@ -1808,19 +2187,55 @@ fn record_auth_failure(shared: &Shared, peer: std::net::IpAddr) {
     entry.0 += 1;
 }
 
-const AUTH_WAIT: Duration = Duration::from_secs(10);
+/// How long a stream opened before sign-in finishes waits for it. Covers the person at the
+/// computer answering "let them in?" (up to `approval::TIMEOUT`), not just a tailnet whois:
+/// a viewer's input stream opens right after hello, and dropping it after a shorter wait
+/// left an approved viewer seeing the screen with no mouse or keyboard.
+const AUTH_WAIT: Duration = Duration::from_secs(crate::approval::TIMEOUT.as_secs() + 10);
+
+/// Types text a viewer sent (IME, emoji, accented letters), in order with its keys: the
+/// next event isn't read until it's typed. Hosts without a text path press US keys for
+/// what they can.
+async fn type_viewer_text(ctx: &SessionCtx, text: String) {
+    let shared = ctx.shared.clone();
+    // Typing paces itself (apps drop bursts), so not on the async runtime.
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut injector = shared.injector.lock().unwrap();
+        if injector.type_text(&text) {
+            return;
+        }
+        let (events, missing) = crate::keys::text_key_events(&text);
+        for ev in events {
+            injector.handle(ev);
+        }
+        if missing > 0 {
+            tracing::debug!("input: {missing} characters have no key on this computer; not typed");
+        }
+    })
+    .await;
+}
+
+/// Input streams open right now, across viewers.
+static INPUT_STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
     let mut tag = [0u8; 1];
     stream.read_exact(&mut tag).await?;
     // Streams opened right after hello can arrive while auth is still in progress
     // (a tailnet whois takes tens of ms); wait for it rather than dropping them.
-    let deadline = tokio::time::Instant::now() + AUTH_WAIT;
-    while !ctx.authed.load(Ordering::Relaxed) {
-        if tokio::time::Instant::now() > deadline {
-            return Ok(());
+    let signed_in = async {
+        while !ctx.authed.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    tokio::select! {
+        waited = tokio::time::timeout(AUTH_WAIT, signed_in) => {
+            if waited.is_err() {
+                return Ok(());
+            }
+        }
+        // Turned away or gone: stop waiting now, not at the deadline.
+        _ = ctx.conn.closed() => return Ok(()),
     }
     let perms = ctx.perms.get().copied().unwrap_or(control::Perms {
         input: false,
@@ -1831,8 +2246,14 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
     match tag[0] {
         STREAM_INPUT => {
             info!("{}: input stream open", ctx.conn.remote_address());
+            INPUT_STREAMS.fetch_add(1, Ordering::Relaxed);
             let mut buf = [0u8; INPUT_EVENT_LEN];
             let mut events = 0u64;
+            // What this viewer is holding down, to let go of when it leaves.
+            let mut keys = std::collections::HashSet::new();
+            let mut buttons = std::collections::HashSet::new();
+            // Text from an IME or a phone keyboard, put back together from its chunks.
+            let mut text = glass_proto::TextReader::default();
             while stream.read_exact(&mut buf).await.is_ok() {
                 // A view-only link's input is read and dropped.
                 if !perms.input {
@@ -1842,10 +2263,26 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
                     Some(ev @ InputEvent::Gamepad { .. }) if !crate::testmode::enabled() => {
                         crate::gamepad::handle(ev)
                     }
+                    Some(ev @ InputEvent::Text { .. }) => {
+                        if let Some(text) = text.push(&ev) {
+                            crate::computer::human_input();
+                            type_viewer_text(&ctx, text).await;
+                        }
+                    }
                     Some(ev) => {
                         // A person clicking, typing or scrolling: agents wait for them.
                         if matches!(ev, InputEvent::MouseDown { .. } | InputEvent::KeyDown { .. } | InputEvent::Scroll { .. }) {
                             crate::computer::human_input();
+                        }
+                        if matches!(ev, InputEvent::MouseMove { .. } | InputEvent::MouseMoveBy { .. }) {
+                            crate::cursor::moved_by(ctx.driver);
+                        }
+                        match ev {
+                            InputEvent::KeyDown { keycode } => _ = keys.insert(keycode),
+                            InputEvent::KeyUp { keycode } => _ = keys.remove(&keycode),
+                            InputEvent::MouseDown { button } => _ = buttons.insert(button),
+                            InputEvent::MouseUp { button } => _ = buttons.remove(&button),
+                            _ => {}
                         }
                         ctx.shared.injector.lock().unwrap().handle(ev)
                     }
@@ -1853,6 +2290,16 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
                 }
                 events += 1;
             }
+            {
+                let mut injector = ctx.shared.injector.lock().unwrap();
+                for keycode in keys {
+                    injector.handle(InputEvent::KeyUp { keycode });
+                }
+                for button in buttons {
+                    injector.handle(InputEvent::MouseUp { button });
+                }
+            }
+            INPUT_STREAMS.fetch_sub(1, Ordering::Relaxed);
             info!(
                 "{}: input stream closed after {events} events",
                 ctx.conn.remote_address()
@@ -1893,17 +2340,19 @@ async fn uni_stream(ctx: SessionCtx, mut stream: RecvStream) -> Result<()> {
 }
 
 /// Frame ids are per session so the client sees a gap only when this session lost a frame.
+/// Returns the frame's id and the bytes sent (0 if test mode dropped it).
 fn send_frame(
     conn: &wtransport::Connection,
     frame: &EncodedFrame,
     next_id: &mut u32,
-) -> Result<()> {
+    sent: Option<&mut crate::retransmit::SentFrames>,
+) -> Result<(u32, usize)> {
     let max = conn.max_datagram_size().unwrap_or(1200);
     let id = *next_id;
     *next_id = next_id.wrapping_add(1);
     // Test-mode fault injection: a dropped frame leaves a gap in the ids.
     if crate::testmode::take_drop() {
-        return Ok(());
+        return Ok((id, 0));
     }
     let flags = if frame.keyframe {
         glass_proto::FLAG_KEYFRAME
@@ -1929,10 +2378,20 @@ fn send_frame(
     {
         *byte ^= 0xff;
     }
-    for dgram in dgrams {
-        conn.send_datagram(dgram)?;
+    let mut bytes = 0;
+    for dgram in &dgrams {
+        bytes += dgram.len();
+        conn.send_datagram(dgram.as_slice())?;
     }
-    Ok(())
+    if let Some(sent) = sent {
+        sent.remember(frame.stream, id, dgrams);
+    }
+    Ok((id, bytes))
+}
+
+/// Bytes waiting in a session's datagram send buffer (`capacity`: its space when empty).
+fn datagrams_queued(conn: &wtransport::Connection, capacity: usize) -> usize {
+    capacity.saturating_sub(conn.quic_connection().datagram_send_buffer_space())
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -2144,6 +2603,12 @@ fn apply_rate_report(shared: &Shared, report: crate::rate::Report) {
 static REMOTE_CAPS: Mutex<Option<std::collections::HashMap<u64, u32>>> = Mutex::new(None);
 static APPLIED_BPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The encoders' bitrate now (0 before it's first set): the WebRTC bridge sizes its queue
+/// by it.
+pub fn applied_bitrate() -> u32 {
+    APPLIED_BPS.load(Ordering::Relaxed)
+}
+
 /// Sets (or with `None` removes) a remote viewer's bitrate cap.
 pub fn set_remote_cap(viewer: u64, bps: Option<u32>) {
     {
@@ -2154,9 +2619,28 @@ pub fn set_remote_cap(viewer: u64, bps: Option<u32>) {
             None => caps.remove(&viewer),
         };
     }
-    if let Some(shared) = SHARED.get() {
-        apply_bitrate(shared);
-    }
+    apply_bitrate_soon();
+}
+
+/// Applies the bitrate off the caller's thread: changing it takes the streams' lock (held for
+/// as long as a capture restart takes) and calls into the encoders, and the callers are the
+/// tasks that send video and answer the viewer's pings, which mustn't wait on that.
+fn apply_bitrate_soon() {
+    static WORKER: std::sync::OnceLock<std::sync::mpsc::Sender<()>> = std::sync::OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let _ = std::thread::Builder::new().name("glass-bitrate".into()).spawn(move || {
+            while rx.recv().is_ok() {
+                // However many came meanwhile, once covers them.
+                while rx.try_recv().is_ok() {}
+                if let Some(shared) = SHARED.get() {
+                    apply_bitrate(shared);
+                }
+            }
+        });
+        tx
+    });
+    let _ = worker.send(());
 }
 
 /// The encoders' bitrate: the tailnet clients' adaptive target, capped by every remote
@@ -2222,17 +2706,29 @@ pub fn bridge_congestion(dropped_frames: u32) {
     }
 }
 
+const NOW_PLAYING_AFTER: Duration = Duration::from_secs(3);
+/// About a first picture's worth, sent evenly over the first round trip (quinn paces it).
+const QUIC_INITIAL_WINDOW: u64 = 128 * 1024;
+/// Where a viewer of unknown link starts; it climbs fast from here (`rate`).
+const CAUTIOUS_START_BPS: u32 = 2_000_000;
+/// Further than a LAN or nearby Wi-Fi: maybe cellular.
+const FAR_RTT: Duration = Duration::from_millis(40);
+/// How long frames wait for a new viewer's size before going out at the current one.
+const FIRST_VIEWPORT_WAIT: Duration = Duration::from_millis(600);
+
 /// A viewer arrived over the internet (WebRTC): start the stream at a rate such links
 /// usually take, instead of the LAN maximum, so the first keyframe isn't lost.
 pub fn remote_viewer_joined() {
+    cautious_start();
+}
+
+fn cautious_start() {
     if let Some(shared) = SHARED.get() {
-        let max = shared.rate.lock().unwrap().max();
-        let start = (max / 5).max(2_000_000);
         let changed = shared
             .rate
             .lock()
             .unwrap()
-            .start_cautiously(start, std::time::Instant::now());
+            .start_cautiously(CAUTIOUS_START_BPS, std::time::Instant::now());
         if changed.is_some() {
             apply_bitrate(shared);
         }

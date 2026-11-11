@@ -105,6 +105,13 @@ async fn tailscale_step() -> Result<Option<String>> {
 
 fn service_step() -> Result<()> {
     log::step("Background service")?;
+    // Installed for everyone (the MSI): it starts at sign-in already, for every user.
+    #[cfg(windows)]
+    if agent::machine_dir().is_some() {
+        agent::install(true)?;
+        log::success("Glass runs in the background and starts when anyone signs in (installed for everyone)")?;
+        return Ok(());
+    }
     let at_login = confirm("Start Glass automatically when you log in?")
         .initial_value(true)
         .interact()?;

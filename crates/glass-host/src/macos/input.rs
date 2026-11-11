@@ -82,6 +82,8 @@ pub struct Injector {
     delta: (i64, i64),
     /// A pen in proximity (Apple Pencil): mouse events carry its tablet data.
     pen: Option<Pen>,
+    /// Scrolling not sent yet, under a point (x, y): trackpads send fractions.
+    scroll: (f32, f32),
 }
 
 /// The pen's latest state, from `InputEvent::Pen`.
@@ -116,6 +118,7 @@ impl Injector {
             click_count: 1,
             delta: (0, 0),
             pen: None,
+            scroll: (0.0, 0.0),
         }
     }
 
@@ -186,18 +189,17 @@ impl Injector {
                 self.delta = (0, 0);
             }
             InputEvent::Scroll { dx, dy } => {
-                let ev = CGEvent::new_scroll_wheel_event2(
-                    self.source.as_deref(),
-                    CGScrollEventUnit::Pixel,
-                    2,
-                    -dy.round() as i32,
-                    -dx.round() as i32,
-                    0,
-                );
+                // DOM: +dy scrolls down; CG: +wheel scrolls up. Pixel units are points.
+                let Some((x, y)) = whole_points(&mut self.scroll, -dx, -dy) else { return };
+                let ev = CGEvent::new_scroll_wheel_event2(self.source.as_deref(), CGScrollEventUnit::Pixel, 2, y, x, 0);
+                // Continuous, as a trackpad's: apps scroll by exactly these points rather
+                // than treating each event as a wheel notch.
+                // Adapted from voxl (MIT, github.com/tembo/voxl): src/mac/input.rs.
+                CGEvent::set_integer_value_field(ev.as_deref(), CGEventField::ScrollWheelEventIsContinuous, 1);
                 self.post(ev);
             }
-            // Routed to crate::gamepad by the server, never here.
-            InputEvent::Gamepad { .. } => {}
+            // Routed to crate::gamepad by the server, never here; text goes to type_text.
+            InputEvent::Gamepad { .. } | InputEvent::Text { .. } => {}
             InputEvent::KeyDown { keycode } | InputEvent::KeyUp { keycode } => {
                 let down = matches!(ev, InputEvent::KeyDown { .. });
                 if let Some(flag) = modifier_flag(keycode) {
@@ -354,6 +356,20 @@ fn to_global(b: CGRect, x: f32, y: f32) -> CGPoint {
     }
 }
 
+/// Adds a scroll to what's waiting in `acc` and takes the whole points out of it, keeping
+/// the fraction for next time; `None` while there's less than a point either way.
+fn whole_points(acc: &mut (f32, f32), dx: f32, dy: f32) -> Option<(i32, i32)> {
+    if !dx.is_finite() || !dy.is_finite() {
+        return None;
+    }
+    acc.0 += dx;
+    acc.1 += dy;
+    let (x, y) = (acc.0.trunc(), acc.1.trunc());
+    acc.0 -= x;
+    acc.1 -= y;
+    (x != 0.0 || y != 0.0).then_some((x as i32, y as i32))
+}
+
 /// DOM button numbering: 0 left, 1 middle, 2 right.
 fn mouse_button(button: u8, down: bool) -> Option<(CGEventType, CGMouseButton)> {
     Some(match (button, down) {
@@ -429,6 +445,19 @@ mod tests {
         assert_eq!((p.x, p.y), (500.0, 200.0));
         let edge = to_global(window, 1.5, -1.0);
         assert_eq!((edge.x, edge.y), (900.0, 50.0), "clamped to the window");
+    }
+
+    #[test]
+    fn scroll_fractions_add_up_instead_of_vanishing() {
+        let mut acc = (0.0, 0.0);
+        // A slow trackpad: a third of a point a frame used to round to nothing, every time.
+        assert_eq!(whole_points(&mut acc, 0.0, 0.4), None);
+        assert_eq!(whole_points(&mut acc, 0.0, 0.4), None);
+        assert_eq!(whole_points(&mut acc, 0.0, 0.4), Some((0, 1)));
+        assert_eq!(whole_points(&mut acc, -2.5, 0.0), Some((-2, 0)));
+        assert_eq!(whole_points(&mut acc, -0.5, 0.0), Some((-1, 0)));
+        assert_eq!(whole_points(&mut acc, f32::NAN, 1.0), None);
+        assert!(acc.0.abs() < 1e-6 && (acc.1 - 0.2).abs() < 1e-5);
     }
 }
 

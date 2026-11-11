@@ -31,6 +31,27 @@ pub struct Recording {
     /// The first file; later parts sit next to it.
     pub path: PathBuf,
     state: Arc<Mutex<Option<Recorder>>>,
+    /// The file records the video as sent: the pointer has to be in it.
+    _cursor: crate::cursor::Bake,
+    made: Arc<Mutex<Made>>,
+}
+
+/// What a recording wrote.
+#[derive(Debug, Clone, Default)]
+pub struct Made {
+    /// The files, in order (none when no keyframe ever came).
+    pub files: Vec<PathBuf>,
+    /// HEVC frames came, and were left out.
+    pub hevc: bool,
+}
+
+impl Recording {
+    /// Ends the recording and says what it wrote.
+    pub fn finish(self) -> Made {
+        let made = self.made.clone();
+        drop(self);
+        made.lock().unwrap().clone()
+    }
 }
 
 impl Drop for Recording {
@@ -45,21 +66,19 @@ impl Drop for Recording {
 
 /// Starts recording what's streamed, for `who`.
 pub fn start(who: &str) -> Result<Recording> {
-    let shared = crate::server::shared().context("the host isn't ready yet")?;
     let settings = crate::settings::load();
-    let dir = crate::settings::recordings_dir(&settings);
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let base = format!("Glass {} {}", local_stamp(), sanitize(who));
-    let path = crate::control::unique_path(&dir, &format!("{base}.mp4"));
-    let recorder = Recorder {
-        dir,
-        base,
-        first: path.clone(),
-        part: 1,
-        file: None,
-        warned_hevc: false,
-    };
+    start_in(&crate::settings::recordings_dir(&settings), who)
+}
+
+/// Starts recording what's streamed into `dir`, for `who`.
+pub fn start_in(dir: &Path, who: &str) -> Result<Recording> {
+    let shared = crate::server::shared().context("the host isn't ready yet")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let (recorder, made) = Recorder::new(dir, who);
+    let path = recorder.first.clone();
     let state = Arc::new(Mutex::new(Some(recorder)));
+    // Before the first keyframe is asked for, so the recording starts with the pointer in.
+    let cursor = crate::cursor::bake();
     let mut frames = shared.frames.subscribe();
     shared.video.request_keyframe(Some(0));
     let thread_state = state.clone();
@@ -91,7 +110,7 @@ pub fn start(who: &str) -> Result<Recording> {
             }
         })?;
     tracing::info!("recording to {}", path.display());
-    Ok(Recording { path, state })
+    Ok(Recording { path, state, _cursor: cursor, made })
 }
 
 struct Recorder {
@@ -101,9 +120,18 @@ struct Recorder {
     part: u32,
     file: Option<Mp4Writer>,
     warned_hevc: bool,
+    made: Arc<Mutex<Made>>,
 }
 
 impl Recorder {
+    fn new(dir: &Path, who: &str) -> (Self, Arc<Mutex<Made>>) {
+        let base = format!("Glass {} {}", local_stamp(), sanitize(who));
+        let first = crate::control::unique_path(dir, &format!("{base}.mp4"));
+        let made = Arc::new(Mutex::new(Made::default()));
+        let r = Recorder { dir: dir.to_path_buf(), base, first, part: 1, file: None, warned_hevc: false, made: made.clone() };
+        (r, made)
+    }
+
     fn frame(&mut self, frame: &EncodedFrame) -> Result<()> {
         if frame.stream != 0 {
             return Ok(());
@@ -111,6 +139,7 @@ impl Recorder {
         if frame.hevc {
             if !self.warned_hevc {
                 self.warned_hevc = true;
+                self.made.lock().unwrap().hevc = true;
                 tracing::warn!("recording: HEVC frames aren't recorded (H.264 only)");
             }
             return Ok(());
@@ -136,6 +165,7 @@ impl Recorder {
                 crate::control::unique_path(&self.dir, &format!("{} part {}.mp4", self.base, self.part))
             };
             self.file = Some(Mp4Writer::create(&path, sps, pps)?);
+            self.made.lock().unwrap().files.push(path);
         }
         let w = self.file.as_mut().unwrap();
         if w.waiting_for_keyframe && !frame.keyframe {
@@ -557,6 +587,9 @@ impl Bits<'_> {
 
 /// "2026-10-22 14-03" in local time (`date` knows the time zone).
 fn local_stamp() -> String {
+    #[cfg(windows)]
+    return crate::platform::clock::local_stamp();
+    #[cfg(not(windows))]
     std::process::Command::new("date")
         .arg("+%Y-%m-%d %H-%M")
         .output()
@@ -670,6 +703,26 @@ mod tests {
             }
             _ => eprintln!("ffprobe not found; skipped the decode check"),
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn says_what_it_wrote() {
+        let dir = std::env::temp_dir().join(format!("glass-rec-made-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut r, made) = Recorder::new(&dir, "an agent");
+        // HEVC is left out, and said so; then H.264 makes one file.
+        let hevc = EncodedFrame { stream: 0, data: vec![0, 0, 1, 0x40], keyframe: true, capture_us: 0, hevc: true, refresh: false };
+        r.frame(&hevc).unwrap();
+        for (n, (data, keyframe)) in frames(10).into_iter().enumerate() {
+            let f = EncodedFrame { stream: 0, data, keyframe, capture_us: n as u64 * 33_333, hevc: false, refresh: false };
+            r.frame(&f).unwrap();
+        }
+        r.finish();
+        let made = made.lock().unwrap().clone();
+        assert!(made.hevc);
+        assert_eq!(made.files.len(), 1);
+        assert!(std::fs::metadata(&made.files[0]).unwrap().len() > 1000);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

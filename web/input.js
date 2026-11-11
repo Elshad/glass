@@ -1,7 +1,9 @@
 // Pointer, touch, keyboard and clipboard input → remote input events.
 
-import { Input, penFields } from './proto.js';
+import { Input, penFields, textEvents } from './proto.js';
 import { MAC_KEYCODES, charToKey, KVK_SHIFT } from './keymap.js';
+import { log } from './log.js';
+import { pointsPerPx, scrollBatcher, wheelPixels } from './scroll.js';
 
 const LONG_PRESS_MS = 500;
 const TAP_SLOP_PX = 10;
@@ -36,8 +38,8 @@ const MODIFIER_KEYCODES = new Set(MODIFIER_CODES.map((c) => MAC_KEYCODES[c]));
  * @param onLocalShortcut (code) => void, for Ctrl+Shift+<key> shortcuts handled locally
  */
 export function attachInput({
-  screens, keySink, send, control, nextClipboard, onMacCopy = () => {}, onPaste, onLocalShortcut, swapCmdOption = false,
-  ctrlAsCmd = true, pcKeyboard = false, onZoom,
+  screens, keySink, send: sendNow, control, nextClipboard, onMacCopy = () => {}, onPaste, onLocalShortcut, swapCmdOption = false,
+  ctrlAsCmd = true, pcKeyboard = false, onZoom, onResize = () => {},
 }) {
   // With iPadOS set to turn the physical ⌘ key into ⌥ (so it can't claim ⌘Tab etc.),
   // swap them back here so the Mac gets the keys the user actually pressed.
@@ -66,6 +68,10 @@ export function attachInput({
   let macHost = true;
   const codeOf = (e) => (!macHost ? undefined : pc ? PC[e.code] : swap ? SWAPPED[e.code] : undefined) ?? e.code;
   const cmdHeld = (e) => (!macHost ? e.metaKey : pc ? e.ctrlKey : swap ? e.altKey : e.metaKey);
+  // Copy and paste: ⌘ on a Mac host; Ctrl on Windows and Linux (and ⌘V still pastes this
+  // device's clipboard there, as a Mac viewer expects).
+  const copyHeld = (e) => (macHost ? cmdHeld(e) : e.ctrlKey && !e.altKey && !e.metaKey);
+  const pasteHeld = (e) => (macHost ? cmdHeld(e) && !swap : e.metaKey || (e.ctrlKey && !e.altKey));
   // Each canvas shows one host stream (data-stream) and is letterboxed by
   // `object-fit: contain`; pointer positions map into the video's content box. Rects are
   // cached and dropped on resize, so pointer events never force a layout read.
@@ -74,6 +80,7 @@ export function attachInput({
   const resize = new ResizeObserver(() => {
     rects.clear();
     drawCursor();
+    onResize();
   });
   const streamOf = (canvas) => Number(canvas.dataset.stream);
   // A display is a canvas (WebTransport) or a <video> (remote, over WebRTC).
@@ -94,6 +101,21 @@ export function attachInput({
 
   // Pointer lock (Capture mouse): relative motion only, the local position means nothing.
   let locked = false;
+
+  // Scrolling goes in the host's desktop points (what a display's `points_width` counts),
+  // so content moves as far as the fingers did whatever size it's shown at. One send a frame.
+  const pointsWidths = []; // stream -> width in desktop points
+  const scrolls = scrollBatcher((a, b) => sendNow(Input.SCROLL, { a, b }));
+  function scrollBy(dx, dy, canvas) {
+    const k = canvas ? pointsPerPx(pointsWidths[streamOf(canvas)] ?? videoSizes[streamOf(canvas)]?.width, contentRect(canvas)?.width) : 1;
+    scrolls.add(dx * k, dy * k);
+  }
+  // Moves don't wait for a pending scroll; clicks and keys go after it.
+  const UNBATCHED = new Set([Input.MOVE, Input.MOVE_BY, Input.PEN]);
+  const send = (kind, fields) => {
+    if (!UNBATCHED.has(kind)) scrolls.flush();
+    sendNow(kind, fields);
+  };
 
   function sendMove(x, y, canvas) {
     if (locked) return;
@@ -196,10 +218,11 @@ export function attachInput({
   });
   screens.addEventListener('contextmenu', (e) => e.preventDefault());
   screens.addEventListener('wheel', (e) => {
-    const unit = e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? 400 : 1;
+    const canvas = canvasOf(e);
     // Point at the screen being scrolled first, so the scroll lands on that display.
-    sendMove(e.clientX, e.clientY, canvasOf(e));
-    send(Input.SCROLL, { a: e.deltaX * unit, b: e.deltaY * unit });
+    sendMove(e.clientX, e.clientY, canvas);
+    const { dx, dy } = wheelPixels(e);
+    scrollBy(dx, dy, canvas);
     e.preventDefault();
   }, { passive: false });
 
@@ -306,7 +329,7 @@ export function attachInput({
         zoomTo(start.zoom.s * (spread() / (start.spread || 1)), c, start);
       } else if (gesture.mode === 'scroll') {
         // Natural scrolling: content follows the fingers.
-        send(Input.SCROLL, { a: gesture.last.x - c.x, b: gesture.last.y - c.y });
+        scrollBy(gesture.last.x - c.x, gesture.last.y - c.y, gesture.canvas);
       }
       gesture.last = c;
       return;
@@ -388,11 +411,13 @@ export function attachInput({
     return best.a.canvas;
   }
 
+  /** Sends the cursor's position; returns the picture it's on. */
   function sendCursor() {
     const canvas = placeCursor();
-    if (!canvas) return;
+    if (!canvas) return undefined;
     const c = toClient(cursor);
     sendMove(c.x, c.y, canvas);
+    return canvas;
   }
 
   function drawCursor() {
@@ -482,8 +507,7 @@ export function attachInput({
       if (two.mode === 'zoom') {
         zoomTo(two.zoom.s * (spread() / (two.spread || 1)), c, two);
       } else if (two.mode === 'scroll') {
-        sendCursor();
-        send(Input.SCROLL, { a: two.last.x - c.x, b: two.last.y - c.y });
+        scrollBy(two.last.x - c.x, two.last.y - c.y, sendCursor());
       }
       two.last = c;
       return;
@@ -542,6 +566,14 @@ export function attachInput({
 
   const heldKeys = new Set();
   let pasteHandled = true;
+  // Safari fires `paste` only into a focused text field, so ⌘ going down focuses the hidden
+  // one until ⌘ is released: ⌘V then pastes this device's clipboard rather than the Mac's own.
+  let focusedForPaste = false;
+  function unfocusAfterPaste() {
+    if (!focusedForPaste) return;
+    focusedForPaste = false;
+    if (document.activeElement === keySink) keySink.blur();
+  }
   function releaseKeys(filter = () => true) {
     for (const keycode of heldKeys) {
       if (filter(keycode)) {
@@ -558,35 +590,62 @@ export function attachInput({
     if (shift) send(Input.KEY_UP, { keycode: KVK_SHIFT });
   }
 
+  /**
+   * Typed text: as key presses when each character has a key on a US keyboard (as before),
+   * else as text the host types as is: IME results, emoji, accented letters.
+   */
+  function typeText(text) {
+    if (!text) return;
+    const keys = [...text].map(charToKey);
+    if (keys.every(Boolean)) {
+      for (const key of keys) tapKey(key.keycode, key.shift);
+      return;
+    }
+    for (const bytes of textEvents(text)) send(Input.TEXT, { bytes });
+  }
+
   // Typing in Glass's own fields (token prompt, share link) stays local.
   const localField = (el) => el !== keySink && el?.matches?.('input, textarea');
 
   window.addEventListener('keydown', (e) => {
     if (localField(e.target)) return;
+    if (e.metaKey && document.activeElement !== keySink) {
+      keySink.focus({ preventScroll: true });
+      focusedForPaste = document.activeElement === keySink;
+    }
     if (e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey && ['KeyF', 'KeyH'].includes(e.code)) {
       e.preventDefault();
       onLocalShortcut(e.code);
       return;
     }
-    if (e.isComposing) return;
+    // An IME is composing (229: the key that starts it): the result comes as compositionend.
+    if (e.isComposing || e.keyCode === 229) return;
     const code = codeOf(e);
     const keycode = MAC_KEYCODES[code];
     // On-screen keyboards often report no code; their text arrives via beforeinput.
     if (keycode === undefined) return;
 
-    if (cmdHeld(e) && code === 'KeyV' && !swap) {
+    if (pasteHeld(e) && code === 'KeyV') {
+      // On Windows and Linux ⌘ is the Windows/Super key, and letting it go alone opens Start
+      // (or the launcher); the paste can get there after it does. A key that does nothing
+      // with it, pressed now, makes it not alone.
+      if (!macHost && e.metaKey) {
+        send(Input.KEY_DOWN, { keycode: MAC_KEYCODES.F20 });
+        send(Input.KEY_UP, { keycode: MAC_KEYCODES.F20 });
+      }
       // Let the browser fire `paste`; the host gets the text and presses Cmd+V itself, so
       // the Mac pastes what's on this device's clipboard. Without a focused text field some
       // browsers never fire it, so fall back to sending ⌘V as a plain keystroke.
       pasteHandled = false;
       setTimeout(() => {
         if (pasteHandled) return;
+        log('info', 'paste: no paste event, sent ⌘V as a keystroke', { focused: document.activeElement === keySink });
         send(Input.KEY_DOWN, { keycode });
         send(Input.KEY_UP, { keycode });
       }, PASTE_FALLBACK_MS);
       return;
     }
-    if (cmdHeld(e) && (code === 'KeyC' || code === 'KeyX') && navigator.clipboard?.write) {
+    if (copyHeld(e) && (code === 'KeyC' || code === 'KeyX') && navigator.clipboard?.write) {
       // Must be called during the keydown for Safari; the item resolves once the
       // Mac reports its new clipboard.
       const clip = nextClipboard(CLIPBOARD_WAIT_MS);
@@ -614,6 +673,7 @@ export function attachInput({
 
   window.addEventListener('keyup', (e) => {
     if (localField(e.target)) return;
+    if (!e.metaKey) unfocusAfterPaste();
     const code = codeOf(e);
     const keycode = MAC_KEYCODES[code];
     if (keycode === undefined) return;
@@ -632,6 +692,7 @@ export function attachInput({
   window.addEventListener('blur', () => {
     releaseKeys();
     remappedCtrl = undefined;
+    unfocusAfterPaste();
   });
 
   document.addEventListener('paste', (e) => {
@@ -643,21 +704,34 @@ export function attachInput({
     const html = data?.getData('text/html') || undefined;
     const image = [...(data?.files ?? [])].find((f) => f.type.startsWith('image/'));
     if (!text && !html && !image) return;
+    log('info', 'paste: sent this device\'s clipboard', { length: text.length, html: Boolean(html), image: image?.size });
     if (onPaste) onPaste({ text, html, image });
     else control({ t: 'clipboard', text, paste: true });
   });
 
+  // An IME (Chinese, Japanese, Korean; Android keyboards for every word) composes in the
+  // key sink, which can't be stopped; what it settles on is typed, and the field emptied.
+  let composed; // { text, at }: Safari can follow compositionend with the same insertText
+  keySink.addEventListener('compositionend', (e) => {
+    typeText(e.data);
+    composed = { text: e.data, at: performance.now() };
+    keySink.value = '';
+  });
+
   // On-screen keyboard text (and anything else that bypassed keydown).
   keySink.addEventListener('beforeinput', (e) => {
+    // Composition steps can't be cancelled; compositionend types the result.
+    if (e.isComposing || /Composition/.test(e.inputType)) return;
     e.preventDefault();
     switch (e.inputType) {
       case 'insertText':
-      case 'insertReplacementText':
-        for (const ch of e.data ?? '') {
-          const key = charToKey(ch);
-          if (key) tapKey(key.keycode, key.shift);
-        }
+      case 'insertReplacementText': {
+        const text = e.data ?? e.dataTransfer?.getData('text/plain') ?? '';
+        const again = composed && composed.text === text && performance.now() - composed.at < 100;
+        composed = undefined;
+        if (!again) typeText(text);
         break;
+      }
       case 'insertLineBreak':
       case 'insertParagraph':
         tapKey(MAC_KEYCODES.Enter, false);
@@ -673,6 +747,8 @@ export function attachInput({
 
   return {
     setTrackpad,
+    /** A display's picture in client pixels (letterboxed), or undefined before its size is known. */
+    contentRect,
     /** The displays changed size or layout: keep the trackpad cursor on a picture. */
     refreshCursor() {
       if (!trackpad) return;
@@ -686,6 +762,11 @@ export function attachInput({
     sendCombo(keycodes) {
       for (const keycode of keycodes) send(Input.KEY_DOWN, { keycode });
       for (const keycode of [...keycodes].reverse()) send(Input.KEY_UP, { keycode });
+    },
+    /** The streamed displays (index = stream), for their size in desktop points. */
+    setStreams(streams) {
+      pointsWidths.length = 0;
+      streams.forEach((d, i) => { pointsWidths[i] = d.points_width; });
     },
     setVideoSize(stream, width, height) {
       videoSizes[stream] = { width, height };

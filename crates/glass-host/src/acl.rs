@@ -171,6 +171,9 @@ async fn put_rules(
     if !crate::forward::is_owner(peer.ip().to_canonical(), &headers).await {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if let Some(r) = crate::origin::require_json(&headers) {
+        return r;
+    }
     let rules = match serde_json::from_slice::<Rules>(&body) {
         Ok(r) => r.rules,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),

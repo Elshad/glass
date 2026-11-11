@@ -71,7 +71,7 @@ impl GlassApp {
             ui::row("Mouse and keyboard", "Off: they can only watch.", switch("l-control", f.control, |f, v| f.control = v, cx), cx),
             ui::row("Files", "Send files here and download from here.", switch("l-files", f.files, |f, v| f.files = v, cx), cx),
             ui::row("Clipboard", "Copy and paste both ways.", switch("l-clip", f.clipboard, |f, v| f.clipboard = v, cx), cx),
-            ui::row("Ask me each time", "You allow each connection, here or from the menu bar.", switch("l-ask", f.ask, |f, v| f.ask = v, cx), cx),
+            ui::row("Ask me each time", format!("You allow each connection, here or from the {}.", super::ICON_PLACE), switch("l-ask", f.ask, |f, v| f.ask = v, cx), cx),
             ui::row("Require a passkey", "Face ID, Touch ID or a security key, on every connection.", switch("l-passkey", f.passkey, |f, v| f.passkey = v, cx), cx),
             ui::row(
                 "Works from anywhere",
@@ -89,7 +89,7 @@ impl GlassApp {
                         .icon(I::Link)
                         .label("Make link")
                         .loading(f.busy)
-                        .disabled(!snap.running())
+                        .disabled(!snap.running() || !snap.policy.allows("links"))
                         .on_click(cx.listener(|this, _, window, cx| this.make_link(window, cx))),
                 )
                 .into_any_element(),
@@ -169,7 +169,7 @@ impl GlassApp {
     fn make_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let f = &self.link;
         let grant = Duration::from_secs(GRANTS[f.grant].1);
-        let scope = Scope { view_only: !f.control, files: f.files, clipboard: f.clipboard, ask: f.ask, passkey: f.passkey };
+        let scope = Scope { view_only: !f.control, files: f.files, clipboard: f.clipboard, ask: f.ask, passkey: f.passkey, support: false };
         let anywhere = f.anywhere;
         self.link.busy = true;
         cx.notify();

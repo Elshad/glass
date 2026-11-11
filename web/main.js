@@ -1,7 +1,7 @@
 // Main thread: wires input, UI and the worker together. Video and networking live
 // in worker.js so the main thread only handles input and small DOM updates.
 
-import { inputEvent } from './proto.js';
+import { Input, inputEvent } from './proto.js';
 import { attachInput } from './input.js';
 import { attachGamepads } from './gamepad.js';
 import { createUI, positionNames } from './ui.js';
@@ -18,6 +18,7 @@ import { createAgent } from './agent.js';
 import { createPush } from './push.js';
 import { createDevice } from './device.js';
 import { createFiles } from './files.js';
+import { createCursor } from './cursor.js';
 
 // Shortcuts iPadOS keeps for itself (no web page or app can capture them), sent as one tap.
 const CMD = K.MetaLeft;
@@ -170,6 +171,7 @@ const areaObserver = new ResizeObserver((entries) => {
 });
 matchMedia(`(resolution: ${devicePixelRatio}dppx)`).addEventListener?.('change', () => queueViewport());
 let viewportTimer;
+let firstViewport = false; // this connection hasn't sent its viewport
 let lastViewport = '';
 
 // Remote: no host serves this page, so there's no config to fetch.
@@ -195,11 +197,13 @@ worker.onerror = (e) => log('error', `worker: ${e.message}`, { src: `${e.filenam
 const control = (msg) => worker.postMessage({ type: 'control', msg });
 // A view-only link sends no input (the host would drop it anyway).
 let inputAllowed = true;
-const send = (kind, fields) => inputAllowed && worker.postMessage({ type: 'input', bytes: inputEvent(kind, fields) });
+// Text events come ready made (textEvents); the rest from their fields.
+const send = (kind, fields) => inputAllowed && worker.postMessage({ type: 'input', bytes: kind === Input.TEXT ? fields.bytes : inputEvent(kind, fields) });
 let session = 0; // this session's id, from welcome (chat from it is our own)
 let perms = { input: true, clipboard: true, files: true, owner: true };
 let features = {};
 let sharpWanted = storage((s) => s.getItem(SHARP_KEY)) === '1';
+let sharpPending = false; // to ask for once the first picture is up
 let sharpMode = 'off'; // what the host is doing: 'off', 'sharp' or '4:2:2'
 let deniedMsg; // why the host last turned us away
 
@@ -306,7 +310,16 @@ const input = attachInput({
     annotator.invalidate();
     document.getElementById('zoom-pill').classList.toggle('hidden', s === 1);
     document.getElementById('zoom-level').textContent = `${s.toFixed(1)}×`;
+    cursor.refresh();
   },
+  onResize: () => cursor.refresh(),
+});
+// The host's pointer, drawn here rather than in the video (where the host supports it).
+const cursor = createCursor({
+  screens,
+  overlay: document.getElementById('remote-cursor'),
+  contentRect: (el) => input.contentRect(el),
+  onWanted: (on) => worker.postMessage({ type: 'localCursor', on }),
 });
 document.getElementById('zoom-reset').addEventListener('click', () => input.resetZoom());
 let micContext;
@@ -347,6 +360,7 @@ const ui = createUI({
   onSelectDisplay: (id) => control(id === 'all' ? { t: 'showAll' } : { t: 'selectDisplay', id }),
   onSharp: (on) => {
     sharpWanted = on;
+    sharpPending = false;
     storage((s) => s.setItem(SHARP_KEY, on ? '1' : '0'));
     ui.setSharp({ on });
     control({ t: 'sharp', on });
@@ -393,13 +407,14 @@ const ui = createUI({
   onUploadFiles: uploadFiles,
   onRequestFiles: () => {
     control({ t: 'pickFiles' });
-    ui.toast({ text: 'Choose files in the dialog on your Mac' });
+    ui.toast({ text: 'Choose files in the dialog on the computer' });
   },
   onAudio: toggleAudio,
   onMic: toggleMic,
   onFullscreen: toggleFullscreen,
   onToggleStats: toggleStats,
   onPrivacy: (on) => control({ t: 'privacy', on }),
+  onSas: () => control({ t: 'sas' }),
   onRestart: (glass) => {
     restarting = glass ? 'Glass' : 'computer';
     control({ t: 'restart', glass });
@@ -487,6 +502,7 @@ const files = createFiles({
   toast: (o) => ui.toast(o),
   upload: (list, dir) => uploadFiles(list, dir),
   // A plain browser download, from this page's own host (not over remote access).
+  // `name` '': the host's name for it (Content-Disposition).
   download: (url, name) => {
     const a = document.createElement('a');
     a.href = url;
@@ -515,6 +531,35 @@ const standalone = matchMedia('(display-mode: standalone), (display-mode: fullsc
 if (standalone) document.getElementById('btn-fullscreen').classList.add('hidden');
 log('info', 'display mode', { standalone: !!standalone });
 
+// A page can be reported hidden while it is on screen and in use: Edge on Windows did, for
+// minutes at a time (its window-occlusion check misfires, e.g. under an always-on-top
+// overlay), which froze the picture while clicks still reached the computer. Input only
+// reaches a page that's on screen, so it counts as being seen. Declared above createDevice:
+// its idle watcher can call syncVideo while this file is still loading.
+let away = false; // "Pause while away" says nobody is here
+let padOn = false; // keyboard and mouse mode: see setPad
+let usedAt = -Infinity; // while hidden: when it was hidden (desktop only), or the last input
+let videoOn = true;
+let pauseTimer;
+
+function floating() {
+  return Boolean(document.pictureInPictureElement || window.documentPictureInPicture?.window);
+}
+/** Whether video should run. Everything that can change the answer calls syncVideo. */
+function wantsVideo() {
+  if (away || padOn) return false;
+  return document.visibilityState === 'visible' || floating() || performance.now() - usedAt < PAUSE_HIDDEN_AFTER_MS;
+}
+function syncVideo() {
+  clearTimeout(pauseTimer);
+  videoOn = wantsVideo();
+  worker.postMessage({ type: 'visible', visible: videoOn });
+  // On only because it was used lately: look again when that runs out. Input just moves usedAt.
+  if (videoOn && document.visibilityState !== 'visible' && !floating()) {
+    pauseTimer = setTimeout(syncVideo, usedAt + PAUSE_HIDDEN_AFTER_MS - performance.now());
+  }
+}
+
 const device = createDevice({
   ui,
   push,
@@ -525,7 +570,10 @@ const device = createDevice({
   streams: () => (rtpVideo ? videos : canvases).slice(0, streamCount),
   sendClip: (clip) => sendClip(clip),
   displays: () => displays,
-  onPause: (away) => worker.postMessage({ type: 'visible', visible: !away && !padOn && document.visibilityState === 'visible' }),
+  onPause: (isAway) => {
+    away = isAway;
+    syncVideo();
+  },
   onPressure: (scale) => {
     if (scale === pressureScale) return;
     pressureScale = scale;
@@ -608,6 +656,8 @@ worker.postMessage({
   // A wide-colour screen: a Display P3 stream is drawn in P3, not clipped to sRGB.
   wideColor: matchMedia('(color-gamut: p3)').matches,
   decoderStep: Number(storage((s) => s.getItem(DECODER_STEP_KEY)) ?? 0),
+  // bench/ only: read the test host's frame marker (see bench.js).
+  bench: storage((s) => s.getItem('glass.bench')) === '1',
 }, rtcPort ? [rtcPort] : []);
 armMachineTimeout();
 showStatus('connecting', 'Connecting', machineName(currentHost));
@@ -673,12 +723,12 @@ function showStreams(count) {
   worker.postMessage({ type: 'streams', count });
 }
 showStreams(1);
-if (document.visibilityState !== 'visible') worker.postMessage({ type: 'visible', visible: false });
 
 const videoSizes = [];
 let status = 'connecting…';
 let codec = '';
 let statsCount = 0;
+let loggedPeak = 0; // the highest audioPeak since stats were last logged
 let targetMbps;
 let displays = [];
 // Ids of windows (not displays) this viewer has seen or picked, so a streamed window never
@@ -688,6 +738,9 @@ const transfers = new Map(); // id -> toast
 
 worker.onmessage = ({ data }) => {
   switch (data.type) {
+    case 'cursor':
+      cursor.setPosition(data.pos);
+      break;
     case 'connected':
       reloadIfUpdated('reconnect');
       if (rtpVideo) checkRtpVideoArrives();
@@ -719,9 +772,25 @@ worker.onmessage = ({ data }) => {
     case 'stats':
       // Over RTP the worker sees no video; the connection's own stats describe it.
       if (rtpVideo) data = { ...data, ...rtpStats };
-      if (++statsCount % 5 === 0) log('info', 'stats', data);
+      // Logged every fifth: with the loudest sound since the last one logged.
+      loggedPeak = Math.max(loggedPeak, data.audioPeak ?? 0);
+      if (++statsCount % 5 === 0) {
+        log('info', 'stats', { ...data, audioPeak: loggedPeak });
+        loggedPeak = 0;
+      }
       if (data.fps > 0) hideStatus();
       renderHud(data);
+      break;
+    case 'firstFrame':
+      window.glassFirstFrame ??= performance.now();
+      // Sharp text restarts capture and the encoder: not while the first picture is coming.
+      if (sharpPending) control({ t: 'sharp', on: true });
+      sharpPending = false;
+      startAfterFirstPicture(0);
+      break;
+    case 'bench':
+      // One second of the bench probe, for bench/run.mjs to collect.
+      (window.glassBench ??= []).push(data);
       break;
     case 'decoderStep':
       storage((s) => s.setItem(DECODER_STEP_KEY, String(data.step)));
@@ -757,10 +826,31 @@ worker.onmessage = ({ data }) => {
   }
 };
 
+// On a slow link the first picture has to share it with everything else, so it goes first:
+// the main screen, then sound and the mic (the worker), then the other displays' previews,
+// then the rest. Only a picture that never comes (a hidden page) holds them to the wait.
+const FIRST_PICTURE_WAIT_MS = 6000;
+const PREVIEWS_AFTER_MS = 1000;
+const REST_AFTER_MS = 2000;
+let startTimers = [];
+function cancelStart() {
+  startTimers.forEach(clearTimeout);
+  startTimers = [];
+}
+function startAfterFirstPicture(wait) {
+  cancelStart();
+  startTimers = [
+    setTimeout(() => thumbs.setConnected(true), wait + PREVIEWS_AFTER_MS),
+    setTimeout(() => { if (remoteKey) setLogSink((lines) => control({ t: 'log', lines })); }, wait + REST_AFTER_MS),
+  ];
+}
+
 function onControl(msg) {
   switch (msg.t) {
     case 'welcome':
-      thumbs.setConnected(true);
+      startAfterFirstPicture(FIRST_PICTURE_WAIT_MS);
+      cursor.reset();
+      cursor.setHostSupports(Boolean(msg.features?.cursor));
       agent.reset();
       agent.setOwner(Boolean(msg.perms ? msg.perms.owner : !msg.guest));
       machineFailures = 0;
@@ -779,14 +869,12 @@ function onControl(msg) {
       input.setHostOs(msg.host_os ?? 'macos');
       ui.setHostOs(msg.host_os ?? 'macos');
       applyKeyboard(msg.host_os ?? 'macos');
-      if (remoteKey) {
-        setLogSink((lines) => control({ t: 'log', lines }));
-        rememberRemote(msg.computer);
-      }
+      files.setHostOs(msg.host_os ?? 'macos');
+      if (remoteKey) rememberRemote(msg.computer);
       guest = Boolean(msg.guest);
       // Remote: other machines aren't reachable from here, so no machines menu either.
       ui.setGuest(guest || Boolean(remoteKey));
-      ui.setCanFit(!guest);
+      ui.setCanFit(!guest && msg.features?.fit !== false);
       // A new session has no second display (the host removed it when the last one ended).
       extended = undefined;
       ui.setExtend({ available: Boolean(msg.features?.extend && (msg.perms ? msg.perms.owner : !guest)), on: false });
@@ -818,7 +906,7 @@ function onControl(msg) {
       // Sharp text is this device's choice: ask again on every (re)connect.
       sharpMode = 'off';
       ui.setSharp({ available: perms.input, on: sharpWanted && perms.input, mode: 'off' });
-      if (sharpWanted && perms.input) control({ t: 'sharp', on: true });
+      sharpPending = sharpWanted && perms.input;
       {
         // Controllers and the mic count as input: not for view-only links.
         const canInput = msg.perms?.input ?? true;
@@ -839,10 +927,16 @@ function onControl(msg) {
       recordButton.classList.toggle('hidden', !(msg.features?.record && msg.perms?.owner));
       if (guest && resolutionMode.startsWith('fit:')) setResolution('auto');
       onLayout(msg.streams);
-      queueViewport(true);
+      // At once: the host holds the first picture for it, to send it at this size.
+      firstViewport = true;
+      lastViewport = '';
+      sendViewport();
       // A reload or reconnect: the host put the displays back when the session ended.
       if (resolutionMode.startsWith('fit:') && !guest) sendFit();
       log('info', 'welcome', { displays: displays.length, streams: msg.streams.map((d) => d.id), audio: msg.audio });
+      break;
+    case 'cursor':
+      cursor.setShape(msg);
       break;
     case 'layout':
       // The host's current displays (a fit adds a virtual one and hides the one it mirrors).
@@ -1015,12 +1109,14 @@ let elsewhere;
 
 function onConnectionStatus(text) {
   if (elsewhere) {
+    cancelStart();
     thumbs.setConnected(false);
     device.setConnected(false);
     showStatus('error', ...elsewhere);
     return;
   }
   if (text !== 'connected') {
+    cancelStart();
     thumbs.setConnected(false);
     device.setConnected(false);
   }
@@ -1065,7 +1161,7 @@ function renderHud(d) {
       `${d.fps} fps  ${d.mbps.toFixed(1)} Mbps` + (targetMbps ? ` (target ${targetMbps.toFixed(0)})` : '') + `  dropped ${d.dropped}`,
     ),
   ];
-  if (d.audioPackets) lines.push(hudLine(`audio ${d.audioPackets} pkt/s  lost ${d.audioLost}`));
+  if (d.audioPackets) lines.push(hudLine(`audio ${d.audioPackets} pkt/s  lost ${d.audioLost}  ${d.audioCodec}`));
   hud.replaceChildren(...lines);
 }
 
@@ -1160,7 +1256,8 @@ function sendViewport() {
       streams.push([1, 1]);
       continue;
     }
-    const area = areas.get(elements[i]);
+    // Before the first layout: this window, near enough for the first picture's size.
+    const area = areas.get(elements[i])?.[0] ? areas.get(elements[i]) : firstViewport ? [innerWidth, innerHeight] : undefined;
     if (resolutionMode !== 'auto' || !area || !area[0]) {
       streams.push(null);
       continue;
@@ -1168,6 +1265,7 @@ function sendViewport() {
     const scale = devicePixelRatio * zoomScale * pressureScale;
     streams.push([Math.round(area[0] * scale), Math.round(area[1] * scale)]);
   }
+  firstViewport = false;
   const msg = JSON.stringify(streams);
   if (msg === lastViewport) return;
   lastViewport = msg;
@@ -1254,7 +1352,9 @@ function fitSizes() {
 
 function onLayout(streams) {
   annotator.invalidate();
+  input.setStreams(streams);
   input.refreshCursor();
+  cursor.setStreams(streams);
   for (const d of streams) if (!streamedWindows.has(d.id) && !displays.some((x) => x.id === d.id)) displays.push(d);
   // The host orders streams as arranged in macOS; lay them out the same way.
   screens.dataset.arrange = arrangement(streams);
@@ -1310,12 +1410,13 @@ function uploadFiles(list, dir) {
 function onFileProgress({ id, name, done, total, direction }) {
   let t = transfers.get(id);
   const verb = direction === 'up' ? 'Sending' : 'Receiving';
-  const fraction = total ? done / total : 1;
+  // `total` null: a folder zipped as it comes, so no total (an indeterminate bar).
+  const fraction = total === null ? null : total ? done / total : 1;
   if (!t) {
     t = ui.toast({ text: `${verb} ${name}`, progress: fraction, timeout: 0 });
     transfers.set(id, t);
   }
-  t.update({ progress: fraction });
+  t.update({ progress: fraction, text: total === null ? `${verb} ${name} · ${formatBytes(done)}` : undefined });
   if (done >= total && direction === 'up') {
     t.update({ text: `Sent ${name}` });
     t.dismiss(1500);
@@ -1472,31 +1573,46 @@ async function toggleFullscreen() {
   await navigator.keyboard?.lock?.().catch(() => {});
 }
 
+// Input on a page reported hidden: keep its video going, and resume it if it was paused (on
+// mobile too, which then waits like a desktop page: it was evidently on screen).
+for (const type of ['pointerdown', 'pointermove', 'keydown', 'wheel']) {
+  addEventListener(type, () => {
+    if (document.visibilityState === 'visible') return;
+    usedAt = performance.now();
+    if (videoOn) return;
+    syncVideo();
+    if (!videoOn) return;
+    log('info', 'input while reported hidden: video resumed');
+    worker.postMessage({ type: 'wake' });
+  }, { capture: true, passive: true });
+}
+
+function onHidden() {
+  // Floating in picture in picture: still on screen, so that decides, not this.
+  // Mobile pauses synchronously: the page may be frozen before a timer could run.
+  if (!floating()) usedAt = mobile ? -Infinity : performance.now();
+  syncVideo();
+}
 // iPadOS suspends background tabs; reconnect as soon as we're back.
-let pauseTimer;
 document.addEventListener('visibilitychange', () => {
   log('info', `visibility: ${document.visibilityState}`);
-  clearTimeout(pauseTimer);
-  if (document.visibilityState === 'visible') {
-    worker.postMessage({ type: 'visible', visible: !padOn });
-    worker.postMessage({ type: 'wake' });
-    reloadIfUpdated('visible');
+  if (document.visibilityState !== 'visible') {
+    onHidden();
     return;
   }
-  // Floating in picture in picture: still on screen, so keep the video going.
-  if (floating()) return;
-  const pause = () => worker.postMessage({ type: 'visible', visible: false });
-  // Synchronously on mobile: the page may be frozen before a timer could run.
-  if (mobile) pause();
-  else pauseTimer = setTimeout(pause, PAUSE_HIDDEN_AFTER_MS);
+  usedAt = -Infinity;
+  syncVideo();
+  worker.postMessage({ type: 'wake' });
+  reloadIfUpdated('visible');
 });
-function floating() {
-  return Boolean(document.pictureInPictureElement || window.documentPictureInPicture?.window);
-}
 // Back from picture in picture with the page still hidden: pause now.
 document.addEventListener('leavepictureinpicture', () => {
-  if (document.visibilityState === 'hidden') worker.postMessage({ type: 'visible', visible: false });
+  if (document.visibilityState !== 'hidden') return;
+  usedAt = -Infinity;
+  syncVideo();
 }, true);
+// Opened in a background tab, or reloaded while reported hidden.
+if (document.visibilityState !== 'visible') onHidden();
 addEventListener('online', () => worker.postMessage({ type: 'wake' }));
 // Leaving (a reload included): end the session now. Safari can keep a dead page's
 // connection open otherwise, and the host would list this device twice.
@@ -1662,11 +1778,12 @@ async function onFirstWelcome() {
 const TRACKPAD_KEY = 'glass.trackpad';
 const touchScreen = matchMedia('(hover: none)').matches || navigator.maxTouchPoints > 0;
 const phone = touchScreen && Math.min(screen.width, screen.height) < 600;
-let padOn = false; // keyboard and mouse mode: see setPad
 let trackpadOn = touchScreen && (storage((s) => s.getItem(TRACKPAD_KEY)) ?? (phone ? '1' : '0')) === '1';
 function setTrackpad(on, chosen = false) {
   trackpadOn = on;
   input.setTrackpad(on);
+  // Trackpad mode draws its own pointer (#tp-cursor): the host's goes back in the video.
+  cursor.setWanted(!on);
   ui.setTrackpad({ available: touchScreen, on });
   if (!chosen) return;
   storage((s) => s.setItem(TRACKPAD_KEY, on ? '1' : '0'));
@@ -1694,7 +1811,7 @@ function setPad(on, chosen = false) {
   } else {
     setTrackpad(padWasTrackpad);
   }
-  worker.postMessage({ type: 'visible', visible: !on && document.visibilityState === 'visible' });
+  syncVideo();
   sendViewport();
   ui.setPad({ available: touchScreen, on });
   log('info', `keyboard and mouse mode ${on ? 'on' : 'off'}`);

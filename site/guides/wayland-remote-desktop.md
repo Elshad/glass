@@ -62,7 +62,7 @@ curl -fsSL glassdesk.dev | sh
 `glass setup` checks for PipeWire, the portal and wl-clipboard, and offers to install what's missing with pacman, apt, dnf or zypper. It installs a one-line udev rule for input, which needs `sudo` once, and runs `tailscale serve` so the machine has an HTTPS address on your tailnet. On Hyprland the share picker asks once which screen to share, and Glass remembers the answer.
 
 **Glass's limits on Linux (beta):**
-- x86_64 only.
+- x86_64 and ARM64 (aarch64) only; needs glibc 2.39+ (Ubuntu 24.04+, Fedora 40+, Arch).
 - Software H.264 encoding (hardware VA-API is planned), and screens over 2560×1600 are halved to keep the frame rate up.
 - It needs a running graphical session, not the login screen.
 

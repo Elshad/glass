@@ -114,8 +114,16 @@ pub trait VideoSource: Send + Sync {
     fn picture(&self, _id: u32, _max: [u32; 2]) -> Option<crate::lossless::RawFrame> {
         None
     }
+    /// Makes sure display `id`'s changes reach `crate::damage` (an agent is waiting on it),
+    /// starting a capture of it if none runs; `false` when this source can't, and pictures
+    /// of it are compared instead. Called on each look; may block.
+    fn track_damage(&self, _id: u32) -> bool {
+        false
+    }
     /// Capture in full colour (BGRA), so `raw_frame` has pictures to send losslessly.
     fn set_full_colour(&self, _on: bool) {}
+    /// Draw the pointer into the picture (`crate::cursor` decides), or leave it out.
+    fn set_cursor_baked(&self, _on: bool) {}
     /// Can this source provide raw frames at all?
     fn supports_lossless(&self) -> bool {
         false
@@ -149,7 +157,10 @@ pub trait InputSink: Send {
     /// Moves the pointer to `x`, `y` (0..1) of display `display`, streamed or not (agents).
     fn move_on_display(&mut self, display: u32, x: f32, y: f32);
     /// Types `text` as is, any characters; `false` when this sink can't (the caller then
-    /// presses keys for it).
+    /// presses keys for it). Linux can't: uinput sends key codes through the desktop's own
+    /// keyboard layout, with no way to type a character the layout lacks (no XTest on
+    /// Wayland, and Glass doesn't drive the RemoteDesktop portal, which takes keysyms), so
+    /// only characters on a US keyboard are typed there.
     fn type_text(&mut self, _text: &str) -> bool {
         false
     }

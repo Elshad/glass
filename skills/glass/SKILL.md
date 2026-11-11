@@ -5,7 +5,7 @@ description: Install, set up, check or troubleshoot Glass (glassdesk.dev), a low
 
 # Glass: set up any machine on the tailnet
 
-Glass streams a computer's screen to a browser and takes mouse, keyboard and touch input back. The host runs on macOS 13+ and on Linux x86_64 (Wayland). Every machine with Glass on the user's tailnet shows up in the client's **Machines** menu, so setting up one more machine is all it takes to control it from anywhere.
+Glass streams a computer's screen to a browser and takes mouse, keyboard and touch input back. The host runs on macOS 13+ and on Linux x86_64 or ARM64 (Wayland). Every machine with Glass on the user's tailnet shows up in the client's **Machines** menu, so setting up one more machine is all it takes to control it from anywhere.
 
 You can do almost everything remotely. Two steps need a person at the target's screen (macOS permission switches, or the Linux share picker); your job is to do the rest and tell the user exactly what to click.
 
@@ -127,6 +127,10 @@ Limit a link with `--view-only`, `--no-files`, `--no-clipboard`, `--ask` (the pe
 ## Use the computer yourself (MCP)
 
 Once Glass runs on a machine, you can see and use it through `glass mcp`, an MCP server with `screenshot`, `snapshot` (an app's window as text with refs, macOS), `press` and `set_value` (act on a ref without moving the pointer), `click`, `type_text`, `press_keys`, `scroll`, `drag`, `wait_for_change`, `request_help` and `confirm`. Suggest adding it when the user wants you to do something in an app with no API: `claude mcp add -s user glass -- glass mcp`. One server reaches every machine: `list_machines`, then pass `machine: "<name>"` to any tool. The user watches you from any Glass viewer and can pause or stop you. Always `confirm` before anything hard to undo, and use `request_help` for sign-ins, 2FA codes and CAPTCHAs instead of working around them.
+
+`wait_for_change` works from what the computer's capture says changed, so a caret or a spinner counts. By default it returns once the screen has been still for `idle_ms` (300). `change: true` waits for a change first. Every screenshot carries a `seq`; pass it as `since` to count changes after that picture, including ones that happened before the call. `region: [x, y, width, height]`, in screenshot pixels, counts only changes there (a field, a progress bar). To see what a click did: screenshot (seq 41), click, `wait_for_change` with `since: 41, change: true, idle_ms: 300`, then screenshot. Over HTTP it's `POST /agent/v1/act` with `{"action": "wait_for_change", "since": 41, "change": true, "idle_ms": 300, "region": [0, 0, 400, 80]}`. The reply has `changed`, `timed_out`, `seq` and `waited_ms`.
+
+`record` records the screen as an MP4 (what's streamed, with the pointer; nothing is re-encoded): `seconds` (default 5, at most 60) records and returns, or `start: true` returns an id and `stop: <id>` ends it (a started one ends by itself after 10 minutes). The MP4 comes back as an embedded `video/mp4` resource when it's 20 MB or less, and its path on that computer either way (under Glass's config folder, `agent-recordings`, removed after a day). Over HTTP: `{"action": "record", "seconds": 5}`, `{"action": "record", "start": true}`, `{"action": "record", "stop": <id>}`; the reply has `path`, `parts`, `bytes`, `duration_ms` and `mp4` (base64, when small enough). It needs only `computer:view`, and an agent under a grant has its recording deleted if a protected app comes to the front.
 
 ## Troubleshooting
 

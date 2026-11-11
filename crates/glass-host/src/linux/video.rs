@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -16,6 +16,7 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use super::{audio, clock::now_us, permissions, portal};
+use crate::mailbox::{FrameSender, Mailbox};
 use crate::media::VideoSource;
 pub use crate::media::{AudioPackets, DisplayInfo, EncodedFrame, Layout};
 use crate::soft_encode::{Encoder, Frame, PixelFormat};
@@ -62,70 +63,6 @@ const PICTURE_MAX: [u32; 2] = [1600, 1600];
 
 /// Lossless refreshes wanted (sharp text): keep a BGRA copy of each new picture.
 static FULL_COLOUR: AtomicBool = AtomicBool::new(false);
-
-/// Hands captured frames to a monitor's encoder. Holds only the newest: a frame that
-/// arrives while the encoder is busy replaces the one waiting, so the encoder never
-/// starts on a picture that went stale in a queue. Pixel buffers are reused, so a 4K
-/// frame (33 MB) is copied into memory that's already mapped, not freshly allocated.
-#[derive(Default)]
-struct Mailbox {
-    state: Mutex<MailboxState>,
-    ready: Condvar,
-}
-
-#[derive(Default)]
-struct MailboxState {
-    frame: Option<(Frame, u64)>,
-    spare: Option<Vec<u8>>,
-    closed: bool,
-}
-
-impl Mailbox {
-    /// A buffer to copy the next frame into: the waiting frame's (it's about to be
-    /// replaced), else one the encoder gave back.
-    fn buffer(&self) -> Vec<u8> {
-        let mut state = self.state.lock().unwrap();
-        state
-            .frame
-            .take()
-            .map(|(f, _)| f.data)
-            .or_else(|| state.spare.take())
-            .unwrap_or_default()
-    }
-
-    fn put(&self, frame: Frame, captured_us: u64) {
-        self.state.lock().unwrap().frame = Some((frame, captured_us));
-        self.ready.notify_one();
-    }
-
-    fn recv_timeout(&self, timeout: Duration) -> Result<(Frame, u64), RecvTimeoutError> {
-        let state = self.state.lock().unwrap();
-        let (mut state, _) = self
-            .ready
-            .wait_timeout_while(state, timeout, |s| s.frame.is_none() && !s.closed)
-            .unwrap();
-        match state.frame.take() {
-            Some(f) => Ok(f),
-            None if state.closed => Err(RecvTimeoutError::Disconnected),
-            None => Err(RecvTimeoutError::Timeout),
-        }
-    }
-
-    /// Gives a frame's buffer back for the next capture.
-    fn recycle(&self, data: Vec<u8>) {
-        self.state.lock().unwrap().spare = Some(data);
-    }
-}
-
-/// The capture side of a mailbox; dropping it tells the encoder capture has stopped.
-struct FrameSender(Arc<Mailbox>);
-
-impl Drop for FrameSender {
-    fn drop(&mut self) {
-        self.0.state.lock().unwrap().closed = true;
-        self.0.ready.notify_all();
-    }
-}
 
 /// Where a capturer that isn't PipeWire (X11) delivers one monitor's frames.
 pub(super) struct CaptureSink {
@@ -441,8 +378,11 @@ fn encode_loop(
     let mut encoder: Option<VideoEncoder> = None;
     let mut applied_bitrate = bitrate;
     let mut last: Option<(Frame, u64)> = None;
+    // The latest picture hasn't been encoded yet (held while a viewer's link is full).
+    let mut unsent = false;
     loop {
-        let fresh = match rx.recv_timeout(IDLE_POLL) {
+        let wait = if unsent { crate::flow::POLL } else { IDLE_POLL };
+        let fresh = match rx.recv_timeout(wait) {
             Ok(f) => Some(f),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
@@ -473,9 +413,10 @@ fn encode_loop(
         if slot < 0 {
             continue;
         }
+        unsent |= has_fresh;
         let wants_key = monitor.keyframe.load(Ordering::Relaxed);
         // Nothing new: only re-encode the last frame to answer a keyframe request.
-        if !has_fresh && !wants_key {
+        if !unsent && !wants_key {
             continue;
         }
         let Some((frame, captured_us)) = last.as_ref() else {
@@ -529,7 +470,13 @@ fn encode_loop(
                 }));
             }
         }
-        let capture_us = if has_fresh { *captured_us } else { now_us() };
+        // A viewer's link is still busy (crate::flow): keep the picture and look again
+        // shortly; the next frame carries every change since.
+        if !wants_key && crate::flow::held(slot as u8) {
+            continue;
+        }
+        let capture_us = if unsent { *captured_us } else { now_us() };
+        unsent = false;
         match encoder.as_mut().unwrap().encode(frame, force) {
             Ok(Some((data, keyframe))) => {
                 let _ = frames.send(Arc::new(EncodedFrame {
@@ -629,6 +576,8 @@ struct StreamState {
     tx: FrameSender,
     first: bool,
     id: usize,
+    /// Compares frames for crate::damage when the compositor doesn't say what changed.
+    differ: crate::damage::Differ,
 }
 
 fn run_pipewire(
@@ -657,10 +606,11 @@ fn run_pipewire(
             tx,
             first: true,
             id: i,
+            differ: Default::default(),
         };
         let listener = stream
             .add_local_listener_with_user_data(state)
-            .param_changed(|_, st, id, param| {
+            .param_changed(|stream, st, id, param| {
                 let Some(param) = param else { return };
                 if id != spa::param::ParamType::Format.as_raw() {
                     return;
@@ -685,6 +635,13 @@ fn run_pipewire(
                     size.height,
                     st.format.format()
                 );
+                // Ask for what changed in each frame, for agents waiting on the screen.
+                let meta = damage_params();
+                if let Some(pod) = Pod::from_bytes(&meta)
+                    && let Err(e) = stream.update_params(&mut [pod])
+                {
+                    warn!("screen {}: can't ask for damage: {e}", st.id);
+                }
             })
             .process(|stream, st| {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -693,6 +650,19 @@ fn run_pipewire(
                 let Some(pixel) = st.pixel else { return };
                 let size = st.format.size();
                 let (width, height) = (size.width as usize, size.height as usize);
+                // Where it changed, when the compositor says (read before the pixels).
+                let damage: Option<Vec<(u32, u32, u32, u32)>> = buffer
+                    .find_meta::<spa::buffer::meta::MetaVideoDamage>()
+                    .map(|d| {
+                        d.iter()
+                            .map(|r| {
+                                let (p, s) = (r.position(), r.size());
+                                let (x, y) = (p.x.max(0) as u32, p.y.max(0) as u32);
+                                (x, y, x.saturating_add(s.width), y.saturating_add(s.height))
+                            })
+                            .collect()
+                    })
+                    .filter(|rects: &Vec<_>| !rects.is_empty());
                 let datas = buffer.datas_mut();
                 let Some(data) = datas.first_mut() else {
                     return;
@@ -705,9 +675,26 @@ fn run_pipewire(
                 if bytes.len() < needed || width == 0 || height == 0 {
                     return;
                 }
-                if st.first {
+                let first = st.first;
+                if first {
                     st.first = false;
                     info!("screen {}: first frame", st.id);
+                }
+                let display = st.id as u32;
+                match damage {
+                    // How the display looks, not a change.
+                    _ if first => crate::damage::note(display, (width, height), &[]),
+                    Some(rects) => crate::damage::note(display, (width, height), &rects),
+                    // Compared only while an agent is looking: it reads the whole frame.
+                    None if crate::damage::wanted(display) => {
+                        if let Some(rects) = st.differ.diff(width, height, stride, &bytes[offset..needed]) {
+                            crate::damage::note(display, (width, height), &rects);
+                        }
+                    }
+                    None => {
+                        st.differ = Default::default();
+                        crate::damage::note_all(display, (width, height));
+                    }
                 }
                 let captured_us = now_us();
                 let mut pixels = st.tx.0.buffer();
@@ -737,6 +724,34 @@ fn run_pipewire(
     }
     mainloop.run();
     Ok(())
+}
+
+/// Damage regions with each buffer (SPA_META_VideoDamage), up to 16 a frame.
+fn damage_params() -> Vec<u8> {
+    use spa::pod::{ChoiceValue, Object, Property, Value};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id, SpaTypes};
+    // SPA_PARAM_META_type and SPA_PARAM_META_size (spa/param/buffers.h).
+    const META_TYPE: u32 = 1;
+    const META_SIZE: u32 = 2;
+    let region = std::mem::size_of::<spa::sys::spa_meta_region>() as i32;
+    let obj = Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: spa::param::ParamType::Meta.as_raw(),
+        properties: vec![
+            Property::new(META_TYPE, Value::Id(Id(spa::sys::SPA_META_VideoDamage))),
+            Property::new(
+                META_SIZE,
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range { default: region * 16, min: region, max: region * 16 },
+                ))),
+            ),
+        ],
+    };
+    spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+        .expect("serialize meta pod")
+        .0
+        .into_inner()
 }
 
 /// Accept 32-bit RGB formats in shared memory (no DMA-BUF modifiers offered, so the
@@ -821,6 +836,10 @@ impl VideoSource for Video {
             }
         }
     }
+    /// Every shared monitor is captured all the time; frames say (or show) what changed.
+    fn track_damage(&self, id: u32) -> bool {
+        self.monitors.lock().unwrap().as_ref().is_some_and(|m| (id as usize) < m.len())
+    }
     fn picture(&self, id: u32, max: [u32; 2]) -> Option<crate::lossless::RawFrame> {
         *THUMBS_UNTIL.lock().unwrap() = Some(std::time::Instant::now() + Duration::from_secs(10));
         let frame = {
@@ -847,49 +866,5 @@ impl VideoSource for Video {
                 m.bitrate.store(bps, Ordering::Relaxed);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn frame(fill: u8) -> Frame {
-        Frame {
-            width: 2,
-            height: 1,
-            stride: 8,
-            format: PixelFormat::Bgrx,
-            data: vec![fill; 8],
-        }
-    }
-
-    #[test]
-    fn mailbox_keeps_only_the_newest_frame() {
-        let mailbox = Arc::new(Mailbox::default());
-        let tx = FrameSender(mailbox.clone());
-        tx.0.put(frame(1), 1);
-        tx.0.put(frame(2), 2);
-        let (f, at) = mailbox.recv_timeout(Duration::ZERO).unwrap();
-        assert_eq!((f.data[0], at), (2, 2));
-        assert!(matches!(mailbox.recv_timeout(Duration::from_millis(5)), Err(RecvTimeoutError::Timeout)));
-        drop(tx);
-        assert!(matches!(mailbox.recv_timeout(Duration::from_secs(5)), Err(RecvTimeoutError::Disconnected)));
-    }
-
-    #[test]
-    fn mailbox_reuses_buffers() {
-        let mailbox = Mailbox::default();
-        let data = Vec::with_capacity(4096);
-        let ptr = data.as_ptr();
-        mailbox.recycle(data);
-        let buffer = mailbox.buffer();
-        assert_eq!(buffer.as_ptr(), ptr, "the encoder's spare");
-        let mut waiting = frame(3);
-        waiting.data.reserve(4096);
-        let ptr = waiting.data.as_ptr();
-        mailbox.put(waiting, 0);
-        let buffer = mailbox.buffer();
-        assert_eq!(buffer.as_ptr(), ptr, "the frame it replaces");
     }
 }

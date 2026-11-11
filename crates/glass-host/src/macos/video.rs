@@ -89,6 +89,10 @@ pub struct Video {
     full_colour: AtomicBool,
     /// The frame rate viewers want (crate::refresh): 60, or up to 120 for fast screens.
     max_fps: std::sync::atomic::AtomicU32,
+    /// Draw the pointer into the picture (crate::cursor decides).
+    cursor: AtomicBool,
+    /// Displays an agent is waiting on that no stream shows, watched for changes alone.
+    watches: Mutex<std::collections::HashMap<u32, capture::Watch>>,
 }
 
 impl Video {
@@ -110,6 +114,8 @@ impl Video {
             rext: AtomicBool::new(false),
             full_colour: AtomicBool::new(false),
             max_fps: std::sync::atomic::AtomicU32::new(crate::refresh::DEFAULT),
+            cursor: AtomicBool::new(true),
+            watches: Mutex::new(Default::default()),
         }
     }
 
@@ -264,6 +270,7 @@ impl Video {
         ));
         let capture = capture::start(
             target.source(),
+            index,
             width,
             height,
             fps as i32,
@@ -272,6 +279,7 @@ impl Video {
             audio,
             self.full_colour.load(Ordering::Relaxed),
             p3,
+            self.cursor.load(Ordering::Relaxed),
         )?;
         let id = info.id;
         let window = matches!(target, Target::Window(_));
@@ -388,6 +396,39 @@ impl VideoSource for Video {
             info!("capture colour: {}", if on { "BGRA (lossless refresh)" } else { "4:2:0" });
         }
     }
+    fn set_cursor_baked(&self, on: bool) {
+        if self.cursor.swap(on, Ordering::Relaxed) != on {
+            for s in self.streams.lock().unwrap().iter() {
+                s.capture.set_shows_cursor(on);
+            }
+        }
+    }
+    /// A streamed display reports its changes already; another is watched while agents
+    /// want it (`heal` stops it after).
+    fn track_damage(&self, id: u32) -> bool {
+        if self.streams.lock().unwrap().iter().any(|s| !s.window && s.display.id == id) {
+            self.watches.lock().unwrap().remove(&id);
+            return true;
+        }
+        let mut watches = self.watches.lock().unwrap();
+        if watches.get(&id).is_some_and(|w| !w.stopped()) {
+            return true;
+        }
+        watches.remove(&id);
+        let watched = capture::list_displays()
+            .and_then(|all| all.into_iter().find(|d| d.info.id == id).context("no such display"))
+            .and_then(|d| capture::watch(&d));
+        match watched {
+            Ok(w) => {
+                watches.insert(id, w);
+                true
+            }
+            Err(e) => {
+                tracing::debug!("display {id}: can't watch it for changes: {e:#}");
+                false
+            }
+        }
+    }
     fn picture(&self, id: u32, max: [u32; 2]) -> Option<crate::lossless::RawFrame> {
         capture::screenshot(id, max)
             .inspect_err(|e| tracing::debug!("preview of display {id}: {e:#}"))
@@ -500,6 +541,8 @@ impl VideoSource for Video {
     /// (closing the lid, even for a second) and never resumes it, which froze the picture
     /// while input still worked.
     fn heal(&self) {
+        // Watches no agent has wanted for a while end.
+        self.watches.lock().unwrap().retain(|id, _| crate::damage::wanted(*id));
         let mut streams = self.streams.lock().unwrap();
         let mut displays = None;
         for index in 0..streams.len() {
