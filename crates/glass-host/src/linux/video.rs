@@ -1,5 +1,6 @@
-//! Captures the monitors shared through the portal (one PipeWire stream each), encodes
-//! each on its own thread, and maps them to stream numbers according to the layout.
+//! Captures the monitors shared through the portal (one PipeWire stream each), or on X11
+//! each monitor's part of the root window (`x11_capture`), encodes each on its own thread,
+//! and maps them to stream numbers according to the layout.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -126,6 +127,38 @@ impl Drop for FrameSender {
     }
 }
 
+/// Where a capturer that isn't PipeWire (X11) delivers one monitor's frames.
+pub(super) struct CaptureSink {
+    tx: FrameSender,
+    monitor: Arc<Monitor>,
+    id: usize,
+}
+
+impl CaptureSink {
+    /// A buffer to copy the next frame into (see `Mailbox::buffer`).
+    pub(super) fn buffer(&self) -> Vec<u8> {
+        self.tx.0.buffer()
+    }
+
+    /// Hands a frame to the encoder, replacing one it hasn't started on.
+    pub(super) fn put(&self, frame: Frame, captured_us: u64) {
+        self.tx.0.put(frame, captured_us);
+    }
+
+    /// The monitor changed size or place. The encoder picks the new size up from the
+    /// next frame; this moves what input mapping and the display list read.
+    pub(super) fn moved(&self, rect: Rect) {
+        {
+            let mut info = self.monitor.info.lock().unwrap();
+            (info.x, info.y) = (rect.x, rect.y);
+            (info.points_width, info.points_height) = (rect.w, rect.h);
+        }
+        if let Some(r) = RECTS.lock().unwrap().get_mut(self.id) {
+            *r = rect;
+        }
+    }
+}
+
 /// Monitor rects for input mapping, by display id.
 static RECTS: Mutex<Vec<Rect>> = Mutex::new(Vec::new());
 
@@ -135,7 +168,8 @@ pub fn rect_of(id: u32) -> Option<Rect> {
 
 /// Bounding box of every monitor (what an absolute pointer device spans).
 pub fn layout_rect() -> Rect {
-    let monitors = hyprland_monitors();
+    // X11 has no compositor to ask: the capturer keeps RECTS current.
+    let monitors = if super::is_x11() { Vec::new() } else { hyprland_monitors() };
     let rects = if monitors.is_empty() {
         RECTS.lock().unwrap().clone()
     } else {
@@ -299,6 +333,21 @@ impl Video {
         if let Some(m) = guard.as_ref() {
             return Ok(m.clone());
         }
+        if super::is_x11() {
+            // No portal and no share dialog: any X client may read the screen.
+            let mut rects = Vec::new();
+            let mut monitors = Vec::new();
+            super::x11_capture::start(self.config.fps as u32, |i, rect| {
+                let (monitor, tx) = self.add_monitor(i, rect)?;
+                rects.push(rect);
+                monitors.push(monitor.clone());
+                Ok(CaptureSink { tx, monitor, id: i })
+            })?;
+            permissions::set_screen_cast_granted(true);
+            *RECTS.lock().unwrap() = rects;
+            *guard = Some(monitors.clone());
+            return Ok(monitors);
+        }
         let cast = portal::start()?;
         permissions::set_screen_cast_granted(true);
         info!("screen cast approved: {} monitor(s)", cast.streams.len());
@@ -322,37 +371,9 @@ impl Video {
                         .map(|r| (r.x, r.y))
                 })
                 .unwrap_or((0.0, 0.0));
-            rects.push(Rect { x, y, w, h });
-            let monitor = Arc::new(Monitor {
-                info: Mutex::new(DisplayInfo {
-                    id: i as u32,
-                    width: w as usize,
-                    height: h as usize,
-                    x,
-                    y,
-                    points_width: w,
-                    points_height: h,
-                    main: i == 0,
-                    builtin: false,
-                }),
-                slot: AtomicI32::new(-1),
-                latest: Mutex::new(None),
-                thumb: Mutex::new(None),
-                generation: std::sync::atomic::AtomicU64::new(0),
-                keyframe: AtomicBool::new(true),
-                bitrate: std::sync::atomic::AtomicU32::new(self.config.bitrate as u32),
-            });
-            let rx = Arc::new(Mailbox::default());
-            let tx = FrameSender(rx.clone());
-            let (fps, bitrate, scale) = (
-                self.config.fps as u32,
-                self.config.bitrate as u32,
-                self.config.scale,
-            );
-            let (frames, m) = (self.frames.clone(), monitor.clone());
-            std::thread::Builder::new()
-                .name(format!("glass-encode-{i}"))
-                .spawn(move || encode_loop(m, rx, frames, fps, bitrate, scale))?;
+            let rect = Rect { x, y, w, h };
+            rects.push(rect);
+            let (monitor, tx) = self.add_monitor(i, rect)?;
             captures.push((s.node_id, monitor.clone(), tx));
             monitors.push(monitor);
         }
@@ -370,6 +391,42 @@ impl Video {
 
         *guard = Some(monitors.clone());
         Ok(monitors)
+    }
+
+    /// A monitor and its encoder thread; frames go in through the returned sender.
+    fn add_monitor(&self, i: usize, rect: Rect) -> Result<(Arc<Monitor>, FrameSender)> {
+        let Rect { x, y, w, h } = rect;
+        let monitor = Arc::new(Monitor {
+            info: Mutex::new(DisplayInfo {
+                id: i as u32,
+                width: w as usize,
+                height: h as usize,
+                x,
+                y,
+                points_width: w,
+                points_height: h,
+                main: i == 0,
+                builtin: false,
+            }),
+            slot: AtomicI32::new(-1),
+            latest: Mutex::new(None),
+            thumb: Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            keyframe: AtomicBool::new(true),
+            bitrate: std::sync::atomic::AtomicU32::new(self.config.bitrate as u32),
+        });
+        let rx = Arc::new(Mailbox::default());
+        let tx = FrameSender(rx.clone());
+        let (fps, bitrate, scale) = (
+            self.config.fps as u32,
+            self.config.bitrate as u32,
+            self.config.scale,
+        );
+        let (frames, m) = (self.frames.clone(), monitor.clone());
+        std::thread::Builder::new()
+            .name(format!("glass-encode-{i}"))
+            .spawn(move || encode_loop(m, rx, frames, fps, bitrate, scale))?;
+        Ok((monitor, tx))
     }
 }
 

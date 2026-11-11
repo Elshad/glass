@@ -26,7 +26,7 @@ case "$(uname -s)-$(uname -m)" in
     TARBALL="glass-latest-darwin-universal.tar.gz"
     ;;
   Linux-x86_64)
-    [ -n "${WAYLAND_DISPLAY:-}" ] || info "Glass on Linux needs a Wayland session (Hyprland, GNOME, KDE…); run setup from inside it."
+    [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] || info "Glass on Linux needs a desktop session (Wayland or X11); run setup from inside it."
     TARBALL="glass-latest-linux-x86_64.tar.gz"
     ;;
   Linux-*) fail "Glass on Linux currently supports x86_64; this machine is $(uname -m)." ;;

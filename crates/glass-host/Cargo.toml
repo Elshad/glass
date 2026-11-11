@@ -59,6 +59,8 @@ objc2-video-toolbox = "0.3.2"
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast", "file_chooser"] }
 evdev = "0.13"
 pipewire = "0.10"
+# X11 sessions (XFCE, i3, xrdp): MIT-SHM capture, XFIXES cursor, DAMAGE, XTEST input.
+x11rb = { version = "0.13", features = ["shm", "randr", "xfixes", "damage", "xtest"] }
 # Hardware H.264 through VA-API (Intel, AMD), with OpenH264 as the fallback.
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }

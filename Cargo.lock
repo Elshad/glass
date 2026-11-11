@@ -2590,6 +2590,7 @@ dependencies = [
  "ureq",
  "webrtc",
  "wtransport",
+ "x11rb",
 ]
 
 [[package]]

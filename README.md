@@ -191,6 +191,7 @@ NSPasteboard, files ◀─▶ control + file streams ◀────────
 - **Decode** in a Web Worker straight to an OffscreenCanvas; the main thread only handles input.
 - **Integrity:** every frame carries a checksum. Corrupted frames are never decoded; the client asks for a keyframe and recovers in a fraction of a second.
 - **Linux:** xdg-desktop-portal + PipeWire capture, OpenH264, uinput, wl-clipboard, systemd user service.
+- **Linux on X11** (XFCE, i3, xrdp sessions; this fork): MIT-SHM capture of the root window driven by DAMAGE, the pointer drawn in from XFIXES, XTEST input, xclip. Build from source; chosen at runtime when `DISPLAY` is set and `WAYLAND_DISPLAY` isn't.
 
 | Path | What |
 |---|---|
