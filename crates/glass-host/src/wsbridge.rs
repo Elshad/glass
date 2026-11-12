@@ -71,6 +71,16 @@ pub async fn handle(
         .filter(|_| websocket)
         .map(|key| derive_accept_key(key.as_bytes()))
     else {
+        // Something on the way (a proxy, a tunnel) can strip the upgrade: say what came.
+        let names: Vec<&str> = headers.keys().map(|k| k.as_str()).collect();
+        info!(
+            "websocket bridge: {} {:?} without a WebSocket upgrade (upgrade: {:?}, connection: {:?}; headers: {})",
+            req.method(),
+            req.version(),
+            headers.get(header::UPGRADE),
+            headers.get(header::CONNECTION),
+            names.join(", ")
+        );
         return (StatusCode::BAD_REQUEST, "expected a WebSocket").into_response();
     };
     let viewer = viewer_ip(peer.ip().to_canonical(), headers);
