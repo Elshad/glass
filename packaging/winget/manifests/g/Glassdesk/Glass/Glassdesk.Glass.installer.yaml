@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+# A template: scripts/winget.mjs fills in the version, URLs and checksums for a release.
+
+PackageIdentifier: Glassdesk.Glass
+PackageVersion: 0.10.0
+MinimumOSVersion: 10.0.19041.0
+InstallerType: msi
+Scope: machine
+InstallModes:
+- interactive
+- silent
+- silentWithProgress
+UpgradeBehavior: install
+Commands:
+- glass
+ReleaseDate: 2026-01-01
+AppsAndFeaturesEntries:
+- UpgradeCode: '{83EBD5C2-954D-4113-A3C1-4797653E5386}'
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/Ntarasiuk/glass/releases/download/v0.10.0/glass-0.10.0-windows-x86_64.msi
+  InstallerSha256: '0000000000000000000000000000000000000000000000000000000000000000'
+- Architecture: arm64
+  InstallerUrl: https://github.com/Ntarasiuk/glass/releases/download/v0.10.0/glass-0.10.0-windows-arm64.msi
+  InstallerSha256: '0000000000000000000000000000000000000000000000000000000000000000'
+ManifestType: installer
+ManifestVersion: 1.10.0

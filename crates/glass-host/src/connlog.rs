@@ -96,7 +96,14 @@ pub fn describe(e: &Entry) -> String {
     format!("{when}  {dur:>9}  {}  {how}  {from}", e.device)
 }
 
+/// Local date and time, without pulling in a time zone database: Windows itself does it.
+#[cfg(windows)]
+fn format_time(unix: u64) -> String {
+    crate::platform::system::local_time(unix).unwrap_or_else(|| unix.to_string())
+}
+
 /// Local date and time, without pulling in a time zone database: `date` does it.
+#[cfg(not(windows))]
 fn format_time(unix: u64) -> String {
     let flag = if cfg!(target_os = "macos") { "-r" } else { "-d" };
     let arg = if cfg!(target_os = "macos") {

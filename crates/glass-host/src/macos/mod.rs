@@ -7,6 +7,7 @@ pub mod ax;
 pub mod capture;
 pub mod clipboard;
 pub mod clock;
+pub mod cursor;
 pub mod encode;
 pub mod front;
 pub mod input;
@@ -47,4 +48,10 @@ pub fn wake_displays() {
     let _ = std::process::Command::new("caffeinate")
         .args(["-u", "-t", "1"])
         .status();
+}
+
+/// Whether process `pid` is still running.
+pub fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }

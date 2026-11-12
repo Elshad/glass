@@ -39,6 +39,120 @@ use webrtc::peer_connection::{
 const CHUNK: usize = 16 * 1024;
 /// Datagrams are dropped rather than queued past this, so video never lags behind.
 const DATAGRAM_BACKLOG: usize = 256 * 1024;
+/// Video waiting in the WebRTC send buffer is held to about this much time at the current
+/// bitrate. A byte cap alone let a slow relayed link (2–3 Mbps through TURN) queue most of
+/// a second of frames, so latency swung between fine and awful as the queue filled and
+/// drained.
+const VIDEO_QUEUE_MS: u64 = 120;
+/// The least queue allowed, so a frame or two always fits at low bitrates.
+const MIN_VIDEO_BACKLOG: usize = 32 * 1024;
+
+/// What the video data channel actually delivers, turned into a bitrate cap. Video over
+/// the data channel (browsers without RTP H.264, like a Tesla's) has no congestion control
+/// of its own, and the shared rate controller won't go below a fraction of its maximum:
+/// on a relay that carries less than that, every frame queued, then dropped.
+#[derive(Default)]
+struct LinkMeter {
+    /// Bytes handed to the channel since the last tick.
+    sent: u64,
+    last_outstanding: usize,
+    cap: Option<u32>,
+    /// Ticks in a row without backing up.
+    calm: u32,
+}
+
+/// The send buffer's floor: bytes still in flight to the browser (not yet acknowledged),
+/// which never drain however little is queued. Through a relay with a 160 ms round trip
+/// that's tens of KB, more than the whole video queue: counted as queued, it kept every
+/// frame (and the keyframe to recover with) out. The least seen in the last second.
+#[derive(Default)]
+struct InFlight {
+    window_min: Option<usize>,
+    floor: usize,
+}
+
+impl InFlight {
+    fn sample(&mut self, outstanding: usize) {
+        self.window_min = Some(self.window_min.map_or(outstanding, |m| m.min(outstanding)));
+    }
+
+    /// Bytes actually waiting behind what's in flight. Past the hard cap everything counts,
+    /// so a floor that's wrong can never let the buffer grow without limit.
+    fn queued(&self, outstanding: usize) -> usize {
+        if outstanding > DATAGRAM_BACKLOG {
+            return outstanding;
+        }
+        outstanding.saturating_sub(self.floor)
+    }
+
+    /// Once a second. `bps`: the bitrate now. The floor is held to what a long round trip
+    /// (`MAX_RTT_MS`) could have in flight: on a link that never drains, the least seen is
+    /// partly queue, and taking all of it as "in flight" would ratchet the queue up.
+    fn tick(&mut self, bps: u32) {
+        if let Some(min) = self.window_min.take() {
+            let most = (bps as u64 / 8 * MAX_RTT_MS / 1000).min(DATAGRAM_BACKLOG as u64 / 2) as usize;
+            self.floor = min.min(most);
+        }
+    }
+}
+
+/// The longest round trip the in-flight floor allows for.
+const MAX_RTT_MS: u64 = 400;
+
+/// The least a link is capped to: still a picture, if a slow one.
+const MIN_LINK_CAP: u32 = 250_000;
+/// Share of the measured link for video (audio and control ride along).
+const LINK_SHARE: f64 = 0.85;
+/// Above this the cap is pointless: lifted.
+const MAX_LINK_CAP: u32 = 100_000_000;
+
+impl LinkMeter {
+    fn sent(&mut self, bytes: usize) {
+        self.sent += bytes as u64;
+    }
+
+    /// Once a second or so. Returns the new cap when it changes (`Some(None)`: lifted).
+    /// `outstanding`: the whole send buffer; `queued`: the part behind what's in flight.
+    fn tick(&mut self, outstanding: usize, queued: usize, dropped: bool, budget: usize, elapsed: Duration) -> Option<Option<u32>> {
+        let secs = elapsed.as_secs_f64().max(0.001);
+        // What left the queue: what went in, less how much it grew.
+        let drained = self.sent as i64 - (outstanding as i64 - self.last_outstanding as i64);
+        let delivered_bps = drained.max(0) as f64 * 8.0 / secs;
+        self.sent = 0;
+        self.last_outstanding = outstanding;
+        let before = self.cap;
+        if dropped || queued > budget / 2 {
+            // Backed up, so what drained is about what the link carries, at best: video is
+            // unreliable, so messages the relay throws away leave the buffer too and look
+            // delivered. So while frames keep being dropped, back off further each second
+            // rather than trust the measurement.
+            self.calm = 0;
+            let measured = (delivered_bps * LINK_SHARE) as u32;
+            let next = match self.cap {
+                Some(cap) if dropped => measured.min((cap as f64 * LINK_SHARE) as u32),
+                Some(cap) => measured.min(cap),
+                None => measured,
+            };
+            self.cap = Some(next.max(MIN_LINK_CAP));
+        } else if let Some(cap) = self.cap {
+            self.calm += 1;
+            // Calm for a few seconds: try a bit more each second.
+            if self.calm >= 3 {
+                let next = (cap as f64 * 1.15) as u32;
+                self.cap = (next < MAX_LINK_CAP).then_some(next);
+            }
+        }
+        (self.cap != before).then_some(self.cap)
+    }
+}
+
+/// How many bytes of video may be queued at `bps` (0: unknown, the byte cap).
+fn video_backlog(bps: u32) -> usize {
+    if bps == 0 {
+        return DATAGRAM_BACKLOG;
+    }
+    (bps as u64 / 8 * VIDEO_QUEUE_MS / 1000).clamp(MIN_VIDEO_BACKLOG as u64, DATAGRAM_BACKLOG as u64) as usize
+}
 const STUN: &str = "stun:stun.cloudflare.com:3478";
 
 // ---- Key and identity ----
@@ -154,11 +268,13 @@ pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 // ---- On/off ----
 
 /// Remote access is opt-in: `glass link --anywhere` turns it on, `glass remote off` off.
+/// A policy can decide instead.
 pub fn enabled() -> bool {
-    dir().join("enabled").exists()
+    crate::policy::load().flag("remote").unwrap_or_else(|| dir().join("enabled").exists())
 }
 
 pub fn set_enabled(on: bool) -> Result<()> {
+    crate::policy::load().check("remote", if on { "on" } else { "off" })?;
     let flag = dir().join("enabled");
     if on {
         std::fs::create_dir_all(dir())?;
@@ -582,6 +698,15 @@ impl PeerConnectionEventHandler for Handler {
     }
 }
 
+/// Where peer connections listen: any port, except that a test host can be pinned to one
+/// (`GLASS_TEST_RTC_PORT`, IPv4) so bench/ can shape exactly that traffic.
+fn udp_addrs() -> Vec<String> {
+    match std::env::var("GLASS_TEST_RTC_PORT").ok().filter(|_| crate::testmode::enabled()) {
+        Some(port) => vec![format!("0.0.0.0:{port}")],
+        None => vec!["0.0.0.0:0".to_string(), "[::]:0".to_string()],
+    }
+}
+
 /// Answers a browser's offer; returns the answer SDP and its signature. The bridge runs
 /// until the peer goes away.
 async fn answer(
@@ -640,7 +765,7 @@ async fn answer(
         .with_interceptor_registry(registry)
         .with_handler(handler)
         .with_runtime(runtime)
-        .with_udp_addrs(vec!["0.0.0.0:0".to_string(), "[::]:0".to_string()])
+        .with_udp_addrs(udp_addrs())
         .build()
         .await?;
     let pc: Arc<dyn PeerConnection> = Arc::new(pc);
@@ -723,6 +848,7 @@ async fn bridge(
     let endpoint = wtransport::Endpoint::client(config)?;
     let (bridge_id, viewer, _registration) = register_bridge();
     let rtp_video = video.is_some();
+    let watching = viewer.watching.clone();
     let url = format!(
         "https://{}:{wt_port}/rtc?peer={peer}&b={bridge_id}{}&k={}",
         crate::listen::host(dial),
@@ -746,11 +872,31 @@ async fn bridge(
     }
 
     let mut datagram_channel: Option<Arc<dyn DataChannel>> = None;
+    // Frame acknowledgements from the browser, on their way to the host: the bridge reads
+    // them too, so its own flow control knows what's on screen. Once they come, the host
+    // sets this viewer's bitrate from them (end to end, through this bridge), and the link
+    // meter steps aside.
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<(u8, u32)>();
+    let mut acking = false;
     let mut bridge_drops = 0u64;
+    // Video over the data channel: measure the link and cap the bitrate to it (RTP video
+    // has its own congestion control).
+    let mut meter = LinkMeter::default();
+    let mut meter_drops = 0u64;
+    let mut meter_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut inflight = InFlight::default();
+    let mut last_tick = std::time::Instant::now();
     let mut gate = FrameGate::default();
     let mut last_keyframe_ask = std::time::Instant::now();
     let mut last_congestion_report = std::time::Instant::now();
     let mut last_drop_report = std::time::Instant::now();
+    // Flow control (crate::flow): while frames sent haven't left the data channel's buffer
+    // (it counts them until the browser acknowledges them), capture is held, so frames
+    // aren't made only to be dropped here. The gate stays as a safety net.
+    let mut link = crate::flow::Link::default();
+    let mut flow = crate::flow::Viewer::new();
+    let mut flow_poll = tokio::time::interval(crate::flow::POLL);
+    flow_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             channel = channels.recv() => {
@@ -760,10 +906,16 @@ async fn bridge(
                     "d" => {
                         datagram_channel = Some(channel.clone());
                         let conn = conn.clone();
+                        let ack_tx = ack_tx.clone();
                         tokio::spawn(async move {
                             while let Some(event) = channel.poll().await {
                                 match event {
-                                    DataChannelEvent::OnMessage(m) => { let _ = conn.send_datagram(&m.data[..]); }
+                                    DataChannelEvent::OnMessage(m) => {
+                                        if let Some(ack) = glass_proto::read_frame_ack(&m.data[..]) {
+                                            let _ = ack_tx.send(ack);
+                                        }
+                                        let _ = conn.send_datagram(&m.data[..]);
+                                    }
                                     DataChannelEvent::OnClose => break,
                                     _ => {}
                                 }
@@ -787,13 +939,31 @@ async fn bridge(
                 if let Some(dc) = &datagram_channel {
                     let outstanding = dc.outstanding_bytes().await.unwrap_or(0);
                     let payload = datagram.payload();
-                    match gate.admit(&payload, outstanding) {
+                    inflight.sample(outstanding);
+                    let queued = inflight.queued(outstanding);
+                    let now = std::time::Instant::now();
+                    link.drained(outstanding, now);
+                    match gate.admit(&payload, queued, video_backlog(crate::server::applied_bitrate())) {
                         Admit::Send => {
-                            let _ = dc.try_send(BytesMut::from(&payload[..])).await;
+                            if dc.try_send(BytesMut::from(&payload[..])).await.is_ok() {
+                                meter.sent(payload.len());
+                                match glass_proto::VideoHeader::read(&payload) {
+                                    Some(h) => link.sent(h.stream, h.frame_id, payload.len(), now),
+                                    None => link.other(payload.len()),
+                                }
+                            }
                         }
-                        Admit::Drop => bridge_drops += 1,
+                        Admit::Drop => {
+                            bridge_drops += 1;
+                            meter_drops += 1;
+                        }
                     }
-                    // Tell the bitrate controller: the browser can't see these drops.
+                    flow.update(&mut link, now);
+                    // Tell the bitrate controller: the browser can't see these drops. (With
+                    // acknowledgements, the host sees them as frames that never arrive.)
+                    if acking {
+                        gate.dropped_frames = 0;
+                    }
                     if gate.dropped_frames > 0 && last_congestion_report.elapsed() >= Duration::from_secs(1) {
                         crate::server::bridge_congestion(std::mem::take(&mut gate.dropped_frames));
                         last_congestion_report = std::time::Instant::now();
@@ -803,7 +973,7 @@ async fn bridge(
                     // Ask once the send buffer has drained, so the keyframe and the frames
                     // after it fit; asking sooner just loops on keyframes alone.
                     for stream in gate.waiting_for_keyframe() {
-                        if outstanding < DATAGRAM_BACKLOG / 4
+                        if queued < video_backlog(crate::server::applied_bitrate()) / 4
                             && last_keyframe_ask.elapsed() >= Duration::from_millis(500)
                         {
                             last_keyframe_ask = std::time::Instant::now();
@@ -813,7 +983,11 @@ async fn bridge(
                 }
                 // Tells apart loss here (the WebRTC send buffer is full) from loss on the way.
                 if bridge_drops > 0 && last_drop_report.elapsed() >= Duration::from_secs(5) {
-                    info!("remote peer ({peer}): bridge dropped {bridge_drops} packets (link backed up)");
+                    info!(
+                        "remote peer ({peer}): bridge dropped {bridge_drops} packets (link backed up; {} KB in flight, link cap {})",
+                        inflight.floor / 1024,
+                        meter.cap.map_or("none".to_string(), |c| format!("{:.1} Mbps", c as f64 / 1e6)),
+                    );
                     bridge_drops = 0;
                     last_drop_report = std::time::Instant::now();
                 }
@@ -829,6 +1003,44 @@ async fn bridge(
                     }
                     pipe_stream_to_channel(recv, channel).await;
                 });
+            }
+            Some((stream, id)) = ack_rx.recv() => {
+                if !acking {
+                    acking = true;
+                    crate::server::set_remote_cap(bridge_id, None);
+                    debug!("remote peer ({peer}): frames acknowledged; the host paces video by them");
+                }
+                let now = std::time::Instant::now();
+                link.acked(stream, id, now);
+                flow.update(&mut link, now);
+            }
+            _ = flow_poll.tick(), if link.busy() => {
+                if let Some(dc) = &datagram_channel {
+                    let now = std::time::Instant::now();
+                    link.drained(dc.outstanding_bytes().await.unwrap_or(0), now);
+                    // Paused: what's in flight says nothing about the link.
+                    if !*watching.borrow() {
+                        link.forget();
+                    }
+                    flow.update(&mut link, now);
+                }
+            }
+            _ = meter_tick.tick(), if !rtp_video && !acking => {
+                if let Some(dc) = &datagram_channel {
+                    let outstanding = dc.outstanding_bytes().await.unwrap_or(0);
+                    let budget = video_backlog(crate::server::applied_bitrate());
+                    let queued = inflight.queued(outstanding);
+                    inflight.tick(crate::server::applied_bitrate());
+                    if let Some(cap) = meter.tick(outstanding, queued, meter_drops > 0, budget, last_tick.elapsed()) {
+                        match cap {
+                            Some(bps) => debug!("remote peer ({peer}): link carries ~{:.1} Mbps of video", bps as f64 / 1e6),
+                            None => debug!("remote peer ({peer}): link cap lifted"),
+                        }
+                        crate::server::set_remote_cap(bridge_id, cap);
+                    }
+                }
+                meter_drops = 0;
+                last_tick = std::time::Instant::now();
             }
             changed = state.changed() => {
                 changed?;
@@ -875,18 +1087,24 @@ impl FrameGate {
             .map(|(i, _)| i as u8)
     }
 
-    fn admit(&mut self, datagram: &[u8], outstanding: usize) -> Admit {
+    /// `budget`: how much video may be queued now (see [`video_backlog`]).
+    fn admit(&mut self, datagram: &[u8], outstanding: usize, budget: usize) -> Admit {
         let Some(h) = (datagram.first() == Some(&glass_proto::KIND_VIDEO))
             .then(|| glass_proto::VideoHeader::read(datagram))
             .flatten()
         else {
-            // Audio and pings: small; drop only if things are badly backed up.
+            // Audio (Opus where the browser decodes it: ~100 kbps, not 1.5 Mbps of PCM) and
+            // pings: small; drop only if things are badly backed up.
             return if outstanding < DATAGRAM_BACKLOG * 2 {
                 Admit::Send
             } else {
                 Admit::Drop
             };
         };
+        // A lost fragment sent again: it isn't a new frame, and it's what ends a stall.
+        if h.flags & glass_proto::FLAG_RETRANSMIT != 0 {
+            return if outstanding < DATAGRAM_BACKLOG * 2 { Admit::Send } else { Admit::Drop };
+        }
         let s = (h.stream as usize).min(glass_proto::MAX_STREAMS - 1);
         if let Some((id, send)) = self.current[s]
             && id == h.frame_id
@@ -898,10 +1116,12 @@ impl FrameGate {
         let send = if keyframe {
             // Keyframes can be bigger than the whole budget; send once the queue has
             // mostly drained, or the picture would never recover.
-            outstanding < DATAGRAM_BACKLOG / 2
+            outstanding < budget / 2
         } else {
+            // A frame bigger than the budget (a game's scene change) still goes when the
+            // queue is nearly empty, or it would be dropped every time.
             !self.broken[s]
-                && outstanding + h.frag_count as usize * FRAGMENT_BYTES <= DATAGRAM_BACKLOG
+                && (outstanding + h.frag_count as usize * FRAGMENT_BYTES <= budget || outstanding < budget / 4)
         };
         self.broken[s] = if keyframe {
             !send
@@ -995,31 +1215,115 @@ mod tests {
     }
 
     #[test]
+    fn bytes_in_flight_dont_count_as_queued() {
+        let mut f = InFlight::default();
+        // Through a relay, ~26 KB is always in flight: the least seen in a second.
+        for o in [60_000, 26_000, 41_000] {
+            f.sample(o);
+        }
+        assert_eq!(f.queued(41_000), 41_000, "no floor until a second has been seen");
+        f.tick(1_300_000);
+        assert_eq!(f.queued(41_000), 15_000);
+        assert_eq!(f.queued(20_000), 0);
+        // A second with no samples keeps the floor.
+        f.tick(1_300_000);
+        assert_eq!(f.queued(36_000), 10_000);
+        // A link that never drains: the least seen (200 KB) is mostly queue. The floor
+        // stops at what 400 ms could have in flight at 1.3 Mbps (65 KB)...
+        f.sample(200_000);
+        f.tick(1_300_000);
+        assert_eq!(f.queued(200_000), 135_000);
+        // ...and past the hard cap, everything counts.
+        assert_eq!(f.queued(DATAGRAM_BACKLOG + 1), DATAGRAM_BACKLOG + 1);
+        // So a keyframe gets out once what's queued, not what's in flight, has drained.
+        let mut g = FrameGate::default();
+        let budget = video_backlog(1_300_000);
+        assert_eq!(g.admit(&video(1, 0, 40, true), f.queued(30_000), budget), Admit::Send);
+    }
+
+    #[test]
+    fn the_link_meter_caps_to_what_the_link_delivers() {
+        let sec = Duration::from_secs(1);
+        let budget = video_backlog(2_400_000);
+        let mut m = LinkMeter::default();
+        // Keeping up: no cap.
+        m.sent(100_000);
+        assert_eq!(m.tick(0, 0, false, budget, sec), None);
+        // Backed up: 300 KB handed over, the queue grew by 150 KB, so ~150 KB/s (1.2 Mbps)
+        // got through; video gets 85% of it.
+        m.sent(300_000);
+        assert_eq!(m.tick(150_000, 150_000, true, budget, sec), Some(Some(1_020_000)));
+        // Still dropping though it seems to drain as fast: backs off 15% more anyway
+        // (dropped messages look delivered).
+        m.sent(150_000);
+        assert_eq!(m.tick(150_000, 150_000, true, budget, sec), Some(Some(867_000)));
+        // Draining slowly: the cap follows the link down, not below the floor.
+        m.sent(0);
+        assert_eq!(m.tick(140_000, 140_000, true, budget, sec), Some(Some(MIN_LINK_CAP)));
+        // Calm: held for two seconds, then raised 15% a second.
+        m.sent(10_000);
+        assert_eq!(m.tick(0, 0, false, budget, sec), None);
+        assert_eq!(m.tick(0, 0, false, budget, sec), None);
+        assert_eq!(m.tick(0, 0, false, budget, sec), Some(Some(287_500)));
+        assert_eq!(m.tick(0, 0, false, budget, sec), Some(Some(330_625)));
+    }
+
+    #[test]
+    fn the_video_queue_is_held_to_a_short_time() {
+        // 2.4 Mbps through a relay: ~36 KB, not the 256 KB cap (most of a second there).
+        assert_eq!(video_backlog(2_400_000), 36_000);
+        assert_eq!(video_backlog(500_000), MIN_VIDEO_BACKLOG);
+        assert_eq!(video_backlog(100_000_000), DATAGRAM_BACKLOG);
+        assert_eq!(video_backlog(0), DATAGRAM_BACKLOG);
+
+        let budget = video_backlog(2_400_000);
+        let mut g = FrameGate::default();
+        // 20 KB queued: a 20-fragment (~25 KB) frame would pass 36 KB: dropped.
+        assert_eq!(g.admit(&video(1, 0, 20, false), 20_000, budget), Admit::Drop);
+        // A huge frame on a nearly empty queue still goes (after a keyframe heals frame 1).
+        assert_eq!(g.admit(&video(2, 0, 80, true), 0, budget), Admit::Send);
+        assert_eq!(g.admit(&video(3, 0, 60, false), 5_000, budget), Admit::Send);
+    }
+
+    #[test]
     fn drops_whole_frames_and_waits_for_a_keyframe() {
         let mut g = FrameGate::default();
         // Room: the whole frame goes, every fragment, even as the buffer fills.
-        assert_eq!(g.admit(&video(1, 0, 3, false), 0), Admit::Send);
+        assert_eq!(g.admit(&video(1, 0, 3, false), 0, DATAGRAM_BACKLOG), Admit::Send);
         assert_eq!(
-            g.admit(&video(1, 2, 3, false), DATAGRAM_BACKLOG),
+            g.admit(&video(1, 2, 3, false), DATAGRAM_BACKLOG, DATAGRAM_BACKLOG),
             Admit::Send
         );
         // No room for frame 2: all of it is dropped...
         assert_eq!(
-            g.admit(&video(2, 0, 3, false), DATAGRAM_BACKLOG),
+            g.admit(&video(2, 0, 3, false), DATAGRAM_BACKLOG, DATAGRAM_BACKLOG),
             Admit::Drop
         );
-        assert_eq!(g.admit(&video(2, 1, 3, false), 0), Admit::Drop);
+        assert_eq!(g.admit(&video(2, 1, 3, false), 0, DATAGRAM_BACKLOG), Admit::Drop);
         // ...and so is frame 3, though there's room: it can't be decoded without 2.
-        assert_eq!(g.admit(&video(3, 0, 3, false), 0), Admit::Drop);
+        assert_eq!(g.admit(&video(3, 0, 3, false), 0, DATAGRAM_BACKLOG), Admit::Drop);
         assert_eq!(g.waiting_for_keyframe().collect::<Vec<_>>(), [0]);
         // A keyframe goes once the queue has drained, even if it's huge, and heals it.
         assert_eq!(
-            g.admit(&video(4, 0, 400, true), DATAGRAM_BACKLOG),
+            g.admit(&video(4, 0, 400, true), DATAGRAM_BACKLOG, DATAGRAM_BACKLOG),
             Admit::Drop
         );
-        assert_eq!(g.admit(&video(5, 0, 400, true), 0), Admit::Send);
-        assert_eq!(g.admit(&video(6, 0, 3, false), 0), Admit::Send);
+        assert_eq!(g.admit(&video(5, 0, 400, true), 0, DATAGRAM_BACKLOG), Admit::Send);
+        assert_eq!(g.admit(&video(6, 0, 3, false), 0, DATAGRAM_BACKLOG), Admit::Send);
         assert_eq!(g.waiting_for_keyframe().count(), 0);
+    }
+
+    #[test]
+    fn audio_keeps_flowing_while_video_backs_off() {
+        let mut g = FrameGate::default();
+        let opus = glass_proto::opus_packet(0, 0, 2, &[0xFC; 120]);
+        let pcm = glass_proto::audio_packet(0, 0, 2, &[0; 480]);
+        // The queue is past what video may use: its frames go, audio of either kind doesn't.
+        assert_eq!(g.admit(&video(1, 0, 3, false), DATAGRAM_BACKLOG, DATAGRAM_BACKLOG), Admit::Drop);
+        assert_eq!(g.admit(&opus, DATAGRAM_BACKLOG, DATAGRAM_BACKLOG), Admit::Send);
+        assert_eq!(g.admit(&pcm, DATAGRAM_BACKLOG, DATAGRAM_BACKLOG), Admit::Send);
+        // Only a badly backed-up link drops it.
+        assert_eq!(g.admit(&opus, DATAGRAM_BACKLOG * 2, DATAGRAM_BACKLOG), Admit::Drop);
     }
 
     #[test]

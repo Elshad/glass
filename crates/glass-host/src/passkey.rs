@@ -172,9 +172,8 @@ async fn answer(recv: &mut RecvStream) -> Result<Option<Response>> {
 }
 
 fn new_challenge() -> Result<String> {
-    use std::io::Read;
     let mut bytes = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    crate::control::getrandom(&mut bytes)?;
     Ok(b64url(&bytes))
 }
 

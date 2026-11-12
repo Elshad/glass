@@ -1,6 +1,6 @@
-//! The Glass menu bar icon: lit (with a count) while anyone is viewing this Mac, badged
-//! while a permission is missing, and a menu listing who, with controls to end it. Runs the app's main thread; the host itself
-//! runs on a background tokio runtime.
+//! The Glass menu bar icon: a screen sharing symbol (with a count) while anyone is viewing
+//! this Mac, badged while a permission is missing, and a menu listing who, with controls to
+//! end it. Runs the app's main thread; the host itself runs on a background tokio runtime.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,8 +10,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSColor, NSImage, NSMenu, NSMenuItem,
-    NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
+    NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSString, ns_string};
 
@@ -263,9 +263,14 @@ fn refresh(list: &[Viewer], state: &State) {
         let Some(ui) = ui.as_ref() else { return };
         let viewing = !list.is_empty();
         if let Some(button) = ui.item.button(mtm) {
-            // Badged while a permission is missing, so it's noticed before someone connects.
+            // Badged while a permission is missing, so it's noticed before someone connects;
+            // macOS's screen sharing symbol, with a count, while anyone is viewing. Always a
+            // plain template image: a contentTintColor renders status items black (FB8530353),
+            // which vanishes on a dark menu bar.
             let symbol = if state.missing_permission() {
                 ns_string!("display.trianglebadge.exclamationmark")
+            } else if viewing {
+                ns_string!("rectangle.inset.filled.and.person.filled")
             } else {
                 ns_string!("display")
             };
@@ -277,9 +282,6 @@ fn refresh(list: &[Viewer], state: &State) {
                 image.setTemplate(true);
             }
             button.setImage(image.as_deref());
-            // Lit, with a count, while anyone is viewing.
-            let tint = viewing.then(NSColor::systemBlueColor);
-            button.setContentTintColor(tint.as_deref());
             let title = if viewing {
                 format!(" {}", list.len())
             } else {

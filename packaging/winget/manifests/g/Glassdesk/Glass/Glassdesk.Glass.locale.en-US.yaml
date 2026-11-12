@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+# A template: scripts/winget.mjs fills in the version, URLs and checksums for a release.
+
+PackageIdentifier: Glassdesk.Glass
+PackageVersion: 0.10.0
+PackageLocale: en-US
+Publisher: Glass
+PublisherUrl: https://glassdesk.dev
+PublisherSupportUrl: https://github.com/Ntarasiuk/glass/issues
+PackageName: Glass
+PackageUrl: https://glassdesk.dev
+License: MIT
+LicenseUrl: https://github.com/Ntarasiuk/glass/blob/main/LICENSE
+ShortDescription: Your computer, in any browser. A free, open-source remote desktop.
+Description: |-
+  Glass lets you use this computer from any browser: your phone, a tablet or another computer, over your
+  tailnet or from anywhere. Installed for everyone on the computer, it starts for each user who signs in.
+  Administrators can manage it with Group Policy or Intune (the ADMX template is in the repository).
+Moniker: glass
+Tags:
+- remote-desktop
+- remote-access
+- screen-sharing
+- remote-support
+- tailscale
+ReleaseNotesUrl: https://github.com/Ntarasiuk/glass/releases/tag/v0.10.0
+Documentations:
+- DocumentLabel: Docs
+  DocumentUrl: https://glassdesk.dev/docs
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0
