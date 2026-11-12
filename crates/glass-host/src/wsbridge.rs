@@ -349,11 +349,18 @@ where
                 }
                 flow.update(&mut link, now);
             }
-            _ = meter_tick.tick(), if !acking => {
+            _ = meter_tick.tick() => {
                 let outstanding = window.outstanding() as usize;
                 let budget = video_backlog(crate::server::applied_bitrate());
                 let queued = inflight.queued(outstanding);
+                // Always: what's merely on the way (the tunnel's round trip, the ack
+                // interval) must never count as queued, or every frame looks backed up.
                 inflight.tick(crate::server::applied_bitrate());
+                if acking {
+                    meter_drops = 0;
+                    last_tick = Instant::now();
+                    continue;
+                }
                 if let Some(cap) = meter.tick(outstanding, queued, meter_drops > 0, budget, last_tick.elapsed()) {
                     match cap {
                         Some(bps) => debug!("websocket peer ({peer}): link carries ~{:.1} Mbps of video", bps as f64 / 1e6),

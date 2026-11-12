@@ -16,8 +16,9 @@ const CONNECT_TIMEOUT_MS = 20_000;
 // With a WebSocket to fall back to, a direct path that hasn't formed by now isn't coming.
 const CONNECT_TIMEOUT_WITH_FALLBACK_MS = 8000;
 const WS_OPEN_TIMEOUT_MS = 10_000;
-const WS_ACK_EVERY = 64 * 1024;
-const WS_ACK_MS = 50;
+// Acks often: everything sent and not yet acked counts against the host's video queue.
+const WS_ACK_EVERY = 16 * 1024;
+const WS_ACK_MS = 20;
 // The bridge's message kinds (crates/glass-host/src/wsbridge.rs).
 const WS_DGRAM = 0, WS_OPEN = 1, WS_DATA = 2, WS_END = 3, WS_ACK = 4;
 // This tab went through the WebSocket before: its network has no direct path, so retries
