@@ -1,0 +1,92 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tsfetch demo</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 16px; }
+  label { display: block; margin: 12px 0 4px; font-weight: 600; }
+  input, select, textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 6px 8px; }
+  button { font: inherit; padding: 6px 14px; margin: 12px 8px 0 0; }
+  pre { background: #8881; padding: 12px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  small { color: #888; }
+</style>
+
+<h1>tsfetch demo</h1>
+<p>This tab joins your tailnet as an ephemeral node and sends one request through it.
+For local testing only: a real page gets its key from its own backend.</p>
+
+<label for="key">Auth key <small>(ephemeral, single-use; leave empty to sign in instead)</small></label>
+<input id="key" type="password" autocomplete="off" placeholder="tskey-auth-…">
+
+<label for="allow">Allowed destinations <small>(host:port, one per line)</small></label>
+<textarea id="allow" rows="2">100.80.10.20:3000</textarea>
+
+<button id="connect">Connect</button>
+<button id="disconnect" disabled>Disconnect</button>
+<span id="state">disconnected</span>
+
+<label for="url">Request</label>
+<div style="display:flex; gap:8px">
+  <select id="method" style="width:7em"><option>GET<option>POST<option>PUT<option>DELETE</select>
+  <input id="url" value="http://100.80.10.20:3000/api/status">
+</div>
+<label for="body">Body <small>(JSON, optional)</small></label>
+<textarea id="body" rows="2"></textarea>
+<button id="send" disabled>Send</button>
+
+<pre id="out"></pre>
+
+<script type="module">
+  import { createTailscaleClient } from "../tsfetch.js";
+
+  const $ = (id) => document.getElementById(id);
+  const out = (text) => { $("out").textContent = text; };
+  let tailscale = null;
+
+  $("connect").onclick = async () => {
+    const key = $("key").value.trim();
+    $("key").value = "";
+    try {
+      tailscale = createTailscaleClient({
+        allow: $("allow").value.split("\n").map((s) => s.trim()).filter(Boolean),
+        ...(key ? { authKey: key } : { onLoginURL: (url) => out(`Sign in to continue:\n${url}`) }),
+        hostname: "tsfetch-demo",
+        debug: new URLSearchParams(location.search).has("debug"),
+        onStateChange: (s) => {
+          $("state").textContent = s;
+          $("connect").disabled = s !== "disconnected";
+          $("disconnect").disabled = s === "disconnected";
+          $("send").disabled = s !== "connected";
+        },
+      });
+      window.tailscale = tailscale;
+      out("Connecting…");
+      await tailscale.connect();
+      out(`Connected as ${tailscale.name} (${tailscale.addresses.join(", ")})`);
+    } catch (e) {
+      out(`${e.name}: ${e.message}`);
+    }
+  };
+
+  $("disconnect").onclick = () => tailscale?.disconnect();
+
+  $("send").onclick = async () => {
+    const body = $("body").value.trim();
+    const started = performance.now();
+    try {
+      const res = await tailscale.fetch($("url").value, {
+        method: $("method").value,
+        ...(body ? { body, headers: { "content-type": "application/json" } } : {}),
+        signal: AbortSignal.timeout(20000),
+      });
+      const text = await res.text();
+      const ms = Math.round(performance.now() - started);
+      const headers = [...res.headers].map(([k, v]) => `${k}: ${v}`).join("\n");
+      out(`${res.status} ${res.statusText}  (${ms} ms)\n${headers}\n\n${text.slice(0, 20000)}`);
+    } catch (e) {
+      out(`${e.name}: ${e.message}`);
+    }
+  };
+
+  addEventListener("pagehide", () => tailscale?.disconnect());
+</script>
