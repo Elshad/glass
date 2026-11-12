@@ -1,7 +1,7 @@
 //! Input on X11 through the XTEST extension. Unlike uinput it needs no device access, and
 //! it reaches X servers that have no kernel input devices at all (xrdp, Xvnc, Xvfb).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,9 @@ const EXTENDED: &[(u16, &[u32])] = &[
     (190, &[0xffd1]),         // F20
 ];
 
+/// Modifiers and locks, by evdev code: held, they are pressed once, never repeated.
+const NO_REPEAT: &[u16] = &[29, 42, 54, 56, 58, 69, 70, 97, 100, 125, 126];
+
 /// The keymap is read again after this long: xrdp replaces it when a client connects.
 const KEYMAP_AGE: Duration = Duration::from_secs(5);
 
@@ -64,6 +67,8 @@ pub struct X11Input {
     root: xproto::Window,
     /// Extended keys' X keycodes by evdev code, and when they were looked up.
     extended: Option<(Instant, HashMap<u16, u8>)>,
+    /// Keys pressed and not yet released, by X keycode.
+    held: HashSet<u8>,
 }
 
 impl X11Input {
@@ -72,7 +77,7 @@ impl X11Input {
         conn.extension_information(xtest::X11_EXTENSION_NAME).ok()??;
         conn.xtest_get_version(2, 2).ok()?.reply().ok()?;
         let root = conn.setup().roots[screen].root;
-        Some(Self { conn, root, extended: None })
+        Some(Self { conn, root, extended: None, held: HashSet::new() })
     }
 
     fn fake(&self, kind: u8, detail: u8, x: i16, y: i16) {
@@ -117,12 +122,27 @@ impl X11Input {
     }
 
     /// Presses or releases a key, by evdev code.
+    ///
+    /// A key held on the viewer's side arrives as one press after another (the browser's
+    /// own key repeat). X ignores a press of a key that's already down, and xrdp turns the
+    /// server's auto repeat off (RDP clients repeat keys themselves), so each repeat is
+    /// sent the way X's auto repeat sends it: a release, then a press.
     pub fn key(&mut self, evdev: u16, down: bool) {
         let Some(keycode) = self.keycode(evdev) else {
             return;
         };
-        let kind = if down { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT };
-        self.fake(kind, keycode, 0, 0);
+        if !down {
+            self.held.remove(&keycode);
+            self.fake(xproto::KEY_RELEASE_EVENT, keycode, 0, 0);
+            return;
+        }
+        if !self.held.insert(keycode) {
+            if NO_REPEAT.contains(&evdev) {
+                return;
+            }
+            self.fake(xproto::KEY_RELEASE_EVENT, keycode, 0, 0);
+        }
+        self.fake(xproto::KEY_PRESS_EVENT, keycode, 0, 0);
     }
 
     /// Presses or releases a pointer button (1 left, 2 middle, 3 right).
