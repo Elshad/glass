@@ -12,6 +12,7 @@
 //! DAMAGE collected since the last grab, plus where the pointer was and is.
 
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -28,6 +29,14 @@ use x11rb::rust_connection::RustConnection;
 use super::clock::now_us;
 use super::video::{CaptureSink, Rect};
 use crate::soft_encode::{Frame, PixelFormat};
+
+/// Whether the pointer goes into the picture. Off while every viewer draws its own
+/// (`crate::cursor`): then it moves at once on their side, and moving it costs no frame.
+static DRAW_CURSOR: AtomicBool = AtomicBool::new(true);
+
+pub fn set_draw_cursor(on: bool) {
+    DRAW_CURSOR.store(on, Ordering::Relaxed);
+}
 
 /// A monitor's rectangle on the root window, in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,13 +305,20 @@ fn run(
     };
 
     let mut pointer = (0i16, 0i16);
+    let mut drawing = DRAW_CURSOR.load(Ordering::Relaxed);
     // Pointer positions since the last grab, for damage: where it was drawn, where it is.
     let mut pointer_trail: Vec<(i16, i16)> = Vec::new();
     let (mut dirty, mut resized, mut first) = (true, false, true);
     let mut last = Instant::now() - interval;
     loop {
-        // Pointer moves aren't damage, so its position is asked for each pass.
-        if has_xfixes {
+        // Putting the pointer in or taking it out changes the picture.
+        if DRAW_CURSOR.load(Ordering::Relaxed) != drawing {
+            drawing = !drawing;
+            dirty = true;
+        }
+        // Pointer moves aren't damage, so its position is asked for each pass. Left out of
+        // the picture, it changes nothing there.
+        if has_xfixes && drawing {
             let p = conn.query_pointer(root)?.reply()?;
             if (p.root_x, p.root_y) != pointer {
                 pointer_trail.push(pointer);
@@ -317,7 +333,7 @@ fn run(
                 Event::DamageNotify(_) => dirty = true,
                 Event::XfixesCursorNotify(_) => {
                     cursor = Cursor::fetch(&conn);
-                    dirty = true;
+                    dirty |= drawing;
                 }
                 Event::RandrScreenChangeNotify(_) => resized = true,
                 _ => {}
@@ -344,7 +360,8 @@ fn run(
                 }
                 _ => None,
             };
-            if let (Some(rects), Some(c)) = (changed.as_mut(), cursor.as_ref()) {
+            let drawn = cursor.as_ref().filter(|_| drawing);
+            if let (Some(rects), Some(c)) = (changed.as_mut(), drawn) {
                 rects.extend(pointer_trail.drain(..).chain([pointer]).map(|p| c.area(p)));
             }
             pointer_trail.clear();
@@ -352,7 +369,7 @@ fn run(
             dirty = false;
             let mut failed = false;
             for (i, target) in targets.iter_mut().enumerate() {
-                match grab(&conn, root, target, format, cursor.as_ref(), pointer) {
+                match grab(&conn, root, target, format, drawn, pointer) {
                     Ok(()) => {
                         if first {
                             info!("screen {i}: first frame");

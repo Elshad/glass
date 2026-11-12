@@ -18,6 +18,7 @@ pub mod setup;
 pub mod va_encode;
 pub mod video;
 mod x11_capture;
+pub mod x11_cursor;
 mod x11_input;
 
 use std::process::{Command, Stdio};

@@ -38,9 +38,10 @@ use crate::control::ServerMsg;
 use crate::media::DisplayInfo;
 use crate::server::Shared;
 
-/// The platform can show viewers the pointer apart from the picture. Linux keeps it in the
-/// picture: the portal fixes the cursor mode when screen sharing is approved, so it can't
-/// follow who's watching without asking again (and its metadata mode isn't wired up yet).
+/// The platform can show viewers the pointer apart from the picture. Linux under Wayland
+/// keeps it in the picture: the portal fixes the cursor mode when screen sharing is
+/// approved, so it can't follow who's watching without asking again (and its metadata mode
+/// isn't wired up yet). X11 sessions can (see `active`).
 pub const SUPPORTED: bool = cfg!(any(target_os = "macos", windows));
 
 const POLL: Duration = Duration::from_millis(33);
@@ -166,7 +167,20 @@ static APPLIED: Mutex<Option<bool>> = Mutex::new(None);
 
 /// Viewers can draw the pointer on this host (the platform, or the test pattern).
 pub fn active() -> bool {
-    SUPPORTED || crate::testmode::enabled()
+    SUPPORTED || x11() || crate::testmode::enabled()
+}
+
+/// An X11 session on Linux: no portal in the way, so the capture can leave the pointer out
+/// whenever viewers draw it (`crate::platform::x11_cursor` looks at it).
+fn x11() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::is_x11()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// The pointer is in the picture now (as far as viewers should assume).
@@ -274,9 +288,17 @@ pub fn start(shared: Arc<Shared>) {
         {
             Box::new(crate::platform::cursor::Poller::default())
         }
-        #[cfg(not(any(target_os = "macos", windows)))]
+        #[cfg(target_os = "linux")]
         {
-            // Nothing to look at: the pointer stays in the picture.
+            if !x11() {
+                // Nothing to look at: the pointer stays in the picture.
+                apply();
+                return;
+            }
+            Box::new(crate::platform::x11_cursor::Poller::default())
+        }
+        #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+        {
             apply();
             return;
         }
@@ -335,7 +357,6 @@ pub fn locate(streams: &[DisplayInfo], (x, y): (f64, f64)) -> (u8, f32, f32) {
 // ---- Images ----
 
 /// Premultiplied RGBA (what Core Graphics draws) to straight.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn unpremultiply(rgba: &mut [u8]) {
     for p in rgba.as_chunks_mut::<4>().0 {
         let a = p[3] as u32;

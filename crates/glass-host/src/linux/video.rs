@@ -828,6 +828,12 @@ impl VideoSource for Video {
     fn supports_lossless(&self) -> bool {
         true
     }
+    fn set_cursor_baked(&self, on: bool) {
+        // The portal fixed its cursor mode at approval; only X11 can follow this.
+        if super::is_x11() {
+            super::x11_capture::set_draw_cursor(on);
+        }
+    }
     fn set_full_colour(&self, on: bool) {
         FULL_COLOUR.store(on, Ordering::Relaxed);
         if !on && let Some(monitors) = self.monitors.lock().unwrap().as_ref() {
