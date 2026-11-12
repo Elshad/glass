@@ -19,7 +19,7 @@
 //! but not yet acknowledged counts as queued, and whole frames are dropped here (newest
 //! wins) rather than let a queue build up on the way.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,7 +40,7 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tracing::{debug, info, warn};
 
-use crate::remote::{Admit, CHUNK, FrameGate, InFlight, LinkMeter, video_backlog};
+use crate::remote::{Admit, CHUNK, DATAGRAM_BACKLOG, FrameGate, InFlight, LinkMeter, video_backlog};
 
 const DGRAM: u8 = 0;
 const OPEN: u8 = 1;
@@ -146,6 +146,69 @@ fn read_id(rest: &Bytes) -> Option<(i32, Bytes)> {
     Some((id, rest.slice(4..)))
 }
 
+/// The least round trip is taken over this long, so a route that got slower is noticed.
+const RTT_WINDOW: Duration = Duration::from_secs(10);
+/// Longer than this isn't a round trip, it's a queue.
+const MAX_RTT: Duration = Duration::from_secs(1);
+
+/// The round trip, from the browser's byte acks: an ack covering a message says it arrived,
+/// and when that message was sent is known. Over a long route (Baku to California through
+/// a tunnel is 200–300 ms) a link carrying `bps` always has about `bps × round trip` on the
+/// way; only what's beyond that is a queue. Counted as queued, it made every frame look
+/// backed up and pushed the bitrate down to almost nothing.
+#[derive(Default)]
+struct RoundTrip {
+    /// (bytes sent so far, when), oldest first.
+    sent: VecDeque<(u64, Instant)>,
+    least: Option<(Duration, Instant)>,
+}
+
+impl RoundTrip {
+    fn sent(&mut self, total: u64, now: Instant) {
+        if self.sent.back().is_none_or(|(_, at)| now.duration_since(*at) >= Duration::from_millis(5)) {
+            self.sent.push_back((total, now));
+            if self.sent.len() > 4096 {
+                self.sent.pop_front();
+            }
+        }
+    }
+
+    /// The browser has received `acked` bytes: the round trip it took, when it says.
+    fn acked(&mut self, acked: u64, now: Instant) -> Option<Duration> {
+        let mut at = None;
+        while let Some(&(total, t)) = self.sent.front() {
+            if total > acked {
+                break;
+            }
+            at = Some(t);
+            self.sent.pop_front();
+        }
+        let rtt = now.duration_since(at?).min(MAX_RTT);
+        if self.least.is_none_or(|(least, since)| rtt < least || now.duration_since(since) >= RTT_WINDOW) {
+            self.least = Some((rtt, now));
+        }
+        Some(rtt)
+    }
+
+    fn least(&self) -> Option<Duration> {
+        self.least.map(|(d, _)| d)
+    }
+
+    /// What a link carrying `bps` has on the way in one round trip.
+    fn on_the_way(&self, bps: u32) -> usize {
+        self.least().map_or(0, |d| (bps as f64 / 8.0 * d.as_secs_f64()) as usize)
+    }
+}
+
+/// Bytes waiting behind what's simply on the way.
+fn queued(outstanding: usize, on_the_way: usize, floor: usize) -> usize {
+    // Past the hard cap everything counts, so a wrong estimate can't let it grow unbounded.
+    if outstanding > DATAGRAM_BACKLOG + on_the_way {
+        return outstanding;
+    }
+    outstanding.saturating_sub(on_the_way.max(floor))
+}
+
 /// Sent and acknowledged byte counts, shared with the stream readers.
 #[derive(Default)]
 struct Window {
@@ -211,6 +274,8 @@ where
     let mut meter_drops = 0u64;
     let mut meter_tick = tokio::time::interval(Duration::from_secs(1));
     let mut inflight = InFlight::default();
+    let mut round_trip = RoundTrip::default();
+    let mut rtt_report = Instant::now();
     let mut last_tick = Instant::now();
     let mut gate = FrameGate::default();
     let mut last_keyframe_ask = Instant::now();
@@ -249,8 +314,12 @@ where
                     }
                     ACK => {
                         if let Some(n) = rest.get(..8).and_then(|b| b.try_into().ok()) {
-                            window.acked.store(u64::from_le_bytes(n), Ordering::Relaxed);
+                            let acked = u64::from_le_bytes(n);
+                            window.acked.store(acked, Ordering::Relaxed);
                             let now = Instant::now();
+                            if let Some(rtt) = round_trip.acked(acked, now) {
+                                link.set_rtt(rtt, now);
+                            }
                             link.drained(window.outstanding() as usize, now);
                             flow.update(&mut link, now);
                         }
@@ -288,14 +357,15 @@ where
                 let payload = datagram.payload();
                 let outstanding = window.outstanding() as usize;
                 inflight.sample(outstanding);
-                let queued = inflight.queued(outstanding);
+                let queued = queued(outstanding, round_trip.on_the_way(crate::server::applied_bitrate()), inflight.floor);
                 let now = Instant::now();
                 link.drained(outstanding, now);
                 match gate.admit(&payload, queued, video_backlog(crate::server::applied_bitrate())) {
                     Admit::Send => {
                         let (msg, len) = frame(DGRAM, None, &payload);
                         if out.try_send(msg).is_ok() {
-                            window.sent.fetch_add(len, Ordering::Relaxed);
+                            let total = window.sent.fetch_add(len, Ordering::Relaxed) + len;
+                            round_trip.sent(total, now);
                             meter.sent(payload.len());
                             match glass_proto::VideoHeader::read(&payload) {
                                 Some(h) => link.sent(h.stream, h.frame_id, payload.len(), now),
@@ -331,8 +401,9 @@ where
                 }
                 if bridge_drops > 0 && last_drop_report.elapsed() >= Duration::from_secs(5) {
                     info!(
-                        "websocket peer ({peer}): dropped {bridge_drops} packets (link backed up; {} KB in flight, link cap {})",
-                        inflight.floor / 1024,
+                        "websocket peer ({peer}): dropped {bridge_drops} packets (link backed up; round trip {}, {} KB on the way, link cap {})",
+                        round_trip.least().map_or("?".to_string(), |d| format!("{} ms", d.as_millis())),
+                        round_trip.on_the_way(crate::server::applied_bitrate()) / 1024,
                         meter.cap.map_or("none".to_string(), |c| format!("{:.1} Mbps", c as f64 / 1e6)),
                     );
                     bridge_drops = 0;
@@ -362,7 +433,17 @@ where
             _ = meter_tick.tick() => {
                 let outstanding = window.outstanding() as usize;
                 let budget = video_backlog(crate::server::applied_bitrate());
-                let queued = inflight.queued(outstanding);
+                let queued = queued(outstanding, round_trip.on_the_way(crate::server::applied_bitrate()), inflight.floor);
+                if rtt_report.elapsed() >= Duration::from_secs(30)
+                    && let Some(rtt) = round_trip.least()
+                {
+                    rtt_report = Instant::now();
+                    info!(
+                        "websocket peer ({peer}): round trip {} ms, video {:.1} Mbps",
+                        rtt.as_millis(),
+                        crate::server::applied_bitrate() as f64 / 1e6
+                    );
+                }
                 // Always: what's merely on the way (the tunnel's round trip, the ack
                 // interval) must never count as queued, or every frame looks backed up.
                 inflight.tick(crate::server::applied_bitrate());
@@ -453,6 +534,23 @@ mod tests {
         let (msg, len) = frame(DGRAM, None, b"abc");
         assert_eq!(len, 4);
         assert!(matches!(msg, Message::Binary(b) if &b[..] == b"\0abc"));
+    }
+
+    #[test]
+    fn round_trip_comes_from_acks() {
+        let t0 = Instant::now();
+        let mut r = RoundTrip::default();
+        r.sent(1000, t0);
+        r.sent(2000, t0 + Duration::from_millis(10));
+        assert_eq!(r.acked(500, t0 + Duration::from_millis(50)), None);
+        assert_eq!(r.acked(1500, t0 + Duration::from_millis(250)), Some(Duration::from_millis(250)));
+        assert_eq!(r.acked(2000, t0 + Duration::from_millis(250)), Some(Duration::from_millis(240)));
+        assert_eq!(r.least(), Some(Duration::from_millis(240)));
+        // 2 Mbps for 240 ms: 60 KB on the way, none of it queued.
+        assert_eq!(r.on_the_way(2_000_000), 60_000);
+        assert_eq!(queued(60_000, r.on_the_way(2_000_000), 0), 0);
+        assert_eq!(queued(80_000, r.on_the_way(2_000_000), 0), 20_000);
+        assert_eq!(queued(DATAGRAM_BACKLOG + 70_000, 60_000, 0), DATAGRAM_BACKLOG + 70_000);
     }
 
     #[test]
