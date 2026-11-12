@@ -118,10 +118,14 @@ async function networkFirst(request, timeoutMs) {
   const cache = await caches.open(SHELL_CACHE);
   // Navigations with a query (shortcuts, shares) are the same page.
   const key = request.mode === 'navigate' ? new URL('./', self.registration.scope).href : request.url.replace(/[?#].*$/, '');
+  // Always ask the server (a cheap 304 when nothing changed): a proxy in front, such as a
+  // Cloudflare zone's "Browser Cache TTL", can stretch max-age=0 into hours, and the
+  // browser would keep running an old client that long. (A navigation can't take options.)
+  const get = () => (request.mode === 'navigate' ? fetch(request) : fetch(request, { cache: 'no-cache' }));
   try {
     const response = await (timeoutMs
-      ? Promise.race([fetch(request), new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), timeoutMs))])
-      : fetch(request));
+      ? Promise.race([get(), new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), timeoutMs))])
+      : get());
     if (response.ok) cache.put(key, response.clone()).catch(() => {});
     return response;
   } catch (e) {
