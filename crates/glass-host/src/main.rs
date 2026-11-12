@@ -54,6 +54,7 @@ mod signin;
 mod sharp;
 mod terminal;
 mod wol;
+mod wsbridge;
 mod rate;
 mod refresh;
 mod remote;

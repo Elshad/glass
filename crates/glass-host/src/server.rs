@@ -102,7 +102,8 @@ pub async fn run(
         other => crate::listen::describe(other),
     };
     info!("WebTransport listening on {wt_where} udp/{wt_port}");
-    crate::remote::watch(wt_port, listen.wt_dial());
+    let wt_dial = listen.wt_dial();
+    crate::remote::watch(wt_port, wt_dial);
     crate::cursor::start(shared.clone());
     // Fleet's scripts and the microphone belong to a signed-in user, not the sign-in screen.
     if !crate::signin::active() {
@@ -159,6 +160,12 @@ pub async fn run(
         .merge(extra_routes.unwrap_or_default())
         .merge(extras)
         .route("/config.json", get(client_config))
+        // Remote access for viewers with no direct UDP path: the same session over a
+        // WebSocket, through whatever tunnel serves the page.
+        .route(
+            "/ws-bridge",
+            get(move |info, req| crate::wsbridge::handle(info, req, wt_port, wt_dial)),
+        )
         .route(
             "/manifest.webmanifest",
             get(move || manifest(manifest_dir.clone(), manifest_cache.clone(), http_port, wt_port)),

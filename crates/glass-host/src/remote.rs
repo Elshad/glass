@@ -36,9 +36,9 @@ use webrtc::peer_connection::{
 };
 
 /// Largest data channel message we send (browsers accept far more; this keeps latency even).
-const CHUNK: usize = 16 * 1024;
+pub(crate) const CHUNK: usize = 16 * 1024;
 /// Datagrams are dropped rather than queued past this, so video never lags behind.
-const DATAGRAM_BACKLOG: usize = 256 * 1024;
+pub(crate) const DATAGRAM_BACKLOG: usize = 256 * 1024;
 /// Video waiting in the WebRTC send buffer is held to about this much time at the current
 /// bitrate. A byte cap alone let a slow relayed link (2–3 Mbps through TURN) queue most of
 /// a second of frames, so latency swung between fine and awful as the queue filled and
@@ -52,11 +52,11 @@ const MIN_VIDEO_BACKLOG: usize = 32 * 1024;
 /// of its own, and the shared rate controller won't go below a fraction of its maximum:
 /// on a relay that carries less than that, every frame queued, then dropped.
 #[derive(Default)]
-struct LinkMeter {
+pub(crate) struct LinkMeter {
     /// Bytes handed to the channel since the last tick.
     sent: u64,
     last_outstanding: usize,
-    cap: Option<u32>,
+    pub(crate) cap: Option<u32>,
     /// Ticks in a row without backing up.
     calm: u32,
 }
@@ -66,19 +66,19 @@ struct LinkMeter {
 /// that's tens of KB, more than the whole video queue: counted as queued, it kept every
 /// frame (and the keyframe to recover with) out. The least seen in the last second.
 #[derive(Default)]
-struct InFlight {
+pub(crate) struct InFlight {
     window_min: Option<usize>,
-    floor: usize,
+    pub(crate) floor: usize,
 }
 
 impl InFlight {
-    fn sample(&mut self, outstanding: usize) {
+    pub(crate) fn sample(&mut self, outstanding: usize) {
         self.window_min = Some(self.window_min.map_or(outstanding, |m| m.min(outstanding)));
     }
 
     /// Bytes actually waiting behind what's in flight. Past the hard cap everything counts,
     /// so a floor that's wrong can never let the buffer grow without limit.
-    fn queued(&self, outstanding: usize) -> usize {
+    pub(crate) fn queued(&self, outstanding: usize) -> usize {
         if outstanding > DATAGRAM_BACKLOG {
             return outstanding;
         }
@@ -88,7 +88,7 @@ impl InFlight {
     /// Once a second. `bps`: the bitrate now. The floor is held to what a long round trip
     /// (`MAX_RTT_MS`) could have in flight: on a link that never drains, the least seen is
     /// partly queue, and taking all of it as "in flight" would ratchet the queue up.
-    fn tick(&mut self, bps: u32) {
+    pub(crate) fn tick(&mut self, bps: u32) {
         if let Some(min) = self.window_min.take() {
             let most = (bps as u64 / 8 * MAX_RTT_MS / 1000).min(DATAGRAM_BACKLOG as u64 / 2) as usize;
             self.floor = min.min(most);
@@ -107,13 +107,13 @@ const LINK_SHARE: f64 = 0.85;
 const MAX_LINK_CAP: u32 = 100_000_000;
 
 impl LinkMeter {
-    fn sent(&mut self, bytes: usize) {
+    pub(crate) fn sent(&mut self, bytes: usize) {
         self.sent += bytes as u64;
     }
 
     /// Once a second or so. Returns the new cap when it changes (`Some(None)`: lifted).
     /// `outstanding`: the whole send buffer; `queued`: the part behind what's in flight.
-    fn tick(&mut self, outstanding: usize, queued: usize, dropped: bool, budget: usize, elapsed: Duration) -> Option<Option<u32>> {
+    pub(crate) fn tick(&mut self, outstanding: usize, queued: usize, dropped: bool, budget: usize, elapsed: Duration) -> Option<Option<u32>> {
         let secs = elapsed.as_secs_f64().max(0.001);
         // What left the queue: what went in, less how much it grew.
         let drained = self.sent as i64 - (outstanding as i64 - self.last_outstanding as i64);
@@ -147,7 +147,7 @@ impl LinkMeter {
 }
 
 /// How many bytes of video may be queued at `bps` (0: unknown, the byte cap).
-fn video_backlog(bps: u32) -> usize {
+pub(crate) fn video_backlog(bps: u32) -> usize {
     if bps == 0 {
         return DATAGRAM_BACKLOG;
     }
@@ -385,7 +385,7 @@ pub fn bridge_watching(id: u64, on: bool) {
 }
 
 /// Registers a bridge; it's removed again when the guard drops.
-fn register_bridge() -> (u64, crate::rtp::Viewer, BridgeGuard) {
+pub(crate) fn register_bridge() -> (u64, crate::rtp::Viewer, BridgeGuard) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (authed_tx, authed) = tokio::sync::watch::channel(false);
@@ -412,7 +412,7 @@ fn register_bridge() -> (u64, crate::rtp::Viewer, BridgeGuard) {
     )
 }
 
-struct BridgeGuard(u64);
+pub(crate) struct BridgeGuard(u64);
 
 impl Drop for BridgeGuard {
     fn drop(&mut self) {
@@ -1055,7 +1055,7 @@ async fn bridge(
 }
 
 #[derive(Debug, PartialEq)]
-enum Admit {
+pub(crate) enum Admit {
     Send,
     Drop,
 }
@@ -1065,13 +1065,13 @@ enum Admit {
 /// spent on frames that can't be decoded. And once a frame is gone, the frames after it
 /// can't be decoded either until the next keyframe, so those go too.
 #[derive(Default)]
-struct FrameGate {
+pub(crate) struct FrameGate {
     /// Per stream: the frame being passed through and whether it's sent or dropped.
     current: [Option<(u32, bool)>; glass_proto::MAX_STREAMS],
     /// Per stream: a frame was dropped, so wait for a keyframe.
     broken: [bool; glass_proto::MAX_STREAMS],
     /// Frames dropped since the bitrate controller was last told.
-    dropped_frames: u32,
+    pub(crate) dropped_frames: u32,
 }
 
 /// Rough bytes on the wire per video fragment.
@@ -1079,7 +1079,7 @@ const FRAGMENT_BYTES: usize = 1250;
 
 impl FrameGate {
     /// Streams whose picture is broken until a keyframe arrives.
-    fn waiting_for_keyframe(&self) -> impl Iterator<Item = u8> + '_ {
+    pub(crate) fn waiting_for_keyframe(&self) -> impl Iterator<Item = u8> + '_ {
         self.broken
             .iter()
             .enumerate()
@@ -1088,7 +1088,7 @@ impl FrameGate {
     }
 
     /// `budget`: how much video may be queued now (see [`video_backlog`]).
-    fn admit(&mut self, datagram: &[u8], outstanding: usize, budget: usize) -> Admit {
+    pub(crate) fn admit(&mut self, datagram: &[u8], outstanding: usize, budget: usize) -> Admit {
         let Some(h) = (datagram.first() == Some(&glass_proto::KIND_VIDEO))
             .then(|| glass_proto::VideoHeader::read(datagram))
             .flatten()

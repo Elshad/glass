@@ -628,6 +628,9 @@ if (remoteKey) {
     port: channel.port1,
     hostKey: remoteKey,
     signalUrl,
+    // A self-hosted introducer's tunnel can also carry the session itself (the host's
+    // /ws-bridge), for networks with no direct UDP path. glassdesk.dev can't.
+    wsUrl: location.hostname === 'glassdesk.dev' ? undefined : `${location.origin.replace(/^http/, 'ws')}/ws-bridge`,
     log,
     onVideo: (stream, track) => {
       const v = videoFor(stream);
