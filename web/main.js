@@ -42,6 +42,9 @@ const SWAP_KEY = 'glass.swapCmdOption';
 const CTRL_AS_CMD_KEY = 'glass.ctrlAsCmd';
 const DECODER_STEP_KEY = 'glass.decoderStep';
 const PC_KEYBOARD_KEY = 'glass.pcKeyboard';
+// Your own pointer stays visible over the picture, with the computer's drawn where it is.
+const BOTH_POINTERS_KEY = 'glass.bothPointers';
+const bothPointers = (storage((s) => s.getItem(BOTH_POINTERS_KEY)) ?? '1') === '1';
 const MACHINE_KEY = 'glass.machine';
 const REMOTES_KEY = 'glass.remotes'; // computers opened from anywhere, for glassdesk.dev/computers
 // Give up on a remembered machine after this many failed connects and return to the
@@ -321,6 +324,7 @@ const cursor = createCursor({
   contentRect: (el) => input.contentRect(el),
   onWanted: (on) => worker.postMessage({ type: 'localCursor', on }),
 });
+cursor.setBoth(bothPointers);
 document.getElementById('zoom-reset').addEventListener('click', () => input.resetZoom());
 let micContext;
 let micStream;
@@ -377,6 +381,11 @@ const ui = createUI({
   swapCmdOption: storage((s) => s.getItem(SWAP_KEY)) === '1',
   ctrlAsCmd,
   pcKeyboard,
+  bothPointers,
+  onBothPointers: (on) => {
+    storage((s) => s.setItem(BOTH_POINTERS_KEY, on ? '1' : '0'));
+    cursor.setBoth(on);
+  },
   onPcKeyboard: (on) => {
     storage((s) => s.setItem(PC_KEYBOARD_KEY, on ? '1' : '0'));
     keyboard.pc = on;

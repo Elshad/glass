@@ -19,7 +19,7 @@ const storageSet = (key, value) => {
 };
 
 
-export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () => {}, onSelectDisplay, onSharp, onListWindows, onSelectWindow, onShortcut, shortcuts, swapCmdOption, onSwapCmdOption, ctrlAsCmd, onCtrlAsCmd, pcKeyboard, onPcKeyboard, onKeyboard, onUploadFiles, onRequestFiles, onAudio, onMic, onFullscreen, onToggleStats, onPrivacy, onRestart, onSas, onToken, onTerminal = () => {}, onOpenDevice = () => {}, onTrackpad = () => {}, onPad = () => {}, onExtend = () => {}, resolution = 'auto', onResolution, fitSizes = () => [], deviceName = () => 'device' }) {
+export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () => {}, onSelectDisplay, onSharp, onListWindows, onSelectWindow, onShortcut, shortcuts, swapCmdOption, onSwapCmdOption, ctrlAsCmd, onCtrlAsCmd, pcKeyboard, onPcKeyboard, bothPointers = false, onBothPointers = () => {}, onKeyboard, onUploadFiles, onRequestFiles, onAudio, onMic, onFullscreen, onToggleStats, onPrivacy, onRestart, onSas, onToken, onTerminal = () => {}, onOpenDevice = () => {}, onTrackpad = () => {}, onPad = () => {}, onExtend = () => {}, resolution = 'auto', onResolution, fitSizes = () => [], deviceName = () => 'device' }) {
   const toolbar = $('toolbar');
   // Each toolbar menu: its button and panel.
   const menus = {
@@ -220,6 +220,7 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
   }
   const pcItem = toggleItem('PC keyboard', 'Ctrl → ⌘, Super → ⌃', pcKeyboard, onPcKeyboard);
   const ctrlItem = toggleItem('Ctrl as ⌘', '⌃⇥ ⌃Space ⌃H ⌃⇧3–5', ctrlAsCmd, onCtrlAsCmd);
+  const pointersItem = toggleItem('Show both pointers', 'yours and the computer’s', bothPointers, onBothPointers);
 
   let swapOn = swapCmdOption;
   const swapItem = menuItem('Swap ⌘ and ⌥', 'see note', {
@@ -329,6 +330,7 @@ export function createUI({ onOpenMachines, onSelectMachine, onWakeMachine = () =
     renderBar();
     const add = menuItem(recording ? 'Press a shortcut…' : 'Add shortcut…', recording ? 'Esc to cancel' : '', { onSelect: addShortcut });
     menus.shortcuts.panel.replaceChildren(
+      pointersItem,
       pcItem,
       ctrlItem,
       swapItem,

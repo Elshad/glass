@@ -42,6 +42,7 @@ export function createCursor({ screens, overlay, contentRect, onWanted }) {
   let wanted = true; // not trackpad mode (it has its own pointer)
   let localOver; // the display this device's mouse (or pen) is over
   let locked = false; // pointer lock: the local position means nothing
+  let both = false; // this device's own arrow stays, and the host's is drawn where it is
   const applied = new WeakMap(); // element -> the cursor value it has
   let overlayKey = '';
   let frame;
@@ -93,10 +94,12 @@ export function createCursor({ screens, overlay, contentRect, onWanted }) {
         } else if (shape) {
           const u = urlFor(shape, cursorScale(shape, rect.width / Math.max(1, info.points_width)));
           value = u.css;
-          if (!(p.flags & CURSOR_YOURS) || localOver !== el || locked) drawn = { rect, u };
+          if (both || !(p.flags & CURSOR_YOURS) || localOver !== el || locked) drawn = { rect, u };
         } else {
           value = 'default';
         }
+        // Both pointers: this device's own arrow as usual; the host's is the overlay.
+        if (both) value = 'default';
       }
       if (applied.get(el) !== value) {
         el.style.cursor = value;
@@ -178,6 +181,14 @@ export function createCursor({ screens, overlay, contentRect, onWanted }) {
     setWanted(on) {
       wanted = on;
       onWanted(on);
+      schedule();
+    },
+    /**
+     * Both pointers: this device's own stays as it is, and the host's is drawn where the
+     * host says it is (a round trip behind), so the two can be told apart.
+     */
+    setBoth(on) {
+      both = on;
       schedule();
     },
     /** A new session: image ids start over. */
